@@ -146,9 +146,29 @@ impl Serializable for RowValue {
     }
 }
 
+#[derive(Error, Debug)]
+pub enum RowError {
+    #[error("Cannot construct Row from empty list")]
+    EmptyRow,
+    #[error("First entry must be a valid primary key")]
+    InvalidFirstEntry,
+}
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub(crate) fields: Vec<RowValue>,
+}
+
+impl TryFrom<Vec<RowValue>> for Row {
+    type Error = RowError;
+    fn try_from(fields: Vec<RowValue>) -> Result<Self, Self::Error> {
+        if fields.is_empty() {
+            return Err(RowError::EmptyRow);
+        }
+        if Key::try_from(&fields[0]).is_err() {
+            return Err(RowError::InvalidFirstEntry);
+        }
+        Ok(Row { fields })
+    }
 }
 
 impl Serializable for Row {
@@ -334,6 +354,49 @@ mod tests {
     use quickcheck_macros::quickcheck;
     use std::io::{Cursor, Seek};
 
+    impl Arbitrary for ColumnType {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let n = g.choose(&[0, 1, 2, 3]).unwrap();
+            match n {
+                0 => ColumnType::String,
+                1 => ColumnType::Bool,
+                2 => ColumnType::Float,
+                3 => ColumnType::Integer,
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    impl Arbitrary for Column {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let n = g.choose(&[0, 1]).unwrap();
+            let nullable = match n {
+                0 => false,
+                1 => true,
+                _ => unreachable!(),
+            };
+            Column {
+                col_type: ColumnType::arbitrary(g),
+                nullable,
+            }
+        }
+    }
+
+    impl Arbitrary for Schema {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let mut first_entry = Column::arbitrary(g);
+            while !first_entry.col_type.is_valid_key() {
+                first_entry = Column::arbitrary(g);
+            }
+            Schema {
+                columns: [first_entry]
+                    .into_iter()
+                    .chain((0..10).map(|_| Column::arbitrary(g)))
+                    .collect(),
+            }
+        }
+    }
+
     impl Arbitrary for RowValue {
         fn arbitrary(g: &mut Gen) -> Self {
             let num = g.choose(&[0, 1, 2, 3, 4]).unwrap();
@@ -354,19 +417,41 @@ mod tests {
         }
     }
 
+    /// TODO: Figure out how to cap g.size() in Arbitrary instead of these contrived
+    /// caps I put in the implementation
     impl Arbitrary for Row {
         fn arbitrary(g: &mut Gen) -> Self {
-            let count = usize::arbitrary(g).min(9);
+            let count = usize::arbitrary(g).min(10);
             let mut first_entry = RowValue::arbitrary(g);
-            while !matches!(first_entry, RowValue::Integer(_) | RowValue::String(_)) {
+            while !matches!(first_entry, RowValue::Integer(_) | RowValue::String(_))
+                && first_entry.encoded_size() > 25
+            {
                 first_entry = RowValue::arbitrary(g);
             }
             Row {
                 fields: [first_entry]
                     .into_iter()
-                    .chain((0..count).map(|_| RowValue::arbitrary(g)))
+                    .chain((0..count).map(|_| {
+                        let mut entry = RowValue::arbitrary(g);
+                        while entry.encoded_size() > 255 {
+                            entry = RowValue::arbitrary(g);
+                        }
+                        entry
+                    }))
                     .collect(),
             }
+        }
+    }
+
+    #[quickcheck]
+    fn primary_key_returns_key(schema: Schema, row: Row) -> TestResult {
+        match schema.validate_row(row) {
+            Ok(validated_row) => {
+                let first_entry = &validated_row.0.fields[0];
+                assert!(Key::try_from(first_entry).is_ok());
+                TestResult::passed()
+            }
+            Err(_) => TestResult::discard(),
         }
     }
 
@@ -414,6 +499,39 @@ mod tests {
             ser_result.unwrap_err(),
             RowValueError::TooManyFields(256)
         ));
+    }
+
+    #[test]
+    fn row_generation_errors_work() {
+        // Null first entries will be rejected
+        let mut fields = vec![
+            RowValue::Null,
+            RowValue::Integer(5),
+            RowValue::Boolean(true),
+        ];
+        assert!(matches!(
+            Row::try_from(fields.clone()),
+            Err(RowError::InvalidFirstEntry)
+        ));
+
+        // Float first entries will be rejected
+        fields.remove(0);
+        fields.insert(0, RowValue::Float(0.0));
+        assert!(matches!(
+            Row::try_from(fields.clone()),
+            Err(RowError::InvalidFirstEntry)
+        ));
+
+        // Bool first entries will be rejected
+        fields.remove(0);
+        fields.insert(0, RowValue::Boolean(true));
+        assert!(matches!(
+            Row::try_from(fields),
+            Err(RowError::InvalidFirstEntry)
+        ));
+
+        // Empty vectors will be rejected
+        assert!(matches!(Row::try_from(Vec::new()), Err(RowError::EmptyRow)));
     }
 
     #[test]

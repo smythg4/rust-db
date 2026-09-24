@@ -9,6 +9,8 @@ use thiserror::Error;
 pub const PAGE_SIZE: usize = 4096;
 pub const LEAF_TAG: u8 = 1;
 pub const INTERNAL_TAG: u8 = 2;
+pub const MAX_LEAF_HEADER_SIZE: usize = 38;
+pub const MAX_INTERNAL_HEADER_SIZE: usize = 20;
 
 #[derive(Error, Debug)]
 pub enum PageError {
@@ -345,6 +347,19 @@ mod tests {
         }
     }
 
+    #[quickcheck]
+    fn header_constant_is_right(page: Page) -> TestResult {
+        let mut cursor = Cursor::new([0u8; PAGE_SIZE]);
+        page.write_header(&mut cursor).unwrap();
+        match page.body {
+            PageBody::Internal { .. } => {
+                assert_eq!(cursor.position(), MAX_INTERNAL_HEADER_SIZE as u64)
+            }
+            PageBody::Leaf { .. } => assert_eq!(cursor.position(), MAX_LEAF_HEADER_SIZE as u64),
+        };
+        TestResult::passed()
+    }
+
     #[test]
     fn basic_leaf_page_roundtrip() {
         let records: Vec<Row> = (1..=5)
@@ -408,6 +423,18 @@ mod tests {
         let actual_free_space = data_offset - slot_offset;
 
         assert_eq!(free_space, actual_free_space);
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn page_quickcheck_roundtrip(page: Page) -> TestResult {
+        let mut bytes = Cursor::new(Vec::new());
+        page.serialize(&mut bytes).unwrap();
+
+        bytes.set_position(0);
+        let deser_page = Page::deserialize(&mut bytes).unwrap();
+
+        assert_eq!(page, deser_page);
         TestResult::passed()
     }
 }

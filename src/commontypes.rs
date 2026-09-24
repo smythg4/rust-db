@@ -243,12 +243,12 @@ pub enum KeyError {
     BoolKey,
 }
 
-impl TryFrom<RowValue> for Key {
+impl TryFrom<&RowValue> for Key {
     type Error = KeyError;
-    fn try_from(value: RowValue) -> Result<Self, Self::Error> {
+    fn try_from(value: &RowValue) -> Result<Self, Self::Error> {
         match value {
-            RowValue::Integer(n) => Ok(Self::Integer(n)),
-            RowValue::String(s) => Ok(Self::String(s)),
+            RowValue::Integer(n) => Ok(Self::Integer(*n)),
+            RowValue::String(s) => Ok(Self::String(s.clone())),
             RowValue::Null => Err(KeyError::NullKey),
             RowValue::Float(_) => Err(KeyError::NotOrderable),
             RowValue::Boolean(_) => Err(KeyError::BoolKey),
@@ -274,7 +274,7 @@ impl Serializable for Key {
     }
 
     fn deserialize<R: Read>(r: &mut R) -> Result<Self, Self::Error> {
-        let field = RowValue::deserialize(r)?;
+        let field = &RowValue::deserialize(r)?;
         field.try_into()
     }
 
@@ -342,8 +342,8 @@ mod tests {
 
     #[test]
     fn null_and_float_keys_trigger_errors() {
-        let null_result = Key::try_from(RowValue::Null);
-        let float_result = Key::try_from(RowValue::Float(10.0));
+        let null_result = Key::try_from(&RowValue::Null);
+        let float_result = Key::try_from(&RowValue::Float(10.0));
 
         assert!(matches!(null_result, Err(KeyError::NullKey)));
         assert!(matches!(float_result, Err(KeyError::NotOrderable)));
