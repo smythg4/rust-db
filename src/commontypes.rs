@@ -86,6 +86,7 @@ impl Lsn {
         }
         Ok(Lsn(id))
     }
+
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -120,6 +121,34 @@ impl Serializable for Lsn {
 
     fn serialize<W: Write>(&self, w: &mut W) -> Result<(), Self::Error> {
         w.write_all(&self.0.to_be_bytes())?;
+        Ok(())
+    }
+
+    fn encoded_size(&self) -> usize {
+        size_of::<u64>()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PageLsn(pub Option<Lsn>);
+
+impl Serializable for PageLsn {
+    type Error = LsnError;
+    fn deserialize<R: Read>(r: &mut R) -> Result<Self, Self::Error> {
+        let mut buf = [0u8; 8];
+        r.read_exact(&mut buf)?;
+        let val = u64::from_be_bytes(buf);
+        Ok(match val {
+            0 => PageLsn(None),
+            n => PageLsn(Some(Lsn::new(n).unwrap())),
+        })
+    }
+
+    fn serialize<W: Write>(&self, w: &mut W) -> Result<(), Self::Error> {
+        match self.0 {
+            Some(lsn) => w.write_all(&lsn.0.to_be_bytes()),
+            None => w.write_all(&0u64.to_be_bytes()),
+        }?;
         Ok(())
     }
 
@@ -214,7 +243,7 @@ macro_rules! id_type_serializable {
                 Ok(Self(<$inner>::from_be_bytes(buf)))
             }
             fn encoded_size(&self) -> usize {
-                1 + std::mem::size_of::<$inner>()
+                std::mem::size_of::<$inner>()
             }
         }
     };
@@ -305,6 +334,16 @@ mod tests {
                 1 => Key::String(String::arbitrary(g)),
                 _ => unreachable!(),
             }
+        }
+    }
+
+    impl Arbitrary for Lsn {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let mut lsn = u64::arbitrary(g);
+            while lsn == 0 {
+                lsn = u64::arbitrary(g);
+            }
+            Lsn::new(lsn).unwrap()
         }
     }
 

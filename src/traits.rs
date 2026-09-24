@@ -34,7 +34,8 @@ where
         r.read_exact(&mut tag)?;
         match tag[0] {
             0 => Ok(None),
-            _ => Ok(Some(T::deserialize(r)?)),
+            1 => Ok(Some(T::deserialize(r)?)),
+            _ => panic!("attempted to deserialize an invalid option tag"),
         }
     }
 

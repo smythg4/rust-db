@@ -1,7 +1,7 @@
 use crate::commontypes::{
-    Key, KeyError, Lsn, LsnError, PAGE_ID_SIZE, PageId, SLOT_ENTRY_SIZE, SlotEntry,
+    Key, KeyError, LsnError, PAGE_ID_SIZE, PageId, PageLsn, SLOT_ENTRY_SIZE, SlotEntry,
 };
-use crate::schema::{Row, RowValueError};
+use crate::schema::{Row, RowValueError, ValidatedRow};
 use crate::traits::Serializable;
 use std::io::{Cursor, Read, Write};
 use thiserror::Error;
@@ -9,8 +9,8 @@ use thiserror::Error;
 pub const PAGE_SIZE: usize = 4096;
 pub const LEAF_TAG: u8 = 1;
 pub const INTERNAL_TAG: u8 = 2;
-pub const MAX_LEAF_HEADER_SIZE: usize = 38;
-pub const MAX_INTERNAL_HEADER_SIZE: usize = 20;
+pub const MAX_LEAF_HEADER_SIZE: usize = 46;
+pub const MAX_INTERNAL_HEADER_SIZE: usize = 28;
 
 #[derive(Error, Debug)]
 pub enum PageError {
@@ -24,12 +24,23 @@ pub enum PageError {
     Key(#[from] KeyError),
     #[error("Invalid page tag: {0}")]
     InvalidTag(u8),
+    #[error("Page got overfull before serialization")]
+    PageOverFlow,
+    #[error("Page too small to split: {0}")]
+    TooSmallToSplit(PageId),
+    #[error("Page too full to fit row -- need to split")]
+    PageFull,
+    #[error("Attempt to insert a duplicate key")]
+    DuplicateKey,
+    #[error("Attempt to insert into a non-leaf page")]
+    NotLeaf,
 }
 pub type RawPage = [u8; PAGE_SIZE];
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Page {
-    last_update: Lsn,
+    page_id: PageId,
+    last_update: PageLsn,
     parent: Option<PageId>,
     body: PageBody,
 }
@@ -63,22 +74,18 @@ impl Page {
     }
 
     pub fn free_space(&self) -> Option<usize> {
-        let base_header_len = 1 // tag
-            + 8 // Lsn
-            + 1 + PAGE_ID_SIZE // parent_page
-            + 2; // num_pages
+        let header_len = match self.body {
+            PageBody::Internal { .. } => MAX_INTERNAL_HEADER_SIZE,
+            PageBody::Leaf { .. } => MAX_LEAF_HEADER_SIZE,
+        };
         let used_size = match &self.body {
             PageBody::Internal { keys, children } => {
-                let header_len = base_header_len;
                 let slots_len = keys.len() * SLOT_ENTRY_SIZE;
                 let children_len = children.len() * PAGE_ID_SIZE;
                 let keys_len = keys.iter().map(|k| k.encoded_size()).sum::<usize>();
                 header_len + slots_len + children_len + keys_len
             }
             PageBody::Leaf { records, .. } => {
-                let header_len = base_header_len
-                    + 1 + PAGE_ID_SIZE // next page
-                    + 1 + PAGE_ID_SIZE; // prev page
                 let slots_len = records.len() * SLOT_ENTRY_SIZE;
                 let records_len = records.iter().map(|r| r.encoded_size()).sum::<usize>();
                 header_len + slots_len + records_len
@@ -89,10 +96,11 @@ impl Page {
 
     /// Writes header to underlying RawPage
     /// TODO: Figure out trait bounds to make this generic (Write + Seek)?
-    pub fn write_header(&self, writer: &mut Cursor<RawPage>) -> Result<(), PageError> {
+    pub(crate) fn write_header(&self, writer: &mut Cursor<RawPage>) -> Result<(), PageError> {
         // Write the header information: Type Tag, LSN, Parent page, then if
         // a Leaf node, write the Next and Prev pages.
         writer.write_all(&[self.page_type_tag()])?;
+        self.page_id.serialize(writer)?;
         self.last_update.serialize(writer)?;
         self.parent.serialize(writer)?;
         match self.body {
@@ -112,7 +120,7 @@ impl Page {
     /// Writes the body of a page to the underlying RawPage
     /// Returns slot_offset and data_offset (used for tests)
     /// TODO: Figure out trait bounds to make this generic (Write + Seek)?
-    pub fn write_body(
+    pub(crate) fn write_body(
         &self,
         writer: &mut Cursor<RawPage>,
         header_end: usize,
@@ -179,6 +187,9 @@ impl Page {
     }
 
     pub fn as_raw_page(&self) -> Result<RawPage, PageError> {
+        if self.free_space().is_none() {
+            return Err(PageError::PageOverFlow);
+        }
         let mut cursor = Cursor::new([0u8; PAGE_SIZE]);
 
         self.write_header(&mut cursor)?;
@@ -197,7 +208,95 @@ impl Page {
             None => return false,
             Some(s) => s,
         };
-        row.encoded_size() + SLOT_ENTRY_SIZE < free_space
+        row.encoded_size() + SLOT_ENTRY_SIZE <= free_space
+    }
+
+    pub fn insert(&mut self, validated_row: ValidatedRow) -> Result<(), PageError> {
+        let new_key = validated_row.primary_key();
+        let row: Row = validated_row.into();
+        if !self.can_insert(&row) {
+            return Err(PageError::PageFull);
+        }
+        let PageBody::Leaf { records, .. } = &mut self.body else {
+            return Err(PageError::NotLeaf);
+        };
+
+        let insert_pos = match records.binary_search_by(|r| r.cmp_key(&new_key)) {
+            Ok(_) => return Err(PageError::DuplicateKey),
+            Err(i) => i,
+        };
+
+        records.insert(insert_pos, row);
+        Ok(())
+    }
+
+    // The old right neighbor's `prev` pointer will need to be updated to point to the new page returned
+    pub fn split_page(&mut self, new_page_id: PageId) -> Result<(Key, Page), PageError> {
+        let curr_page_id = self.page_id;
+        match &mut self.body {
+            PageBody::Internal { keys, children } => {
+                if keys.len() < 2 {
+                    return Err(PageError::TooSmallToSplit(self.page_id));
+                }
+                debug_assert!(keys.iter().is_sorted());
+                let split_point = keys.len() / 2;
+                let new_keys = keys.split_off(split_point);
+                let new_children = children.split_off(split_point + 1);
+                let split_key = keys.pop().expect("missing key to promote!").clone();
+                debug_assert_eq!(keys.len(), children.len() + 1);
+                debug_assert_eq!(new_keys.len(), new_children.len() + 1);
+                Ok((
+                    split_key,
+                    Page {
+                        page_id: new_page_id,
+                        last_update: PageLsn(None),
+                        parent: self.parent,
+                        body: PageBody::Internal {
+                            keys: new_keys,
+                            children: new_children,
+                        },
+                    },
+                ))
+            }
+            PageBody::Leaf { records, next, .. } => {
+                if records.len() < 2 {
+                    return Err(PageError::TooSmallToSplit(self.page_id));
+                }
+                debug_assert!(
+                    records
+                        .iter()
+                        .filter_map(|r| r.fields.first())
+                        .map(|k| Key::try_from(k).unwrap())
+                        .is_sorted()
+                );
+                let split_point = records.len() / 2;
+                let new_records = records.split_off(split_point);
+                let split_key: Key = records
+                    .last()
+                    .expect("missing promoting key")
+                    .fields
+                    .first()
+                    .expect("missing primary key")
+                    .try_into()
+                    .expect("invalid key");
+
+                debug_assert_eq!(new_records.len(), records.len());
+                let new_page = Page {
+                    page_id: new_page_id,
+                    last_update: PageLsn(None),
+                    parent: self.parent,
+                    body: PageBody::Leaf {
+                        records: new_records,
+                        prev: Some(curr_page_id),
+                        next: *next,
+                    },
+                };
+
+                // connect current node to new right neighbor
+                *next = Some(new_page_id);
+                Ok((split_key, new_page))
+            }
+        }
     }
 }
 
@@ -208,7 +307,7 @@ impl Serializable for Page {
         w.write_all(&raw)?;
         Ok(())
     }
-    fn deserialize<R: std::io::prelude::Read>(r: &mut R) -> Result<Self, Self::Error> {
+    fn deserialize<R: Read>(r: &mut R) -> Result<Self, Self::Error> {
         let mut buf = [0u8; PAGE_SIZE];
         r.read_exact(&mut buf)?;
         let mut cursor = Cursor::new(&buf[..]);
@@ -222,7 +321,8 @@ impl Serializable for Page {
             _ => return Err(PageError::InvalidTag(tag)),
         };
 
-        let last_update = Lsn::deserialize(&mut cursor)?;
+        let page_id = PageId::deserialize(&mut cursor)?;
+        let last_update = PageLsn::deserialize(&mut cursor)?;
         let parent = Option::<PageId>::deserialize(&mut cursor)?;
         let (next_page, prev_page) = if is_leaf {
             let np = Option::<PageId>::deserialize(&mut cursor)?;
@@ -239,8 +339,10 @@ impl Serializable for Page {
         let body = if is_leaf {
             let mut records = Vec::with_capacity(num_items);
             for _ in 0..num_items {
-                let slot = SlotEntry::deserialize(&mut cursor)?;
-                records.push(Row::deserialize(&mut &buf[slot.range()])?);
+                let slot_range = SlotEntry::deserialize(&mut cursor)?.range();
+                records.push(Row::deserialize(
+                    &mut buf.get(slot_range).expect("bad range for leaf page!"),
+                )?);
             }
             PageBody::Leaf {
                 next: next_page,
@@ -254,12 +356,15 @@ impl Serializable for Page {
             }
             let mut keys = Vec::with_capacity(num_items);
             for _ in 0..num_items {
-                let slot = SlotEntry::deserialize(&mut cursor)?;
-                keys.push(Key::deserialize(&mut &buf[slot.range()])?);
+                let slot_range = SlotEntry::deserialize(&mut cursor)?.range();
+                keys.push(Key::deserialize(
+                    &mut buf.get(slot_range).expect("bad range for internal page!"),
+                )?);
             }
             PageBody::Internal { keys, children }
         };
         Ok(Page {
+            page_id,
             parent,
             last_update,
             body,
@@ -290,8 +395,9 @@ mod tests {
     use quickcheck_macros::quickcheck;
 
     use super::*;
-    use crate::commontypes::TableId;
+    use crate::commontypes::{Lsn, TableId};
     use crate::schema::RowValue;
+    use crate::schema::tests::SchemaRowPair;
 
     impl Arbitrary for PageBody {
         fn arbitrary(g: &mut Gen) -> Self {
@@ -306,7 +412,8 @@ mod tests {
                     PageBody::Internal { keys, children }
                 }
                 LEAF_TAG => {
-                    let records: Vec<Row> = (0..10).map(|_| Row::arbitrary(g)).collect();
+                    let mut records: Vec<Row> = (0..10).map(|_| Row::arbitrary(g)).collect();
+                    records.sort_by_key(|r| Key::try_from(&r.fields[0]).unwrap());
                     let next = Some(PageId::new(
                         TableId::new(u32::arbitrary(g)),
                         u32::arbitrary(g),
@@ -329,22 +436,59 @@ mod tests {
 
     impl Arbitrary for Page {
         fn arbitrary(g: &mut Gen) -> Self {
-            let mut lsn = u64::arbitrary(g);
-            while lsn == 0 {
-                lsn = u64::arbitrary(g);
-            }
-            let last_update = Lsn::new(lsn).unwrap();
+            let page_id = PageId::new(TableId::new(u32::arbitrary(g)), u32::arbitrary(g));
+            let last_update = PageLsn(Option::<Lsn>::arbitrary(g));
             let parent = Some(PageId::new(
                 TableId::new(u32::arbitrary(g)),
                 u32::arbitrary(g),
             ));
             let body = PageBody::arbitrary(g);
             Page {
+                page_id,
                 last_update,
                 parent,
                 body,
             }
         }
+    }
+
+    #[quickcheck]
+    fn page_insert_returns_page_full_when_full(
+        mut page: Page,
+        SchemaRowPair(schema, row): SchemaRowPair,
+    ) -> TestResult {
+        if !matches!(page.body, PageBody::Leaf { .. }) {
+            return TestResult::discard();
+        }
+        if page.can_insert(&row) {
+            return TestResult::discard();
+        }
+
+        let validated_row = schema.validate_row(row).unwrap();
+
+        let result = page.insert(validated_row);
+
+        assert!(matches!(result, Err(PageError::PageFull)), "{result:?}");
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn duplicate_keys_trigger_error_on_insert(
+        mut page: Page,
+        SchemaRowPair(schema, row): SchemaRowPair,
+    ) -> TestResult {
+        if !matches!(page.body, PageBody::Leaf { .. }) {
+            return TestResult::discard();
+        }
+        if !page.can_insert(&row) {
+            return TestResult::discard();
+        }
+        let validated_row = schema.validate_row(row).unwrap();
+        let _ = page.insert(validated_row.clone()); // this might error if the key already exists, but we're guaranteed to have it in there after calling it
+        let result = page.insert(validated_row); // this is the check that matters
+
+        assert!(matches!(result, Err(PageError::DuplicateKey)), "{result:?}");
+        TestResult::passed()
     }
 
     #[quickcheck]
@@ -376,7 +520,8 @@ mod tests {
             })
             .collect();
         let lpage = Page {
-            last_update: Lsn::new(10).unwrap(),
+            page_id: PageId::new(TableId::new(10), 10),
+            last_update: PageLsn(Some(Lsn::new(10).unwrap())),
             parent: Some(PageId::new(TableId::new(1), 1)),
             body: PageBody::Leaf {
                 records,
@@ -398,7 +543,8 @@ mod tests {
         let keys: Vec<Key> = (0..10).map(|i| Key::String(i.to_string())).collect();
         let children: Vec<PageId> = (0..11).map(|i| PageId::new(TableId::new(1), i)).collect();
         let ipage = Page {
-            last_update: Lsn::new(10).unwrap(),
+            page_id: PageId::new(TableId::new(10), 10),
+            last_update: PageLsn(Some(Lsn::new(10).unwrap())),
             parent: Some(PageId::new(TableId::new(1), 1)),
             body: PageBody::Internal { keys, children },
         };

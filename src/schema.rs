@@ -1,4 +1,5 @@
 use crate::commontypes::Key;
+use crate::page::PAGE_SIZE;
 use crate::traits::Serializable;
 use integer_encoding::*;
 use std::io::{Read, Write};
@@ -11,7 +12,7 @@ const FLOAT_FLAG: u8 = 2;
 const STRING_FLAG: u8 = 3;
 const BOOL_FLAG: u8 = 4;
 
-const MAX_FIELD_LEN: usize = 4096 / 2;
+const MAX_FIELD_LEN: usize = PAGE_SIZE / 2;
 const MAX_NUM_FIELDS: usize = 255;
 
 #[derive(Error, Debug)]
@@ -138,7 +139,7 @@ impl Serializable for RowValue {
             Self::Boolean(_) => 1 + size_of::<u8>(),
             Self::String(s) => {
                 let length = s.len();
-                let varlen = length.encode_var_vec().len();
+                let varlen = length.required_space();
                 1 + varlen + length
             }
             Self::Null => 1,
@@ -156,6 +157,27 @@ pub enum RowError {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Row {
     pub(crate) fields: Vec<RowValue>,
+}
+
+impl Row {
+    /// Compares this row's primary key (its first field) against `key`.
+    ///
+    /// The result is how `self` orders relative to `key`, which is the
+    /// orientation `binary_search_by` expects, so no `.reverse()` is needed.
+    ///
+    /// Panics if the first field isn't a valid key. Stored rows passed schema
+    /// validation, so reaching that arm means the page is corrupt.
+    pub fn cmp_key(&self, key: &Key) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (self.fields.first(), key) {
+            (Some(RowValue::Integer(a)), Key::Integer(b)) => a.cmp(b),
+            (Some(RowValue::String(a)), Key::String(b)) => a.as_str().cmp(b.as_str()),
+            // Mirror Key's derived Ord, where Integer sorts before String.
+            (Some(RowValue::Integer(_)), Key::String(_)) => Ordering::Less,
+            (Some(RowValue::String(_)), Key::Integer(_)) => Ordering::Greater,
+            (other, _) => panic!("row has invalid primary key {other:?}; page is corrupt"),
+        }
+    }
 }
 
 impl TryFrom<Vec<RowValue>> for Row {
@@ -348,7 +370,7 @@ impl Schema {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use quickcheck::{Arbitrary, Gen, TestResult};
     use quickcheck_macros::quickcheck;
@@ -385,7 +407,7 @@ mod tests {
     impl Arbitrary for Schema {
         fn arbitrary(g: &mut Gen) -> Self {
             let mut first_entry = Column::arbitrary(g);
-            while !first_entry.col_type.is_valid_key() {
+            while !first_entry.col_type.is_valid_key() || first_entry.nullable {
                 first_entry = Column::arbitrary(g);
             }
             Schema {
@@ -424,7 +446,7 @@ mod tests {
             let count = usize::arbitrary(g).min(10);
             let mut first_entry = RowValue::arbitrary(g);
             while !matches!(first_entry, RowValue::Integer(_) | RowValue::String(_))
-                && first_entry.encoded_size() > 25
+                || first_entry.encoded_size() > 25
             {
                 first_entry = RowValue::arbitrary(g);
             }
@@ -443,15 +465,51 @@ mod tests {
         }
     }
 
+    fn valid_row_from_schema(schema: &Schema, g: &mut Gen) -> Row {
+        Row {
+            fields: schema
+                .columns
+                .iter()
+                .map(|c| {
+                    let coin_flip = bool::arbitrary(g);
+                    match c.col_type {
+                        _ if c.nullable && coin_flip => RowValue::Null,
+                        ColumnType::Bool => RowValue::Boolean(bool::arbitrary(g)),
+                        ColumnType::Float => {
+                            let mut f = f64::arbitrary(g);
+                            while f.is_nan() {
+                                f = f64::arbitrary(g);
+                            }
+                            RowValue::Float(f)
+                        }
+                        ColumnType::Integer => RowValue::Integer(i64::arbitrary(g)),
+                        ColumnType::String => RowValue::String(String::arbitrary(g)),
+                    }
+                })
+                .collect(),
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub(crate) struct SchemaRowPair(pub(crate) Schema, pub(crate) Row);
+
+    impl Arbitrary for SchemaRowPair {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let schema = Schema::arbitrary(g);
+            let row = valid_row_from_schema(&schema, g);
+            SchemaRowPair(schema, row)
+        }
+    }
+
     #[quickcheck]
-    fn primary_key_returns_key(schema: Schema, row: Row) -> TestResult {
+    fn primary_key_returns_key(SchemaRowPair(schema, row): SchemaRowPair) -> TestResult {
         match schema.validate_row(row) {
             Ok(validated_row) => {
                 let first_entry = &validated_row.0.fields[0];
                 assert!(Key::try_from(first_entry).is_ok());
                 TestResult::passed()
             }
-            Err(_) => TestResult::discard(),
+            Err(_) => TestResult::failed(),
         }
     }
 
@@ -674,5 +732,17 @@ mod tests {
     fn schemas_fail_with_no_columns() {
         let schema_result = Schema::try_from(vec![]);
         assert!(matches!(schema_result, Err(SchemaError::EmptyColumns)));
+    }
+
+    #[quickcheck]
+    fn cmp_key_matches_key_ord(row: Row, key: Key) -> bool {
+        let row_key = Key::try_from(&row.fields[0]).unwrap();
+        row.cmp_key(&key) == row_key.cmp(&key)
+    }
+
+    #[quickcheck]
+    fn cmp_key_equal_to_own_key(row: Row) -> bool {
+        let row_key = Key::try_from(&row.fields[0]).unwrap();
+        row.cmp_key(&row_key) == std::cmp::Ordering::Equal
     }
 }
