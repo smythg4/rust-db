@@ -6,9 +6,11 @@ Working on phase 1 without getting too in the weeds on the schema. Right now the
 
 ### Immediate To-Do
 - [x] Write `Schema` type used to validate `Row`s prior to `insert` operations.
-- [ ] Write `.free_space(&self)` method on my `Page`
-- [ ] Write `.can_insert(&self, row: &Row) -> bool` method on my `Page` to determine if a node split is required.
-- [ ] Write a `.primary_key(&self) -> RowValue` method for `Row` to return the primary key. Currently I'm leaning towards always putting the primary key in slot 0.
+- [x] Add a `Bool` type for `RowValues`, don't allow it as a Primary Key in the `Schema`.
+- [x] Write `.free_space(&self)` method on my `Page`
+- [x] Write tests for `.free_space(&self)` that serialize actual pages and confirm free space lines up properly
+- [x] Write `.can_insert(&self, row: &Row) -> bool` method on my `Page` to determine if a node split is required.
+- [ ] Write a `.primary_key(&self) -> Key` method for `ValidatedRow` to return the primary key. Currently I'm leaning towards always putting the primary key in slot 0.
 - [ ] Add an error return if someone tries to construct a `Row` with an invalid type in the primary key (first) slot.
 
 ### Phase 0 — types

@@ -25,14 +25,14 @@ pub enum PageError {
 }
 pub type RawPage = [u8; PAGE_SIZE];
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub struct Page {
     last_update: Lsn,
     parent: Option<PageId>,
     body: PageBody,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone)]
 pub enum PageBody {
     Leaf {
         records: Vec<Row>,
@@ -60,32 +60,62 @@ impl Page {
         }
     }
 
-    pub fn as_raw_page(&self) -> Result<RawPage, PageError> {
-        let mut cursor = Cursor::new([0u8; PAGE_SIZE]);
+    pub fn free_space(&self) -> Option<usize> {
+        let base_header_len = 1 // tag
+            + 8 // Lsn
+            + 1 + PAGE_ID_SIZE // parent_page
+            + 2; // num_pages
+        let used_size = match &self.body {
+            PageBody::Internal { keys, children } => {
+                let header_len = base_header_len;
+                let slots_len = keys.len() * SLOT_ENTRY_SIZE;
+                let children_len = children.len() * PAGE_ID_SIZE;
+                let keys_len = keys.iter().map(|k| k.encoded_size()).sum::<usize>();
+                header_len + slots_len + children_len + keys_len
+            }
+            PageBody::Leaf { records, .. } => {
+                let header_len = base_header_len
+                    + 1 + PAGE_ID_SIZE // next page
+                    + 1 + PAGE_ID_SIZE; // prev page
+                let slots_len = records.len() * SLOT_ENTRY_SIZE;
+                let records_len = records.iter().map(|r| r.encoded_size()).sum::<usize>();
+                header_len + slots_len + records_len
+            }
+        };
+        PAGE_SIZE.checked_sub(used_size)
+    }
 
+    /// Writes header to underlying RawPage
+    /// TODO: Figure out trait bounds to make this generic (Write + Seek)?
+    pub fn write_header(&self, writer: &mut Cursor<RawPage>) -> Result<(), PageError> {
         // Write the header information: Type Tag, LSN, Parent page, then if
         // a Leaf node, write the Next and Prev pages.
-        cursor.write_all(&[self.page_type_tag()])?;
-        self.last_update.serialize(&mut cursor)?;
-        self.parent.serialize(&mut cursor)?;
+        writer.write_all(&[self.page_type_tag()])?;
+        self.last_update.serialize(writer)?;
+        self.parent.serialize(writer)?;
         match self.body {
             PageBody::Leaf { next, prev, .. } => {
-                next.serialize(&mut cursor)?;
-                prev.serialize(&mut cursor)?;
+                next.serialize(writer)?;
+                prev.serialize(writer)?;
             }
             PageBody::Internal { .. } => {}
         };
 
         // note the number of items stored on the page
         let num_items = self.num_items() as u16; // records.len() for Leaf, keys.len() for Internal
-        cursor.write_all(&num_items.to_be_bytes())?;
+        writer.write_all(&num_items.to_be_bytes())?;
+        Ok(())
+    }
 
-        // Header complete, mark the position.
-        let header_end = cursor.position() as usize;
-
-        // track the current position of where to write data
+    /// Writes the body of a page to the underlying RawPage
+    /// Returns slot_offset and data_offset (used for tests)
+    /// TODO: Figure out trait bounds to make this generic (Write + Seek)?
+    pub fn write_body(
+        &self,
+        writer: &mut Cursor<RawPage>,
+        header_end: usize,
+    ) -> Result<(usize, usize), PageError> {
         let mut data_offset = PAGE_SIZE;
-
         match &self.body {
             PageBody::Leaf { records, .. } => {
                 // Track the positions
@@ -99,25 +129,26 @@ impl Page {
 
                     // shift the offset back, and write the Row at the proper offset
                     data_offset -= len;
-                    cursor.set_position(data_offset as u64);
-                    cursor.write_all(&buffer)?;
+                    writer.set_position(data_offset as u64);
+                    writer.write_all(&buffer)?;
 
                     // build a SlotEntry to point to the newly written data and write
                     // it at the proper offset
                     let slot_entry = SlotEntry::new(data_offset as u16, len as u16);
-                    cursor.set_position(slot_offset as u64);
-                    slot_entry.serialize(&mut cursor)?;
+                    writer.set_position(slot_offset as u64);
+                    slot_entry.serialize(writer)?;
 
                     // advance the running slot_offset
                     slot_offset += SLOT_ENTRY_SIZE;
                 }
+                Ok((slot_offset, data_offset))
             }
             PageBody::Internal { keys, children } => {
                 // children are fixed-width and inserted in order right after the header
                 let mut children_pos = header_end;
                 for child in children {
-                    cursor.set_position(children_pos as u64);
-                    child.serialize(&mut cursor)?;
+                    writer.set_position(children_pos as u64);
+                    child.serialize(writer)?;
                     children_pos += PAGE_ID_SIZE;
                 }
 
@@ -131,18 +162,40 @@ impl Page {
 
                     // adjust data_offset and write the data
                     data_offset -= length;
-                    cursor.set_position(data_offset as u64);
-                    cursor.write_all(&buffer)?;
+                    writer.set_position(data_offset as u64);
+                    writer.write_all(&buffer)?;
 
                     // write the accompanying SlotEntry
                     let slot_entry = SlotEntry::new(data_offset as u16, length as u16);
-                    cursor.set_position(slot_offset as u64);
-                    slot_entry.serialize(&mut cursor)?;
+                    writer.set_position(slot_offset as u64);
+                    slot_entry.serialize(writer)?;
                     slot_offset += SLOT_ENTRY_SIZE;
                 }
+                Ok((slot_offset, data_offset))
             }
-        };
+        }
+    }
+
+    pub fn as_raw_page(&self) -> Result<RawPage, PageError> {
+        let mut cursor = Cursor::new([0u8; PAGE_SIZE]);
+
+        self.write_header(&mut cursor)?;
+
+        // Header complete, mark the position.
+        let header_end = cursor.position() as usize;
+
+        // write the body (result isn't important here)
+        let _ = self.write_body(&mut cursor, header_end)?;
+
         Ok(cursor.into_inner())
+    }
+
+    pub fn can_insert(&self, row: &Row) -> bool {
+        let free_space = match self.free_space() {
+            None => return false,
+            Some(s) => s,
+        };
+        row.encoded_size() + SLOT_ENTRY_SIZE < free_space
     }
 }
 
@@ -210,6 +263,10 @@ impl Serializable for Page {
             body,
         })
     }
+
+    fn encoded_size(&self) -> usize {
+        PAGE_SIZE
+    }
 }
 
 impl PageBody {
@@ -227,9 +284,66 @@ impl PageBody {
 
 #[cfg(test)]
 mod tests {
+    use quickcheck::{Arbitrary, Gen, TestResult};
+    use quickcheck_macros::quickcheck;
+
     use super::*;
     use crate::commontypes::TableId;
     use crate::schema::RowValue;
+
+    impl Arbitrary for PageBody {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let kind = g.choose(&[INTERNAL_TAG, LEAF_TAG]).unwrap();
+            match *kind {
+                INTERNAL_TAG => {
+                    let keys: Vec<Key> =
+                        (0..10).map(|_| Key::String(String::arbitrary(g))).collect();
+                    let children: Vec<PageId> = (0..11)
+                        .map(|_| PageId::new(TableId::new(u32::arbitrary(g)), u32::arbitrary(g)))
+                        .collect();
+                    PageBody::Internal { keys, children }
+                }
+                LEAF_TAG => {
+                    let records: Vec<Row> = (0..10).map(|_| Row::arbitrary(g)).collect();
+                    let next = Some(PageId::new(
+                        TableId::new(u32::arbitrary(g)),
+                        u32::arbitrary(g),
+                    ));
+                    let prev = Some(PageId::new(
+                        TableId::new(u32::arbitrary(g)),
+                        u32::arbitrary(g),
+                    ));
+
+                    PageBody::Leaf {
+                        records,
+                        next,
+                        prev,
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    impl Arbitrary for Page {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let mut lsn = u64::arbitrary(g);
+            while lsn == 0 {
+                lsn = u64::arbitrary(g);
+            }
+            let last_update = Lsn::new(lsn).unwrap();
+            let parent = Some(PageId::new(
+                TableId::new(u32::arbitrary(g)),
+                u32::arbitrary(g),
+            ));
+            let body = PageBody::arbitrary(g);
+            Page {
+                last_update,
+                parent,
+                body,
+            }
+        }
+    }
 
     #[test]
     fn basic_leaf_page_roundtrip() {
@@ -280,5 +394,20 @@ mod tests {
         let deser = Page::deserialize(&mut Cursor::new(bytes)).unwrap();
 
         assert_eq!(deser, ipage);
+    }
+
+    #[quickcheck]
+    fn free_space_works(page: Page) -> TestResult {
+        let free_space = page.free_space().unwrap();
+
+        let mut raw_page = Cursor::new([0u8; PAGE_SIZE]);
+        page.write_header(&mut raw_page).unwrap();
+        let header_end = raw_page.position() as usize;
+        let (slot_offset, data_offset) = page.write_body(&mut raw_page, header_end).unwrap();
+
+        let actual_free_space = data_offset - slot_offset;
+
+        assert_eq!(free_space, actual_free_space);
+        TestResult::passed()
     }
 }

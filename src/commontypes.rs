@@ -1,5 +1,6 @@
 use crate::schema::{RowValue, RowValueError};
 use crate::traits::Serializable;
+use integer_encoding::*;
 use std::io::{Read, Write};
 use thiserror::Error;
 
@@ -41,6 +42,9 @@ impl Serializable for PageId {
         let page_num = u32::from_be_bytes(page_buf);
 
         Ok(PageId::new(table_id, page_num))
+    }
+    fn encoded_size(&self) -> usize {
+        PAGE_ID_SIZE
     }
 }
 
@@ -118,6 +122,10 @@ impl Serializable for Lsn {
         w.write_all(&self.0.to_be_bytes())?;
         Ok(())
     }
+
+    fn encoded_size(&self) -> usize {
+        size_of::<u64>()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +160,9 @@ impl Serializable for SlotEntry {
             u16::from_be_bytes(offset_buf),
             u16::from_be_bytes(length_buf),
         ))
+    }
+    fn encoded_size(&self) -> usize {
+        SLOT_ENTRY_SIZE
     }
 }
 
@@ -201,6 +212,9 @@ macro_rules! id_type_serializable {
                 let mut buf = [0u8; std::mem::size_of::<$inner>()];
                 r.read_exact(&mut buf)?;
                 Ok(Self(<$inner>::from_be_bytes(buf)))
+            }
+            fn encoded_size(&self) -> usize {
+                1 + std::mem::size_of::<$inner>()
             }
         }
     };
@@ -258,15 +272,50 @@ impl Serializable for Key {
         field.serialize(w)?;
         Ok(())
     }
+
     fn deserialize<R: Read>(r: &mut R) -> Result<Self, Self::Error> {
         let field = RowValue::deserialize(r)?;
         field.try_into()
+    }
+
+    fn encoded_size(&self) -> usize {
+        match self {
+            Self::Integer(_) => 1 + size_of::<i64>(),
+            Self::String(s) => {
+                let length = s.len();
+                let varlen = length.encode_var_vec().len();
+                1 + varlen + length
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quickcheck::{Arbitrary, Gen, TestResult};
+    use quickcheck_macros::quickcheck;
+    use std::io::Cursor;
+
+    impl Arbitrary for Key {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let num = g.choose(&[0, 1]).unwrap();
+            match num {
+                0 => Key::Integer(i64::arbitrary(g)),
+                1 => Key::String(String::arbitrary(g)),
+                _ => unreachable!(),
+            }
+        }
+    }
+
+    #[quickcheck]
+    fn key_encoded_sizes(key: Key) -> TestResult {
+        let mut bytes = Cursor::new(Vec::new());
+        key.serialize(&mut bytes).unwrap();
+
+        assert_eq!(key.encoded_size(), bytes.into_inner().len());
+        TestResult::passed()
+    }
 
     #[test]
     fn page_id_size_constant_is_accurate() {

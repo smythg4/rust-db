@@ -1,3 +1,4 @@
+use crate::commontypes::Key;
 use crate::traits::Serializable;
 use integer_encoding::*;
 use std::io::{Read, Write};
@@ -129,6 +130,20 @@ impl Serializable for RowValue {
         }
         Ok(())
     }
+
+    fn encoded_size(&self) -> usize {
+        match self {
+            Self::Float(_) => 1 + size_of::<f64>(),
+            Self::Integer(_) => 1 + size_of::<i64>(),
+            Self::Boolean(_) => 1 + size_of::<u8>(),
+            Self::String(s) => {
+                let length = s.len();
+                let varlen = length.encode_var_vec().len();
+                1 + varlen + length
+            }
+            Self::Null => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -167,6 +182,10 @@ impl Serializable for Row {
             f.serialize(w)?;
         }
         Ok(())
+    }
+
+    fn encoded_size(&self) -> usize {
+        1 + self.fields.iter().map(|f| f.encoded_size()).sum::<usize>()
     }
 }
 
@@ -241,6 +260,16 @@ pub enum SchemaError {
 /// bad bytes into the database.
 #[derive(Debug, Clone)]
 pub struct ValidatedRow(Row);
+
+impl ValidatedRow {
+    pub fn primary_key(&self) -> Key {
+        match &self.0.fields[0] {
+            RowValue::Integer(n) => Key::Integer(*n),
+            RowValue::String(s) => Key::String(s.clone()),
+            _ => unreachable!("shouldn't be able to get another option from a Validated Row"),
+        }
+    }
+}
 
 impl From<ValidatedRow> for Row {
     fn from(value: ValidatedRow) -> Self {
@@ -323,6 +352,38 @@ mod tests {
                 _ => unreachable!(),
             }
         }
+    }
+
+    impl Arbitrary for Row {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let count = usize::arbitrary(g).min(9);
+            let mut first_entry = RowValue::arbitrary(g);
+            while !matches!(first_entry, RowValue::Integer(_) | RowValue::String(_)) {
+                first_entry = RowValue::arbitrary(g);
+            }
+            Row {
+                fields: [first_entry]
+                    .into_iter()
+                    .chain((0..count).map(|_| RowValue::arbitrary(g)))
+                    .collect(),
+            }
+        }
+    }
+
+    #[quickcheck]
+    fn encoded_sizes(value: RowValue) -> TestResult {
+        let mut bytes = Cursor::new(Vec::new());
+        value.serialize(&mut bytes).unwrap();
+        assert_eq!(value.encoded_size(), bytes.into_inner().len());
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn encoded_row_sizes(row: Row) -> TestResult {
+        let mut bytes = Cursor::new(Vec::new());
+        row.serialize(&mut bytes).unwrap();
+        assert_eq!(row.encoded_size(), bytes.into_inner().len());
+        TestResult::passed()
     }
 
     #[quickcheck]

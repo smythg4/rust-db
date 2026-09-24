@@ -6,6 +6,7 @@ where
     type Error;
     fn serialize<W: Write>(&self, w: &mut W) -> Result<(), Self::Error>;
     fn deserialize<R: Read>(r: &mut R) -> Result<Self, Self::Error>;
+    fn encoded_size(&self) -> usize;
 }
 
 /// Handles Option types by pre-pending entries with a '0' u8 for `None` or a
@@ -27,12 +28,20 @@ where
             }
         }
     }
+
     fn deserialize<R: Read>(r: &mut R) -> Result<Self, Self::Error> {
         let mut tag = [0u8; 1];
         r.read_exact(&mut tag)?;
         match tag[0] {
             0 => Ok(None),
             _ => Ok(Some(T::deserialize(r)?)),
+        }
+    }
+
+    fn encoded_size(&self) -> usize {
+        match self {
+            Some(v) => v.encoded_size() + 1,
+            None => 1,
         }
     }
 }
