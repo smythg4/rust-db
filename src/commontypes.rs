@@ -225,6 +225,8 @@ pub enum KeyError {
     NullKey,
     #[error(transparent)]
     RowValue(#[from] RowValueError),
+    #[error("Seriously? A boolean as a key?")]
+    BoolKey,
 }
 
 impl TryFrom<RowValue> for Key {
@@ -235,6 +237,7 @@ impl TryFrom<RowValue> for Key {
             RowValue::String(s) => Ok(Self::String(s)),
             RowValue::Null => Err(KeyError::NullKey),
             RowValue::Float(_) => Err(KeyError::NotOrderable),
+            RowValue::Boolean(_) => Err(KeyError::BoolKey),
         }
     }
 }

@@ -1,4 +1,3 @@
-use crate::commontypes::{Key, KeyError};
 use crate::traits::Serializable;
 use integer_encoding::*;
 use std::io::{Read, Write};
@@ -9,6 +8,7 @@ const NULL_FLAG: u8 = 0;
 const INT_FLAG: u8 = 1;
 const FLOAT_FLAG: u8 = 2;
 const STRING_FLAG: u8 = 3;
+const BOOL_FLAG: u8 = 4;
 
 const MAX_FIELD_LEN: usize = 4096 / 2;
 const MAX_NUM_FIELDS: usize = 255;
@@ -25,6 +25,8 @@ pub enum RowValueError {
     FieldTooLong(usize),
     #[error("Too many fields: {0}. Only {MAX_NUM_FIELDS} allowed")]
     TooManyFields(usize),
+    #[error("Booleans must come from bytes holding '0' or '1', got {0}")]
+    InvalidBool(u8),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -32,6 +34,7 @@ pub enum RowValue {
     Integer(i64),
     Float(f64),
     String(String),
+    Boolean(bool),
     Null,
 }
 
@@ -41,6 +44,7 @@ impl RowValue {
             Self::Integer(_) => INT_FLAG,
             Self::Float(_) => FLOAT_FLAG,
             Self::String(_) => STRING_FLAG,
+            Self::Boolean(_) => BOOL_FLAG,
             Self::Null => NULL_FLAG,
         }
     }
@@ -50,6 +54,7 @@ impl RowValue {
             Self::Float(_) => Some(ColumnType::Float),
             Self::Integer(_) => Some(ColumnType::Integer),
             Self::String(_) => Some(ColumnType::String),
+            Self::Boolean(_) => Some(ColumnType::Bool),
             Self::Null => None,
         }
     }
@@ -58,10 +63,10 @@ impl RowValue {
 impl Serializable for RowValue {
     type Error = RowValueError;
     fn deserialize<R: Read>(r: &mut R) -> Result<Self, RowValueError> {
-        let mut tag_buf = [0u8; 1];
+        let mut one_buf = [0u8; 1];
         let mut eight_buf = [0u8; 8];
-        r.read_exact(&mut tag_buf)?;
-        let tag = tag_buf[0];
+        r.read_exact(&mut one_buf)?;
+        let tag = one_buf[0];
         match tag {
             INT_FLAG => {
                 r.read_exact(&mut eight_buf)?;
@@ -79,6 +84,14 @@ impl Serializable for RowValue {
                 let mut s = vec![0u8; len];
                 r.read_exact(&mut s)?;
                 Ok(Self::String(String::from_utf8(s)?))
+            }
+            BOOL_FLAG => {
+                r.read_exact(&mut one_buf)?;
+                match one_buf[0] {
+                    0 => Ok(Self::Boolean(false)),
+                    1 => Ok(Self::Boolean(true)),
+                    _ => Err(RowValueError::InvalidBool(one_buf[0])),
+                }
             }
             NULL_FLAG => Ok(Self::Null),
             _ => Err(RowValueError::UnknownTag(tag)),
@@ -104,6 +117,13 @@ impl Serializable for RowValue {
                 let varlen = length.encode_var_vec();
                 w.write_all(&varlen)?;
                 w.write_all(s.as_bytes())?;
+            }
+            RowValue::Boolean(b) => {
+                w.write_all(&BOOL_FLAG.to_be_bytes())?;
+                match b {
+                    true => w.write_all(&1u8.to_be_bytes()),
+                    false => w.write_all(&0u8.to_be_bytes()),
+                }?;
             }
             RowValue::Null => w.write_all(&NULL_FLAG.to_be_bytes())?,
         }
@@ -155,6 +175,17 @@ pub enum ColumnType {
     Integer,
     Float,
     String,
+    Bool,
+}
+
+impl ColumnType {
+    fn is_valid_key(&self) -> bool {
+        match self {
+            Self::Float => false,
+            Self::Bool => false,
+            Self::Integer | Self::String => true,
+        }
+    }
 }
 
 /// A value stored in a `Schema` representing the defined column type
@@ -166,24 +197,25 @@ pub struct Column {
 }
 
 macro_rules! column_constructors {
-      ($($variant:ident => $non_null:ident, $nullable:ident);* $(;)?) => {
-          impl Column {
-              $(
-                  pub const fn $non_null() -> Self {
-                      Self { col_type: ColumnType::$variant, nullable: false }
-                  }
-                  pub const fn $nullable() -> Self {
-                      Self { col_type: ColumnType::$variant, nullable: true }
-                  }
-              )*
-          }
-      };
-  }
+    ($($variant:ident => $non_null:ident, $nullable:ident);* $(;)?) => {
+        impl Column {
+            $(
+                pub const fn $non_null() -> Self {
+                    Self { col_type: ColumnType::$variant, nullable: false }
+                }
+                pub const fn $nullable() -> Self {
+                    Self { col_type: ColumnType::$variant, nullable: true }
+                }
+            )*
+        }
+    };
+}
 
 column_constructors! {
     Integer => integer, nullable_integer;
     Float => float, nullable_float;
     String => string, nullable_string;
+    Bool => bool, nullable_bool;
 }
 
 #[derive(Error, Debug)]
@@ -207,6 +239,7 @@ pub enum SchemaError {
 /// ValidatedRow is the only type accepted for `insert` operations on the B+Tree
 /// This ensures that Schema validation has been accomplished before trying to push
 /// bad bytes into the database.
+#[derive(Debug, Clone)]
 pub struct ValidatedRow(Row);
 
 impl From<ValidatedRow> for Row {
@@ -216,7 +249,8 @@ impl From<ValidatedRow> for Row {
 }
 
 /// Stores the list of columns for a Table. Columns include a ColumnType (e.g. Integer, String,
-/// Float) as well as an `is_nullable` flag indicated whether or not the field is nullable.
+/// Float) as well as an `nullable` flag indicated whether or not the field is nullable.
+#[derive(Debug, Clone)]
 pub struct Schema {
     columns: Vec<Column>,
 }
@@ -227,7 +261,7 @@ impl TryFrom<Vec<Column>> for Schema {
         if columns.is_empty() {
             return Err(SchemaError::EmptyColumns);
         }
-        if columns[0].col_type == ColumnType::Float {
+        if !columns[0].col_type.is_valid_key() {
             return Err(SchemaError::NonOrdPrimaryKey);
         }
         if columns[0].nullable {
@@ -273,7 +307,7 @@ mod tests {
 
     impl Arbitrary for RowValue {
         fn arbitrary(g: &mut Gen) -> Self {
-            let num = g.choose(&[0, 1, 2, 3]).unwrap();
+            let num = g.choose(&[0, 1, 2, 3, 4]).unwrap();
             match num {
                 0 => RowValue::Integer(i64::arbitrary(g)),
                 1 => {
@@ -285,6 +319,7 @@ mod tests {
                 }
                 2 => RowValue::String(String::arbitrary(g)),
                 3 => RowValue::Null,
+                4 => RowValue::Boolean(bool::arbitrary(g)),
                 _ => unreachable!(),
             }
         }
@@ -337,7 +372,7 @@ mod tests {
 
     #[quickcheck]
     fn invalid_tags_trigger_error(tag: u8) -> TestResult {
-        if [STRING_FLAG, INT_FLAG, FLOAT_FLAG, NULL_FLAG].contains(&tag) {
+        if [STRING_FLAG, INT_FLAG, FLOAT_FLAG, BOOL_FLAG, NULL_FLAG].contains(&tag) {
             return TestResult::discard();
         }
 
@@ -360,6 +395,7 @@ mod tests {
                 Column::integer(),
                 Column::nullable_string(),
                 Column::nullable_float(),
+                Column::bool(),
             ],
         };
 
@@ -368,13 +404,19 @@ mod tests {
                 RowValue::Integer(1),
                 RowValue::String("hello".to_string()),
                 RowValue::Float(1.5),
+                RowValue::Boolean(true),
             ],
         };
         assert!(schema.validate_row(all_present).is_ok());
 
         // NULL is fine in nullable columns
         let with_nulls = Row {
-            fields: vec![RowValue::Integer(2), RowValue::Null, RowValue::Null],
+            fields: vec![
+                RowValue::Integer(2),
+                RowValue::Null,
+                RowValue::Null,
+                RowValue::Boolean(true),
+            ],
         };
         assert!(schema.validate_row(with_nulls).is_ok());
     }
@@ -424,9 +466,18 @@ mod tests {
     }
 
     #[test]
-    fn schemas_cant_have_float_primary_keys() {
+    fn schemas_cant_have_invalidkey_primary_keys() {
+        // Floats can't be primary keys
         let schema_result = Schema::try_from(vec![
             Column::float(),
+            Column::string(),
+            Column::nullable_float(),
+        ]);
+        assert!(matches!(schema_result, Err(SchemaError::NonOrdPrimaryKey)));
+
+        // Bools can't be primary keys
+        let schema_result = Schema::try_from(vec![
+            Column::bool(),
             Column::string(),
             Column::nullable_float(),
         ]);

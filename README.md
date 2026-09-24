@@ -5,6 +5,7 @@ A learning project focused on learning more about databases.
 Working on phase 1 without getting too in the weeds on the schema. Right now the schema is really just a `Row` entry that holds a list of values. Currently I'm able to roundtrip an `InternalPage` and a `LeafPage` to/from raw bytes. I need to write out the helper functions to determine when splits or merges will be needed upon `insert` and `delete`.
 
 ### Immediate To-Do
+- [x] Write `Schema` type used to validate `Row`s prior to `insert` operations.
 - [ ] Write `.free_space(&self)` method on my `Page`
 - [ ] Write `.can_insert(&self, row: &Row) -> bool` method on my `Page` to determine if a node split is required.
 - [ ] Write a `.primary_key(&self) -> RowValue` method for `Row` to return the primary key. Currently I'm leaning towards always putting the primary key in slot 0.
