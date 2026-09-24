@@ -1,3 +1,4 @@
+use crate::commontypes::{Key, KeyError};
 use crate::traits::Serializable;
 use integer_encoding::*;
 use std::io::{Read, Write};
@@ -156,10 +157,33 @@ pub enum ColumnType {
     String,
 }
 
+/// A value stored in a `Schema` representing the defined column type
+/// and whether or not the field is nullable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
     col_type: ColumnType,
     nullable: bool,
+}
+
+macro_rules! column_constructors {
+      ($($variant:ident => $non_null:ident, $nullable:ident);* $(;)?) => {
+          impl Column {
+              $(
+                  pub const fn $non_null() -> Self {
+                      Self { col_type: ColumnType::$variant, nullable: false }
+                  }
+                  pub const fn $nullable() -> Self {
+                      Self { col_type: ColumnType::$variant, nullable: true }
+                  }
+              )*
+          }
+      };
+  }
+
+column_constructors! {
+    Integer => integer, nullable_integer;
+    Float => float, nullable_float;
+    String => string, nullable_string;
 }
 
 #[derive(Error, Debug)]
@@ -170,8 +194,19 @@ pub enum SchemaError {
     ColumnCountMismatch,
     #[error("Null value in non-nullable column {0}")]
     NullValueInNonNullCol(usize),
+    #[error("Primary keys cannot be nullable")]
+    NullablePrimaryKey,
+    #[error("Primary keys must be impl Ord")]
+    NonOrdPrimaryKey,
+    #[error("Cannot build Schema from empty column slice")]
+    EmptyColumns,
+    #[error("Too many columns")]
+    TooManyColumns,
 }
 
+/// ValidatedRow is the only type accepted for `insert` operations on the B+Tree
+/// This ensures that Schema validation has been accomplished before trying to push
+/// bad bytes into the database.
 pub struct ValidatedRow(Row);
 
 impl From<ValidatedRow> for Row {
@@ -179,11 +214,36 @@ impl From<ValidatedRow> for Row {
         value.0
     }
 }
+
+/// Stores the list of columns for a Table. Columns include a ColumnType (e.g. Integer, String,
+/// Float) as well as an `is_nullable` flag indicated whether or not the field is nullable.
 pub struct Schema {
     columns: Vec<Column>,
 }
 
+impl TryFrom<Vec<Column>> for Schema {
+    type Error = SchemaError;
+    fn try_from(columns: Vec<Column>) -> Result<Self, Self::Error> {
+        if columns.is_empty() {
+            return Err(SchemaError::EmptyColumns);
+        }
+        if columns[0].col_type == ColumnType::Float {
+            return Err(SchemaError::NonOrdPrimaryKey);
+        }
+        if columns[0].nullable {
+            return Err(SchemaError::NullablePrimaryKey);
+        }
+        if columns.len() > MAX_NUM_FIELDS {
+            return Err(SchemaError::TooManyColumns);
+        }
+        Ok(Self { columns })
+    }
+}
+
 impl Schema {
+    /// Takes an unvalidated Row and ensures it conforms to the `Schema`, errors
+    /// will indicate what was wrong and in which column it occurred. `ValidatedRow`
+    /// is the only type accepted for `insert` operations.
     pub fn validate_row(&self, row: Row) -> Result<ValidatedRow, SchemaError> {
         let cols = &self.columns;
         let values = &row.fields;
@@ -297,18 +357,9 @@ mod tests {
     fn valid_rows_pass_validation() {
         let schema = Schema {
             columns: vec![
-                Column {
-                    col_type: ColumnType::Integer,
-                    nullable: false,
-                },
-                Column {
-                    col_type: ColumnType::String,
-                    nullable: true,
-                },
-                Column {
-                    col_type: ColumnType::Float,
-                    nullable: true,
-                },
+                Column::integer(),
+                Column::nullable_string(),
+                Column::nullable_float(),
             ],
         };
 
@@ -331,16 +382,7 @@ mod tests {
     #[test]
     fn invalid_rows_fail_validation() {
         let schema = Schema {
-            columns: vec![
-                Column {
-                    col_type: ColumnType::Integer,
-                    nullable: false,
-                },
-                Column {
-                    col_type: ColumnType::String,
-                    nullable: true,
-                },
-            ],
+            columns: vec![Column::integer(), Column::nullable_string()],
         };
 
         let wrong_type = Row {
@@ -366,5 +408,41 @@ mod tests {
             schema.validate_row(too_short),
             Err(SchemaError::ColumnCountMismatch)
         ));
+    }
+
+    #[test]
+    fn schemas_cant_have_nullable_primary_keys() {
+        let schema_result = Schema::try_from(vec![
+            Column::nullable_integer(),
+            Column::string(),
+            Column::nullable_float(),
+        ]);
+        assert!(matches!(
+            schema_result,
+            Err(SchemaError::NullablePrimaryKey)
+        ));
+    }
+
+    #[test]
+    fn schemas_cant_have_float_primary_keys() {
+        let schema_result = Schema::try_from(vec![
+            Column::float(),
+            Column::string(),
+            Column::nullable_float(),
+        ]);
+        assert!(matches!(schema_result, Err(SchemaError::NonOrdPrimaryKey)));
+    }
+
+    #[test]
+    fn schemas_fail_with_too_many_columns() {
+        let cols: Vec<Column> = (0..MAX_NUM_FIELDS + 1).map(|_| Column::integer()).collect();
+        let schema_result = Schema::try_from(cols);
+        assert!(matches!(schema_result, Err(SchemaError::TooManyColumns)));
+    }
+
+    #[test]
+    fn schemas_fail_with_no_columns() {
+        let schema_result = Schema::try_from(vec![]);
+        assert!(matches!(schema_result, Err(SchemaError::EmptyColumns)));
     }
 }
