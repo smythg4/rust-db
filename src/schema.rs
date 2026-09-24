@@ -43,6 +43,15 @@ impl RowValue {
             Self::Null => NULL_FLAG,
         }
     }
+
+    pub fn column_type(&self) -> Option<ColumnType> {
+        match self {
+            Self::Float(_) => Some(ColumnType::Float),
+            Self::Integer(_) => Some(ColumnType::Integer),
+            Self::String(_) => Some(ColumnType::String),
+            Self::Null => None,
+        }
+    }
 }
 
 impl Serializable for RowValue {
@@ -140,28 +149,89 @@ impl Serializable for Row {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ColumnType {
+    Integer,
+    Float,
+    String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Column {
+    col_type: ColumnType,
+    nullable: bool,
+}
+
+#[derive(Error, Debug)]
+pub enum SchemaError {
+    #[error("Type in Row does not conform to type in schema column {0}")]
+    TypeMismatch(usize),
+    #[error("Row doesn't have the right number of columns")]
+    ColumnCountMismatch,
+    #[error("Null value in non-nullable column {0}")]
+    NullValueInNonNullCol(usize),
+}
+
+pub struct ValidatedRow(Row);
+
+impl From<ValidatedRow> for Row {
+    fn from(value: ValidatedRow) -> Self {
+        value.0
+    }
+}
+pub struct Schema {
+    columns: Vec<Column>,
+}
+
+impl Schema {
+    pub fn validate_row(&self, row: Row) -> Result<ValidatedRow, SchemaError> {
+        let cols = &self.columns;
+        let values = &row.fields;
+        if cols.len() != values.len() {
+            return Err(SchemaError::ColumnCountMismatch);
+        }
+
+        for (i, (col, value)) in cols.iter().zip(values.iter()).enumerate() {
+            match value.column_type() {
+                Some(c) if c == col.col_type => {}
+                None if col.nullable => {}
+                None if !col.nullable => return Err(SchemaError::NullValueInNonNullCol(i)),
+                _ => return Err(SchemaError::TypeMismatch(i)),
+            }
+        }
+
+        Ok(ValidatedRow(row))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quickcheck::TestResult;
+    use quickcheck::{Arbitrary, Gen, TestResult};
     use quickcheck_macros::quickcheck;
     use std::io::{Cursor, Seek};
 
-    #[test]
-    fn roundtrip_basic() {
-        let mut fields = Vec::new();
-        for i in 0..10 {
-            fields.push(RowValue::Integer(i));
+    impl Arbitrary for RowValue {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let num = g.choose(&[0, 1, 2, 3]).unwrap();
+            match num {
+                0 => RowValue::Integer(i64::arbitrary(g)),
+                1 => {
+                    let mut f = f64::arbitrary(g);
+                    while f.is_nan() {
+                        f = f64::arbitrary(g);
+                    }
+                    RowValue::Float(f)
+                }
+                2 => RowValue::String(String::arbitrary(g)),
+                3 => RowValue::Null,
+                _ => unreachable!(),
+            }
         }
-        for i in 0..10 {
-            fields.push(RowValue::Float(i as f64 / 100.0));
-        }
-        for i in 0..10 {
-            fields.push(RowValue::String(format!("String {i}")));
-        }
-        for _ in 0..10 {
-            fields.push(RowValue::Null);
-        }
+    }
+
+    #[quickcheck]
+    fn roundtrip_basic(fields: Vec<RowValue>) -> TestResult {
         let row = Row { fields };
         let mut bytes = Cursor::new(Vec::new());
         row.serialize(&mut bytes).unwrap();
@@ -170,13 +240,14 @@ mod tests {
         let deser = Row::deserialize(&mut bytes).unwrap();
 
         assert_eq!(row, deser);
+        TestResult::passed()
     }
 
     #[test]
     fn too_many_row_entries_triggers_error() {
         let mut fields = Vec::new();
-        for i in 0..MAX_NUM_FIELDS + 1 {
-            fields.push(RowValue::Integer(i as i64));
+        for _ in 0..MAX_NUM_FIELDS + 1 {
+            fields.push(RowValue::Null);
         }
         let row = Row { fields };
         let mut bytes = Cursor::new(Vec::new());
@@ -220,5 +291,80 @@ mod tests {
             Err(RowValueError::UnknownTag(t)) if t == tag => TestResult::passed(),
             _ => TestResult::failed(),
         }
+    }
+
+    #[test]
+    fn valid_rows_pass_validation() {
+        let schema = Schema {
+            columns: vec![
+                Column {
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                Column {
+                    col_type: ColumnType::String,
+                    nullable: true,
+                },
+                Column {
+                    col_type: ColumnType::Float,
+                    nullable: true,
+                },
+            ],
+        };
+
+        let all_present = Row {
+            fields: vec![
+                RowValue::Integer(1),
+                RowValue::String("hello".to_string()),
+                RowValue::Float(1.5),
+            ],
+        };
+        assert!(schema.validate_row(all_present).is_ok());
+
+        // NULL is fine in nullable columns
+        let with_nulls = Row {
+            fields: vec![RowValue::Integer(2), RowValue::Null, RowValue::Null],
+        };
+        assert!(schema.validate_row(with_nulls).is_ok());
+    }
+
+    #[test]
+    fn invalid_rows_fail_validation() {
+        let schema = Schema {
+            columns: vec![
+                Column {
+                    col_type: ColumnType::Integer,
+                    nullable: false,
+                },
+                Column {
+                    col_type: ColumnType::String,
+                    nullable: true,
+                },
+            ],
+        };
+
+        let wrong_type = Row {
+            fields: vec![RowValue::Integer(1), RowValue::Float(1.5)],
+        };
+        assert!(matches!(
+            schema.validate_row(wrong_type),
+            Err(SchemaError::TypeMismatch(1))
+        ));
+
+        let null_in_non_null = Row {
+            fields: vec![RowValue::Null, RowValue::String("x".to_string())],
+        };
+        assert!(matches!(
+            schema.validate_row(null_in_non_null),
+            Err(SchemaError::NullValueInNonNullCol(0))
+        ));
+
+        let too_short = Row {
+            fields: vec![RowValue::Integer(1)],
+        };
+        assert!(matches!(
+            schema.validate_row(too_short),
+            Err(SchemaError::ColumnCountMismatch)
+        ));
     }
 }

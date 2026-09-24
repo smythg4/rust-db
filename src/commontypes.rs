@@ -281,4 +281,19 @@ mod tests {
         se.serialize(&mut buffer).unwrap();
         assert_eq!(SLOT_ENTRY_SIZE, buffer.len());
     }
+
+    #[test]
+    fn zero_lsns_trigger_errors() {
+        let result = Lsn::new(0);
+        assert!(matches!(result, Err(LsnError::ZeroLsn)))
+    }
+
+    #[test]
+    fn null_and_float_keys_trigger_errors() {
+        let null_result = Key::try_from(RowValue::Null);
+        let float_result = Key::try_from(RowValue::Float(10.0));
+
+        assert!(matches!(null_result, Err(KeyError::NullKey)));
+        assert!(matches!(float_result, Err(KeyError::NotOrderable)));
+    }
 }

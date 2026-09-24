@@ -22,7 +22,7 @@ Working on phase 1 without getting too in the weeds on the schema. Right now the
 - Custom table schema with `String`, `int`, and `float`. `String` stored as a
   length-prefixed `VarInt`.
 - Slotted page layout, fullness evaluated by free space instead of a fixed
-  cell count. Byte-packed metadata (dirty bit, node type, etc).
+  cell count.
 - Sibling pointers on leaf nodes — bidirectional (prev *and* next) this time,
   to support reverse scans for roughly free.
 
@@ -81,7 +81,7 @@ ARIES in one pass:
    *before* the corresponding page write hits disk. Every page carries the
    LSN of its last modifying record.
 - WAL records are generated at the BTree call site (logical redo/undo info —
-  "inserted key K at slot S in page P" — lives there, not in the buffer
+  "Inserted key K into page P" — lives there, not in the buffer
   pool). `WriteGuard::drop` does **not** push to the WAL; it only marks the
   frame dirty. WAL-before-data is enforced at the *other* end: in the BPM's
   flush/eviction path, before writing a dirty page, force the log manager to
