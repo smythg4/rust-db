@@ -12,7 +12,7 @@ const FLOAT_FLAG: u8 = 2;
 const STRING_FLAG: u8 = 3;
 const BOOL_FLAG: u8 = 4;
 
-const MAX_FIELD_LEN: usize = MAX_LEAF_ENTRY_SIZE / 2;
+const MAX_FIELD_LEN: usize = MAX_LEAF_ENTRY_SIZE;
 const MAX_NUM_FIELDS: usize = 255;
 
 #[derive(Error, Debug)]
@@ -112,11 +112,11 @@ impl Serializable for RowValue {
             }
             RowValue::String(s) => {
                 w.write_all(&STRING_FLAG.to_be_bytes())?;
-                let length = s.len();
+                let length = self.encoded_size();
                 if length > MAX_FIELD_LEN {
                     return Err(RowValueError::FieldTooLong(length));
                 }
-                let varlen = length.encode_var_vec();
+                let varlen = s.len().encode_var_vec();
                 w.write_all(&varlen)?;
                 w.write_all(s.as_bytes())?;
             }
@@ -396,6 +396,8 @@ impl Schema {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use crate::commontypes::{PAGE_ID_SIZE, SLOT_ENTRY_SIZE};
+
     use super::*;
     use quickcheck::{Arbitrary, Gen, TestResult};
     use quickcheck_macros::quickcheck;
@@ -491,28 +493,34 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn valid_row_from_schema(schema: &Schema, g: &mut Gen) -> Row {
-        Row {
-            fields: schema
-                .columns
-                .iter()
-                .map(|c| {
-                    let coin_flip = bool::arbitrary(g);
-                    match c.col_type {
-                        _ if c.nullable && coin_flip => RowValue::Null,
-                        ColumnType::Bool => RowValue::Boolean(bool::arbitrary(g)),
-                        ColumnType::Float => {
-                            let mut f = f64::arbitrary(g);
-                            while f.is_nan() {
-                                f = f64::arbitrary(g);
+        let vr = loop {
+            let row = Row {
+                fields: schema
+                    .columns
+                    .iter()
+                    .map(|c| {
+                        let coin_flip = bool::arbitrary(g);
+                        match c.col_type {
+                            _ if c.nullable && coin_flip => RowValue::Null,
+                            ColumnType::Bool => RowValue::Boolean(bool::arbitrary(g)),
+                            ColumnType::Float => {
+                                let mut f = f64::arbitrary(g);
+                                while f.is_nan() {
+                                    f = f64::arbitrary(g);
+                                }
+                                RowValue::Float(f)
                             }
-                            RowValue::Float(f)
+                            ColumnType::Integer => RowValue::Integer(i64::arbitrary(g)),
+                            ColumnType::String => RowValue::String(String::arbitrary(g)),
                         }
-                        ColumnType::Integer => RowValue::Integer(i64::arbitrary(g)),
-                        ColumnType::String => RowValue::String(String::arbitrary(g)),
-                    }
-                })
-                .collect(),
-        }
+                    })
+                    .collect(),
+            };
+            if let Ok(vr) = schema.validate_row(row) {
+                break vr;
+            }
+        };
+        vr.0
     }
 
     #[derive(Debug, Clone)]
@@ -565,6 +573,44 @@ pub(crate) mod tests {
 
         assert_eq!(row, deser);
         TestResult::passed()
+    }
+
+    #[test]
+    fn too_big_row_triggers_error_on_validation() {
+        let schema = Schema::try_from(vec![Column::string(), Column::nullable_string()]).unwrap();
+        let row = Row::try_from(vec![
+            RowValue::String("a".repeat(MAX_LEAF_ENTRY_SIZE)),
+            RowValue::Null,
+        ])
+        .unwrap();
+        let result = schema.validate_row(row);
+
+        assert!(matches!(result, Err(SchemaError::RowTooLong(_))));
+    }
+
+    #[test]
+    fn too_big_key_triggers_error_on_validation() {
+        // this should be the largest value that is valid
+        let test_boundary = MAX_INTERNAL_ENTRY_SIZE - PAGE_ID_SIZE - SLOT_ENTRY_SIZE - 1 - 2;
+
+        let schema = Schema::try_from(vec![Column::string(), Column::nullable_string()]).unwrap();
+        let row = Row::try_from(vec![
+            RowValue::String("a".repeat(test_boundary + 1)),
+            RowValue::Null,
+        ])
+        .unwrap();
+        let result = schema.validate_row(row);
+
+        assert!(matches!(result, Err(SchemaError::KeyTooLong(_))));
+
+        let row = Row::try_from(vec![
+            RowValue::String("a".repeat(test_boundary)),
+            RowValue::Null,
+        ])
+        .unwrap();
+        let result = schema.validate_row(row);
+
+        assert!(result.is_ok());
     }
 
     #[test]

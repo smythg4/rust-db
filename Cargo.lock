@@ -18,6 +18,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
+name = "crc32_light"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b8f1eb51679ee5eb74d4a3e2b81af80e271f36704804d19952fb73dca9527cf6"
+
+[[package]]
 name = "env_filter"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -168,6 +174,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 name = "rust-db"
 version = "0.1.0"
 dependencies = [
+ "crc32_light",
  "integer-encoding",
  "quickcheck",
  "quickcheck_macros",

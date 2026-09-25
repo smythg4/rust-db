@@ -15,6 +15,7 @@ QUICKCHECK_TESTS=10000 cargo test
 ```
 
 ### Immediate To-Do
+  - [ ] Write `insert` for internal pages - will make current tests much nicer.
   - [x] `Option` deserialize: return an `InvalidData` io error instead of panicking on bad tags
   - [x] Replace `expect`s in `Page::deserialize` with `PageError::Corrupt`; validate invariants on read (valid key
   in field 0, strictly sorted keys, children = keys + 1)
@@ -43,7 +44,7 @@ QUICKCHECK_TESTS=10000 cargo test
 ### Phase 1 — Storage Layout
 - In-table data is represented as a `RowValue`, which currently supports `Integer(i64)`, `String(String)`, `Boolean(bool)`, `Float(f64)`, and `Null`.
 - `Schemas` hold `Columns` that are made up of `ColumnType` and a `nullable` flag. Primary Keys are always stored in the first element of the underlying `Vec`. Primary Keys can only be non-nullable `String` or `Integer` right now and a new `Schema` will be rejected if the first entry doesn't meet these requirements.
-- The fundamental unit of storage `Page` holds core metadata like `page_id: PageId`, `parent: Option<PageId>`, `Lsn` (not currently used, but will be important for WAL implementation), as well as a `PageBody` that is either a `Leaf` or `Internal`.
+- The fundamental unit of storage `Page` holds core metadata like `page_id: PageId` and `Lsn` (not currently used, but will be important for WAL implementation), as well as a `PageBody` that is either a `Leaf` or `Internal`.
   - `Internal` page bodies hold a list of keys and child `PageId`s. There should always be 1 more child than keys. This is enforced through `debug_assert!`s for operations on `Page`s and `PageError::CorruptData` for deserialization.
   - `Leaf` page bodies hold a list of `Rows` and sibling pointers (`next: Option<PageId>`, `prev: Option<PageId>`) to allow quicker sequential scans.
 - All data encoding is in Big Endian order.
@@ -59,28 +60,28 @@ QUICKCHECK_TESTS=10000 cargo test
   All integers are big-endian. `Option<PageId>` fields are a 1-byte tag (`0` = `None`, `1` = `Some`) followed by
   the 8-byte `PageId` only when `Some`.
 
-  #### Leaf header (≤ 46 bytes)
+  #### Leaf header (≤ 41 bytes)
 
   | Offset | Field | Size (bytes) | Notes |
   |---:|---|---:|---|
   | 0 | `tag` | 1 | `1` = leaf |
   | 1 | `page_id` | 8 | `TableId` (u32) + page number (u32) |
   | 9 | `lsn` | 8 | `0` = no LSN yet |
-  | 17 | `parent` | 1 + 8 | `Option<PageId>` |
-  | 26 | `next` | 1 + 8 | `Option<PageId>` |
-  | 35 | `prev` | 1 + 8 | `Option<PageId>` |
-  | 44 | `num_items` | 2 | number of records |
+  | 17 | `checksum` | 4 | `u32` |
+  | 21 | `next` | 1 + 8 | `Option<PageId>` |
+  | 30 | `prev` | 1 + 8 | `Option<PageId>` |
+  | 39 | `num_items` | 2 | number of records |
 
-  #### Internal header (≤ 28 bytes)
+  #### Internal header (≤ 23 bytes)
 
   | Offset | Field | Size (bytes) | Notes |
   |---:|---|---:|---|
   | 0 | `tag` | 1 | `2` = internal |
   | 1 | `page_id` | 8 | `TableId` (u32) + page number (u32) |
   | 9 | `lsn` | 8 | `0` = no LSN yet |
-  | 17 | `parent` | 1 + 8 | `Option<PageId>` |
-  | 26 | `num_items` | 2 | number of keys |
-  | 28 | `children` | 8 × (`num_items` + 1) | child `PageId`s, followed by the slot array |
+  | 17 | `checksum` | 4 | `u32` |
+  | 21 | `num_items` | 2 | number of keys |
+  | 23 | `children` | 8 × (`num_items` + 1) | child `PageId`s, followed by the slot array |
 
   Offsets assume every `Option` is `Some`. Each `None` moves the fields after it 8 bytes earlier.
 

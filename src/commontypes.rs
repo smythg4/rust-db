@@ -424,6 +424,7 @@ mod tests {
         let deser = T::deserialize(&mut buf).unwrap();
         assert_eq!(deser, value);
         assert_eq!(buf.get_ref().len(), value.encoded_size());
+        assert_eq!(buf.position() as usize, value.encoded_size());
     }
 
     #[quickcheck]
@@ -439,6 +440,10 @@ mod tests {
         assert_roundtrip(key);
         assert_roundtrip(table_id);
         assert_roundtrip(page_id);
+        let mut o_page_id = Some(page_id);
+        assert_roundtrip(o_page_id);
+        o_page_id = None;
+        assert_roundtrip(o_page_id);
         assert_roundtrip(lsn);
         assert_roundtrip(slot_index);
         assert_roundtrip(slot_entry);

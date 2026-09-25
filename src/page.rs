@@ -3,6 +3,7 @@ use crate::commontypes::{
 };
 use crate::schema::{Row, RowValue, RowValueError, ValidatedRow};
 use crate::traits::Serializable;
+use crc32_light::Crc32Stream;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use thiserror::Error;
@@ -10,8 +11,9 @@ use thiserror::Error;
 pub const PAGE_SIZE: usize = 4096;
 pub const LEAF_TAG: u8 = 1;
 pub const INTERNAL_TAG: u8 = 2;
-pub const MAX_LEAF_HEADER_SIZE: usize = 46;
-pub const MAX_INTERNAL_HEADER_SIZE: usize = 28;
+pub const MAX_LEAF_HEADER_SIZE: usize = 41;
+pub const MAX_INTERNAL_HEADER_SIZE: usize = 23;
+pub const CHECKSUM_OFFSET: usize = 17;
 
 /// The maximum size for an entry into a leaf, decided to ensure that upon a Page split
 /// an entry will fit after
@@ -19,7 +21,8 @@ pub const MAX_LEAF_ENTRY_SIZE: usize = (PAGE_SIZE - MAX_LEAF_HEADER_SIZE) / 4;
 
 /// The maximum size for an key going into an internal page, decided to ensure that upon a Page split
 /// an entry will fit after
-pub const MAX_INTERNAL_ENTRY_SIZE: usize = PAGE_SIZE - MAX_INTERNAL_HEADER_SIZE - PAGE_ID_SIZE;
+pub const MAX_INTERNAL_ENTRY_SIZE: usize =
+    (PAGE_SIZE - MAX_INTERNAL_HEADER_SIZE - PAGE_ID_SIZE) / 4;
 
 #[derive(Error, Debug)]
 pub enum PageError {
@@ -39,8 +42,10 @@ pub enum PageError {
     PageFull,
     #[error("Attempt to insert a duplicate key")]
     DuplicateKey,
-    #[error("Attempt to insert into a non-leaf page")]
+    #[error("Attempt to insert a row into a non-leaf page")]
     NotLeaf,
+    #[error("Attempt to insert a separator into a non-internal page")]
+    NotInternal,
     #[error("invariant violated")]
     InvariantViolated,
     #[error("Corrupt data found on page: {page_id:?}. {kind:?}")]
@@ -61,6 +66,7 @@ pub enum CorruptionKind {
     PageWouldOverFlow,
     InvalidLsn,
     UnknownCorruption,
+    CheckSumMismatch,
 }
 pub type RawPage = [u8; PAGE_SIZE];
 
@@ -68,7 +74,6 @@ pub type RawPage = [u8; PAGE_SIZE];
 pub struct Page {
     page_id: PageId,
     last_update: PageLsn,
-    parent: Option<PageId>,
     body: PageBody,
 }
 
@@ -86,6 +91,36 @@ pub enum PageBody {
 }
 
 impl Page {
+    pub fn empty_leaf(page_id: PageId) -> Self {
+        let body = PageBody::Leaf {
+            records: Vec::new(),
+            next: None,
+            prev: None,
+        };
+        Self::empty_page(page_id, body)
+    }
+
+    fn empty_page(page_id: PageId, body: PageBody) -> Self {
+        Page {
+            page_id,
+            last_update: PageLsn(None),
+            body,
+        }
+    }
+
+    #[allow(dead_code)]
+    fn new_root(page_id: PageId, left: PageId, separator: Key, right: PageId) -> Self {
+        let body = PageBody::Internal {
+            keys: vec![separator],
+            children: vec![left, right],
+        };
+        Page {
+            page_id,
+            last_update: PageLsn(None),
+            body,
+        }
+    }
+
     fn page_type_tag(&self) -> u8 {
         match self.body {
             PageBody::Internal { .. } => INTERNAL_TAG,
@@ -101,13 +136,8 @@ impl Page {
         }
     }
 
-    /// Returns `true` if the `Page` is a root page (i.e. has no parent page). Returns `false` otherwise.
-    pub fn is_root(&self) -> bool {
-        self.parent.is_none()
-    }
-
     /// Returns the number of bytes available for data in the page. Because the headers can be of variable size depending
-    /// on the `Option` variant, we always reserve the maximum space required (e.g. assuming we have a parent and two siblings in the `Leaf`
+    /// on the `Option` variant, we always reserve the maximum space required (e.g. assuming we have two siblings in the `Leaf`
     /// case). Returns `None` if the `Page` won't fit into a [u8; PAGE_SIZE] space, which means somewhere data overflowed.
     pub fn free_space(&self) -> Option<usize> {
         let header_len = match self.body {
@@ -129,12 +159,13 @@ impl Page {
 
     /// Writes `Page` header data to writer.
     pub(crate) fn write_header<W: Write>(&self, writer: &mut W) -> Result<(), PageError> {
-        // Write the header information: Type Tag, LSN, Parent page, then if
+        // Write the header information: Type Tag, LSN, a CRC32 checksum, then if
         // a Leaf node, write the Next and Prev pages.
         writer.write_all(&[self.page_type_tag()])?;
         self.page_id.serialize(writer)?;
         self.last_update.serialize(writer)?;
-        self.parent.serialize(writer)?;
+        // place holder for checksum
+        writer.write_all(&0u32.to_be_bytes())?;
         match self.body {
             PageBody::Leaf { next, prev, .. } => {
                 next.serialize(writer)?;
@@ -235,7 +266,18 @@ impl Page {
         // write the body (result isn't important here)
         let _ = self.write_body(&mut cursor, header_end)?;
 
-        Ok(cursor.into_inner())
+        let mut buf = cursor.into_inner();
+        let crc = Self::page_checksum(&buf);
+        buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+
+        Ok(buf)
+    }
+
+    fn page_checksum(raw_page: &RawPage) -> u32 {
+        let mut crc_stream = Crc32Stream::new();
+        crc_stream.update(&raw_page[..CHECKSUM_OFFSET]);
+        crc_stream.update(&raw_page[CHECKSUM_OFFSET + 4..]);
+        crc_stream.finalize()
     }
 
     /// Returns `true` if `row` can fit in the `Page` without overflowing
@@ -251,11 +293,19 @@ impl Page {
         Self::leaf_entry_size(row) <= free_space
     }
 
+    /// Inserts a separator `Key` and associated child `PageId` into an internal `Page`.
+    /// Primarily called by parent datastructure (e.g. `BTree`) after splitting a `Page`
+    /// lower in the tree.
+    #[allow(dead_code)]
+    fn internal_insert(&mut self, _separator: Key, _right_child: PageId) -> Result<(), PageError> {
+        todo!()
+    }
+
     /// Inserts a `ValidatedRow` into the `Page`. `ValidatedRow`s are those that are checked
     /// by a `Schema` type to ensure the `Row` conforms to the rules in the `Schema`.
     /// Will return `Error` if `Page` isn't of the `Leaf` variety, the `Key` is a duplicate,
     /// or the `Page` can't fit it.
-    pub fn insert(&mut self, validated_row: ValidatedRow) -> Result<(), PageError> {
+    pub fn leaf_insert(&mut self, validated_row: ValidatedRow) -> Result<(), PageError> {
         let PageBody::Leaf { .. } = &mut self.body else {
             return Err(PageError::NotLeaf);
         };
@@ -337,7 +387,6 @@ impl Page {
                     Page {
                         page_id: new_page_id,
                         last_update: PageLsn(None),
-                        parent: self.parent,
                         body: PageBody::Internal {
                             keys: new_keys,
                             children: new_children,
@@ -380,12 +429,12 @@ impl Page {
                     .fields
                     .first()
                     .ok_or(PageError::InvariantViolated)?
-                    .try_into()?;
+                    .try_into()
+                    .map_err(|_| PageError::InvariantViolated)?;
 
                 let new_page = Page {
                     page_id: new_page_id,
                     last_update: PageLsn(None),
-                    parent: self.parent,
                     body: PageBody::Leaf {
                         records: new_records,
                         prev: Some(curr_page_id),
@@ -408,9 +457,23 @@ impl Serializable for Page {
         w.write_all(&raw)?;
         Ok(())
     }
+
     fn deserialize<R: Read>(r: &mut R) -> Result<Self, Self::Error> {
         let mut buf = [0u8; PAGE_SIZE];
         r.read_exact(&mut buf)?;
+
+        // read the checksum
+        let crc_buf = &buf[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4];
+        let checksum = u32::from_be_bytes(crc_buf.try_into().expect("always 4 byte slice"));
+
+        let computed_checksum = Self::page_checksum(&buf);
+        if computed_checksum != checksum {
+            return Err(PageError::Corrupt {
+                page_id: None,
+                kind: CorruptionKind::CheckSumMismatch,
+            });
+        }
+
         let mut cursor = Cursor::new(&buf[..]);
 
         let mut buf_one = [0u8; 1];
@@ -430,7 +493,10 @@ impl Serializable for Page {
         let page_id = PageId::deserialize(&mut cursor)?;
 
         let last_update = PageLsn::deserialize(&mut cursor)?;
-        let parent = Option::<PageId>::deserialize(&mut cursor)?;
+
+        // skip the crc32 portion
+        cursor.set_position(CHECKSUM_OFFSET as u64 + 4);
+
         let (next_page, prev_page) = if is_leaf {
             let np = Option::<PageId>::deserialize(&mut cursor)?;
             let pp = Option::<PageId>::deserialize(&mut cursor)?;
@@ -520,7 +586,6 @@ impl Serializable for Page {
 
         let page = Page {
             page_id,
-            parent,
             last_update,
             body,
         };
@@ -564,7 +629,7 @@ mod tests {
     use crate::commontypes::{Lsn, TableId};
     use crate::schema::tests::SchemaRowPair;
     use crate::schema::tests::valid_row_from_schema;
-    use crate::schema::{RowValue, Schema};
+    use crate::schema::{Column, RowValue, Schema};
 
     impl Arbitrary for PageBody {
         fn arbitrary(g: &mut Gen) -> Self {
@@ -607,12 +672,10 @@ mod tests {
             let page_id = PageId::arbitrary(g);
             let last_update = PageLsn(Option::<Lsn>::arbitrary(g));
 
-            let parent = Option::<PageId>::arbitrary(g);
             let body = PageBody::arbitrary(g);
             let mut page = Page {
                 page_id,
                 last_update,
-                parent,
                 body,
             };
             while page.free_space().is_none() {
@@ -634,6 +697,137 @@ mod tests {
         }
     }
 
+    /// Fixed-width key prefix so string keys sort by their index regardless of padding.
+    fn padded_key(index: usize, total_len: usize) -> Key {
+        let prefix = format!("{index:06}");
+        Key::String(format!(
+            "{prefix}{}",
+            "x".repeat(total_len.saturating_sub(prefix.len()))
+        ))
+    }
+
+    /// Two-column schema (integer key + string payload) and the largest payload that still validates.
+    fn leaf_schema() -> (Schema, usize) {
+        let schema = Schema::try_from(vec![Column::integer(), Column::string()]).unwrap();
+        let row_with = |key: i64, len: usize| Row {
+            fields: vec![RowValue::Integer(key), RowValue::String("p".repeat(len))],
+        };
+        let max_payload = (0..MAX_LEAF_ENTRY_SIZE)
+            .rev()
+            .find(|&len| schema.validate_row(row_with(0, len)).is_ok())
+            .expect("some payload must validate");
+        (schema, max_payload)
+    }
+
+    #[quickcheck]
+    fn max_size_row_fits_after_leaf_split(payload_sizes: Vec<u16>, target: u8) -> TestResult {
+        let page_id = PageId::new(TableId::new(u32::MAX), u32::MAX);
+
+        if payload_sizes.is_empty() {
+            return TestResult::discard();
+        }
+        let (schema, max_payload) = leaf_schema();
+
+        // helper closure to build a row from the schema
+        let make_row = |key: i64, len: usize| {
+            schema
+                .validate_row(Row {
+                    fields: vec![RowValue::Integer(key), RowValue::String("p".repeat(len))],
+                })
+                .unwrap()
+        };
+
+        // generate an empty leaf page
+        let mut page = Page::empty_leaf(page_id);
+        let mut count = 0i64;
+
+        // fill it up with various sized rows and keys 0, 10, 20, ...
+        for len in payload_sizes.iter().cycle() {
+            let len = *len as usize % (max_payload + 1);
+            match page.leaf_insert(make_row(count * 10, len)) {
+                Ok(()) => count += 1,
+                Err(PageError::PageFull) => break,
+                Err(e) => panic!("Unexpected error: {e:?}"),
+            }
+        }
+
+        // split the page! (the new one will have a duplicate page id, but that's fine for the test)
+        let (separator, mut right) = page.split_page(page_id).unwrap();
+
+        // generate a key that lands between entries
+        let key = (target as i64 % (count + 1)) * 10 - 5;
+        // generate a max size payload
+        let big_row = make_row(key, max_payload);
+
+        let result = if Key::Integer(key) >= separator {
+            right.leaf_insert(big_row)
+        } else {
+            page.leaf_insert(big_row)
+        };
+
+        assert!(
+            result.is_ok(),
+            "max size row didn't fit after split: {result:?}"
+        );
+
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn max_size_key_fits_after_internal_split(key_sizes: Vec<u16>, target: u16) -> TestResult {
+        let page_id = PageId::new(TableId::new(u32::MAX), u32::MAX);
+        if key_sizes.is_empty() {
+            return TestResult::discard();
+        }
+
+        // largest string key whose internal entry still fits the limit
+        let max_key_len = (0..MAX_INTERNAL_ENTRY_SIZE)
+            .rev()
+            .find(|&len| Page::internal_entry_size(&padded_key(0, len)) <= MAX_INTERNAL_ENTRY_SIZE)
+            .unwrap();
+
+        // fill and internal page with keys 0, 2, 4, ... until one won't fit
+        let mut keys: Vec<Key> = Vec::new();
+        let mut children = vec![page_id];
+        for (i, size) in key_sizes.iter().cycle().enumerate() {
+            let key = padded_key(i * 2, 6 + *size as usize % (max_key_len - 5));
+            // this silliness is because I don't have an internal page insert yet
+            let page = Page::empty_page(
+                page_id,
+                PageBody::Internal {
+                    keys: keys.clone(),
+                    children: children.clone(),
+                },
+            );
+            if page.free_space().unwrap() < Page::internal_entry_size(&key) {
+                break;
+            }
+            keys.push(key);
+            children.push(page_id);
+        }
+
+        let mut page = Page::empty_page(page_id, PageBody::Internal { keys, children });
+        let key_count = page.num_items();
+
+        let (separator, right) = match page.split_page(page_id) {
+            Ok(split) => split,
+            Err(PageError::TooSmallToSplit(_)) => return TestResult::discard(),
+            Err(e) => panic!("Unexpected split error: {e:?}"),
+        };
+
+        // a max size key whose prefix lands between existing keys
+        let new_key = padded_key((target as usize % (key_count + 1)) * 2 + 1, max_key_len);
+        let half = if new_key >= separator { &right } else { &page };
+        let free = half.free_space().unwrap();
+
+        // TODO: change this to an actual insert once I have an insert method for internal pages
+        assert!(
+            free >= Page::internal_entry_size(&new_key),
+            "max size target needs {} bytes but the target half only has {free}",
+            Page::internal_entry_size(&new_key)
+        );
+        TestResult::passed()
+    }
     #[quickcheck]
     fn insertion_order_on_leaves(
         SchemaWithRows(schema, rows): SchemaWithRows,
@@ -657,7 +851,7 @@ mod tests {
 
             let page_clone = page.clone();
 
-            let result = page.insert(validated_row);
+            let result = page.leaf_insert(validated_row);
             if is_duplicate {
                 assert!(matches!(result, Err(PageError::DuplicateKey)));
                 assert_eq!(page_clone, page);
@@ -747,7 +941,7 @@ mod tests {
     }
 
     #[quickcheck]
-    fn sibling_and_parent_pointers_correct_after_split(mut page: Page) -> TestResult {
+    fn sibling_pointers_correct_after_split(mut page: Page) -> TestResult {
         if matches!(page.body, PageBody::Internal { .. }) {
             return TestResult::discard();
         }
@@ -790,10 +984,6 @@ mod tests {
                     );
                 }
             };
-            assert_eq!(
-                page.parent, new_page.parent,
-                "new and original page should have same parent"
-            );
             TestResult::passed()
         } else {
             TestResult::discard()
@@ -899,14 +1089,14 @@ mod tests {
         // fill the page up entries
         while page.can_insert(&row) {
             let vr = schema.validate_row(row.clone()).unwrap();
-            page.insert(vr).unwrap();
+            page.leaf_insert(vr).unwrap();
             row = increment_key_on_row(&row);
         }
         let snapshot = page.clone();
 
         // one more insert should trigger page full
         let vr = schema.validate_row(row.clone()).unwrap();
-        let result = page.insert(vr);
+        let result = page.leaf_insert(vr);
         assert!(matches!(result, Err(PageError::PageFull)));
 
         // make sure the failed insert didn't change the underlying page
@@ -920,6 +1110,38 @@ mod tests {
         let _ = Page::deserialize(&mut Cursor::new(raw_page));
         // this will likely always fail, but it's possible that quickcheck generated a valid random input
         // we only care that the call doesn't panic
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn any_burst_of_up_to_4_bytes_is_detected(
+        page: Page,
+        pos: u16,
+        len: u8,
+        masks: [u8; 4],
+    ) -> TestResult {
+        let mut bytes = page.as_raw_page().unwrap();
+
+        // CRC32 is guaranteed to detect any change confined to 4 consecutive bytes.
+        let len = 1 + len as usize % 4;
+        let start = pos as usize % (PAGE_SIZE - len + 1);
+
+        // XOR with a nonzero mask always changes the byte (writing a value might not).
+        for (offset, mask) in masks.iter().take(len).enumerate() {
+            bytes[start + offset] ^= (*mask).max(1);
+        }
+
+        let result = Page::deserialize(&mut &bytes[..]);
+        assert!(
+            matches!(
+                result,
+                Err(PageError::Corrupt {
+                    kind: CorruptionKind::CheckSumMismatch,
+                    ..
+                })
+            ),
+            "{len} changed byte(s) at offset {start} not detected: {result:?}"
+        );
         TestResult::passed()
     }
 
@@ -976,8 +1198,8 @@ mod tests {
             return TestResult::discard();
         }
         let validated_row = schema.validate_row(row).unwrap();
-        let _ = page.insert(validated_row.clone()); // this might error if the key already exists, but we're guaranteed to have it in there after calling it
-        let result = page.insert(validated_row); // this is the check that matters
+        let _ = page.leaf_insert(validated_row.clone()); // this might error if the key already exists, but we're guaranteed to have it in there after calling it
+        let result = page.leaf_insert(validated_row); // this is the check that matters
 
         assert!(matches!(result, Err(PageError::DuplicateKey)), "{result:?}");
         TestResult::passed()
@@ -987,7 +1209,7 @@ mod tests {
     fn header_constant_is_right(page: Page) -> TestResult {
         let mut cursor = Cursor::new([0u8; PAGE_SIZE]);
         page.write_header(&mut cursor).unwrap();
-        let mut none_count = page.parent.is_none() as u64;
+        let mut none_count = 0;
         match page.body {
             PageBody::Internal { .. } => {
                 assert_eq!(
@@ -1027,7 +1249,6 @@ mod tests {
         let lpage = Page {
             page_id: PageId::new(TableId::new(1), 10),
             last_update: PageLsn(Some(Lsn::new(10).unwrap())),
-            parent: Some(PageId::new(TableId::new(1), 1)),
             body: PageBody::Leaf {
                 records,
                 next: Some(PageId::new(TableId::new(1), 3)),
@@ -1050,7 +1271,6 @@ mod tests {
         let ipage = Page {
             page_id: PageId::new(TableId::new(10), 10),
             last_update: PageLsn(Some(Lsn::new(10).unwrap())),
-            parent: Some(PageId::new(TableId::new(1), 1)),
             body: PageBody::Internal { keys, children },
         };
         let mut bytes = Vec::with_capacity(PAGE_SIZE);
