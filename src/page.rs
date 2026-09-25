@@ -3,7 +3,7 @@ use crate::commontypes::{
 };
 use crate::schema::{Row, RowValueError, ValidatedRow};
 use crate::traits::Serializable;
-use std::io::{Cursor, Read, Write};
+use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use thiserror::Error;
 
@@ -64,13 +64,14 @@ pub enum PageBody {
 }
 
 impl Page {
-    pub fn page_type_tag(&self) -> u8 {
+    fn page_type_tag(&self) -> u8 {
         match self.body {
             PageBody::Internal { .. } => INTERNAL_TAG,
             PageBody::Leaf { .. } => LEAF_TAG,
         }
     }
 
+    /// Returns the number of records present in a `Leaf` page or the number of keys present in a `Internal` page.
     pub fn num_items(&self) -> usize {
         match &self.body {
             PageBody::Leaf { records, .. } => records.len(),
@@ -78,34 +79,34 @@ impl Page {
         }
     }
 
+    /// Returns `true` if the `Page` is a root page (i.e. has no parent page). Returns `false` otherwise.
     pub fn is_root(&self) -> bool {
         self.parent.is_none()
     }
 
+    /// Returns the number of bytes available for data in the page. Because the headers can be of variable size depending
+    /// on the `Option` variant, we always reserve the maximum space required (e.g. assuming we have a parent and two siblings in the `Leaf`
+    /// case). Returns `None` if the `Page` won't fit into a [u8; PAGE_SIZE] space, which means somewhere data overflowed.
     pub fn free_space(&self) -> Option<usize> {
         let header_len = match self.body {
             PageBody::Internal { .. } => MAX_INTERNAL_HEADER_SIZE,
             PageBody::Leaf { .. } => MAX_LEAF_HEADER_SIZE,
         };
-        let used_size = match &self.body {
-            PageBody::Internal { keys, children } => {
-                let slots_len = keys.len() * SLOT_ENTRY_SIZE;
-                let children_len = children.len() * PAGE_ID_SIZE;
-                let keys_len = keys.iter().map(|k| k.encoded_size()).sum::<usize>();
-                header_len + slots_len + children_len + keys_len
-            }
-            PageBody::Leaf { records, .. } => {
-                let slots_len = records.len() * SLOT_ENTRY_SIZE;
-                let records_len = records.iter().map(|r| r.encoded_size()).sum::<usize>();
-                header_len + slots_len + records_len
-            }
-        };
+        let used_size = header_len
+            + match &self.body {
+                // extra PAGE_ID_SIZE is to account for the right child in the internal page
+                PageBody::Internal { keys, .. } => {
+                    keys.iter().map(Self::internal_entry_size).sum::<usize>() + PAGE_ID_SIZE
+                }
+                PageBody::Leaf { records, .. } => {
+                    records.iter().map(Self::leaf_entry_size).sum::<usize>()
+                }
+            };
         PAGE_SIZE.checked_sub(used_size)
     }
 
-    /// Writes header to underlying RawPage
-    /// TODO: Figure out trait bounds to make this generic (Write + Seek)?
-    pub(crate) fn write_header(&self, writer: &mut Cursor<RawPage>) -> Result<(), PageError> {
+    /// Writes `Page` header data to writer.
+    pub(crate) fn write_header<W: Write>(&self, writer: &mut W) -> Result<(), PageError> {
         // Write the header information: Type Tag, LSN, Parent page, then if
         // a Leaf node, write the Next and Prev pages.
         writer.write_all(&[self.page_type_tag()])?;
@@ -126,12 +127,12 @@ impl Page {
         Ok(())
     }
 
-    /// Writes the body of a page to the underlying RawPage
-    /// Returns slot_offset and data_offset (used for tests)
-    /// TODO: Figure out trait bounds to make this generic (Write + Seek)?
-    pub(crate) fn write_body(
+    /// Writes the body of a page to the writer
+    /// Returns `slot_offset` and `data_offset` (used for tests to confirm that `free_space` is working properly) for the `Page`
+    /// `data_offset` - `slot_offset` is the range of unused space on the `Page`
+    pub(crate) fn write_body<W: Write + Seek>(
         &self,
-        writer: &mut Cursor<RawPage>,
+        writer: &mut W,
         header_end: usize,
     ) -> Result<(usize, usize), PageError> {
         let mut data_offset = PAGE_SIZE;
@@ -148,13 +149,13 @@ impl Page {
 
                     // shift the offset back, and write the Row at the proper offset
                     data_offset -= len;
-                    writer.set_position(data_offset as u64);
+                    writer.seek(SeekFrom::Start(data_offset as u64))?;
                     writer.write_all(&buffer)?;
 
                     // build a SlotEntry to point to the newly written data and write
                     // it at the proper offset
                     let slot_entry = SlotEntry::new(data_offset as u16, len as u16);
-                    writer.set_position(slot_offset as u64);
+                    writer.seek(SeekFrom::Start(slot_offset as u64))?;
                     slot_entry.serialize(writer)?;
 
                     // advance the running slot_offset
@@ -166,7 +167,7 @@ impl Page {
                 // children are fixed-width and inserted in order right after the header
                 let mut children_pos = header_end;
                 for child in children {
-                    writer.set_position(children_pos as u64);
+                    writer.seek(SeekFrom::Start(children_pos as u64))?;
                     child.serialize(writer)?;
                     children_pos += PAGE_ID_SIZE;
                 }
@@ -181,12 +182,12 @@ impl Page {
 
                     // adjust data_offset and write the data
                     data_offset -= length;
-                    writer.set_position(data_offset as u64);
+                    writer.seek(SeekFrom::Start(data_offset as u64))?;
                     writer.write_all(&buffer)?;
 
                     // write the accompanying SlotEntry
                     let slot_entry = SlotEntry::new(data_offset as u16, length as u16);
-                    writer.set_position(slot_offset as u64);
+                    writer.seek(SeekFrom::Start(slot_offset as u64))?;
                     slot_entry.serialize(writer)?;
                     slot_offset += SLOT_ENTRY_SIZE;
                 }
@@ -195,6 +196,9 @@ impl Page {
         }
     }
 
+    /// Returns the `Page` represented as raw bytes (`RawPage = [0u8; PAGE_SIZE]`).
+    /// Will error if write to internal `Cursor` fails or if the `Page` would overflow
+    /// a `RawPage`.
     pub fn as_raw_page(&self) -> Result<RawPage, PageError> {
         if self.free_space().is_none() {
             return Err(PageError::PageOverFlow);
@@ -212,14 +216,23 @@ impl Page {
         Ok(cursor.into_inner())
     }
 
+    /// Returns `true` if `row` can fit in the `Page` without overflowing
+    /// a `RawPage` when converted to raw bytes.
     pub fn can_insert(&self, row: &Row) -> bool {
+        // immediately return `false` if the page is already overfull
         let free_space = match self.free_space() {
             None => return false,
             Some(s) => s,
         };
-        row.encoded_size() + SLOT_ENTRY_SIZE <= free_space
+        // new row will be encoded and a corresponding slot index is allocated, both
+        // parts need to fit
+        Self::leaf_entry_size(row) <= free_space
     }
 
+    /// Inserts a `ValidatedRow` into the `Page`. `ValidatedRow`s are those that are checked
+    /// by a `Schema` type to ensure the `Row` conforms to the rules in the `Schema`.
+    /// Will return `Error` if `Page` isn't of the `Leaf` variety, the `Key` is a duplicate,
+    /// or the `Page` can't fit it.
     pub fn insert(&mut self, validated_row: ValidatedRow) -> Result<(), PageError> {
         let PageBody::Leaf { .. } = &mut self.body else {
             return Err(PageError::NotLeaf);
@@ -243,7 +256,25 @@ impl Page {
         Ok(())
     }
 
-    // The old right neighbor's `prev` pointer will need to be updated to point to the new page returned
+    /// Returns the fully loaded cost for inserting a `Key` into an Internal page to include the slot entry
+    /// and child page pointer
+    fn internal_entry_size(k: &Key) -> usize {
+        k.encoded_size() + SLOT_ENTRY_SIZE + PAGE_ID_SIZE
+    }
+
+    /// Returns the fully loaded cost for inserting a `Row` into an Leaf page to include the slot entry
+    fn leaf_entry_size(r: &Row) -> usize {
+        r.encoded_size() + SLOT_ENTRY_SIZE
+    }
+
+    /// Accepts a `new_page_id` to assign to the new `Page` and splits the current `Page` into two
+    /// parts. Used by a controlling `B+Tree` structure when `Page`s would overflow from an `insert`.
+    /// Returns the new `Page` (new right neighbor) and promoted `Key`.
+    /// Neighbor pointers for this `Page` and the new `Page` are updated in this call.
+    /// Will return `Error` if the `Page` is too small to split (fewer than 3 keys for `Internal`, fewer
+    /// than 2 records for a `Leaf`).
+    /// Note: The caller is responsible for inserting the returned `Key` into the parent `Page` and
+    /// updating the old right neighbor's `prev` pointer to the new `Page` returned
     pub fn split_page(&mut self, new_page_id: PageId) -> Result<(Key, Page), PageError> {
         let curr_page_id = self.page_id;
         match &mut self.body {
@@ -255,9 +286,27 @@ impl Page {
                     keys.windows(2).all(|w| w[0] < w[1]),
                     "keys aren't strictly increasing"
                 );
-                let split_point = keys.len() / 2;
-                let mut new_keys = keys.split_off(split_point);
-                let new_children = children.split_off(split_point + 1);
+
+                // Split point is based on key size instead of purely indexing halfway through the Vec.
+                let split_size = keys.iter().map(Self::internal_entry_size).sum::<usize>() / 2;
+                let split_point = keys
+                    .iter()
+                    .scan(0, |acc, k| {
+                        *acc += Self::internal_entry_size(k);
+                        Some(*acc)
+                    })
+                    .position(|total| total >= split_size)
+                    .unwrap();
+
+                // split_point is where the total first reaches halfway and we want
+                // to split right after that point (+1). We clamp the result in the event
+                // of a very large last key we need at least 2 elements in the right set
+                // (since we're going to remove one to promote)
+                let split_off_point = (split_point + 1).clamp(1, keys.len() - 2);
+
+                let mut new_keys = keys.split_off(split_off_point);
+                let new_children = children.split_off(split_off_point + 1);
+
                 let split_key = new_keys.remove(0);
                 debug_assert_eq!(keys.len() + 1, children.len());
                 debug_assert_eq!(new_keys.len() + 1, new_children.len());
@@ -285,8 +334,24 @@ impl Page {
                         .is_sorted_by(|a, b| a < b),
                     "record aren't sorted by strictly increasing"
                 );
-                let split_point = records.len() / 2;
-                let new_records = records.split_off(split_point);
+
+                // Split point is based on row size instead of purely indexing halfway through the Vec.
+                let split_size = records.iter().map(Self::leaf_entry_size).sum::<usize>() / 2;
+                let split_point = records
+                    .iter()
+                    .scan(0, |acc, r| {
+                        *acc += Self::leaf_entry_size(r);
+                        Some(*acc)
+                    })
+                    .position(|total| total >= split_size)
+                    .unwrap();
+
+                // split_point is where the total first reaches halfway and we want
+                // to split right after that point (+1). We clamp the result in the event
+                // of a very large last row we need at least 1 elements in the right set
+                let split_off_point = (split_point + 1).clamp(1, records.len() - 1);
+
+                let new_records = records.split_off(split_off_point);
                 let split_key: Key = new_records
                     .first()
                     .ok_or(PageError::CorruptData)?
@@ -396,6 +461,11 @@ impl Serializable for Page {
                         .ok_or(PageError::InvalidRange(slot_range))?,
                 )?);
             }
+            // ensure there's always one more child than keys
+            if keys.len() + 1 != children.len() {
+                return Err(PageError::CorruptData);
+            }
+            // ensure the keys are sorted
             if !keys.windows(2).all(|w| w[0] < w[1]) {
                 return Err(PageError::CorruptData);
             }
@@ -951,7 +1021,10 @@ mod tests {
         bytes.set_position(0);
         let deser_page = Page::deserialize(&mut bytes).unwrap();
 
-        assert_eq!(page, deser_page);
+        assert_eq!(
+            page.as_raw_page().unwrap(),
+            deser_page.as_raw_page().unwrap()
+        );
         TestResult::passed()
     }
 }

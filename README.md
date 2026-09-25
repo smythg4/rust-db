@@ -15,20 +15,20 @@ QUICKCHECK_TESTS=10000 cargo test
   - [x] `Option` deserialize: return an `InvalidData` io error instead of panicking on bad tags
   - [x] Replace `expect`s in `Page::deserialize` with `PageError::Corrupt`; validate invariants on read (valid key
   in field 0, strictly sorted keys, children = keys + 1)
-  - [ ] Corrupt-input tests: random/mutated page bytes never panic; truncated values return `Err`
+  - [x] Corrupt-input tests: random/mutated page bytes never panic; truncated values return `Err`
   - [ ] Cap total row size (vs. usable leaf space) and key size (vs. internal node space) in `validate_row`; unify
   raw vs. encoded length limits
-  - [ ] Split leaves by bytes, not count, so a post-split retry always fits
+  - [x] Split leaves by bytes, not count, so a post-split retry always fits
   - [ ] `find_child` tests: boundaries + split-then-route
   - [x] Split tests: discard only `TooSmallToSplit`; strict leaf sortedness `debug_assert`
   - [x] Generators: integer keys in internal nodes, random `None` pointers (loosen `free_space_works`
   accordingly), fuller pages
-  - [ ] Round-trip + size tests for `PageLsn`, `Lsn`, `PageId`, `SlotEntry`, `Option<T>`
+  - [x] Round-trip + size tests for `PageLsn`, `Lsn`, `PageId`, `SlotEntry`, `Option<T>`
   - [ ] Delete or rewrite `page_insert_returns_page_full_when_full`; tidy `validate_row`, `Row::try_from`,
   `PageLsn::deserialize`
 
 ### Phase 0 — Types
-- When following the cstack database tutorial, raw `u32` and `usize` abounded. This time, I opted to create custom types for things like `PageId`, `SlotIndex`, `SlotEntry`, `Key`, `Row`, `RowValue`, and `ValidatedRow` for example.
+- When following the [cstack database tutorial](https://github.com/smythg4/cstack_db), raw `u32` and `usize` abounded. This time, I opted to create custom types for things like `PageId`, `SlotIndex`, `SlotEntry`, `Key`, `Row`, `RowValue`, and `ValidatedRow` for example.
 - Compile time checks will prevent users from using the wrong type of arguments (e.g. `PageId` when `SlotIndex` is required).
 - One very nice touch is the concept of `ValidatedRow`. A `Table` can hold a `Schema`. When performing an `insert` operation, the `Page` object requires that argument is a `ValidatedRow`. `Schema` includes a method called `validate_row(row: Row) -> Result<ValidatedRow, SchemaError>`, which ensures that any `Row` inserted into a `Page` conforms to the `Schema`'s rules to prevent the input of junk data.
 - A lot of work is being done by a `Serializable` trait. Any type that's going to or from a raw byte format is required to implement this trait. This allows smooth composition for something like `Page` to `serialize` or `deserialize` component parts to/from anything that implements `Write`/`Read`.

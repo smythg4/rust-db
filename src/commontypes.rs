@@ -359,13 +359,25 @@ mod tests {
         }
     }
 
-    #[quickcheck]
-    fn key_encoded_sizes(key: Key) -> TestResult {
-        let mut bytes = Cursor::new(Vec::new());
-        key.serialize(&mut bytes).unwrap();
+    impl Arbitrary for SlotIndex {
+        fn arbitrary(g: &mut Gen) -> Self {
+            SlotIndex(u16::arbitrary(g))
+        }
+    }
 
-        assert_eq!(key.encoded_size(), bytes.into_inner().len());
-        TestResult::passed()
+    impl Arbitrary for SlotEntry {
+        fn arbitrary(g: &mut Gen) -> Self {
+            SlotEntry {
+                offset: u16::arbitrary(g),
+                length: u16::arbitrary(g),
+            }
+        }
+    }
+
+    impl Arbitrary for PageLsn {
+        fn arbitrary(g: &mut Gen) -> Self {
+            PageLsn(Option::<Lsn>::arbitrary(g))
+        }
     }
 
     #[test]
@@ -398,5 +410,38 @@ mod tests {
 
         assert!(matches!(null_result, Err(KeyError::NullKey)));
         assert!(matches!(float_result, Err(KeyError::NotOrderable)));
+    }
+
+    fn assert_roundtrip<T>(value: T)
+    where
+        T: Serializable + PartialEq + std::fmt::Debug,
+        T::Error: std::fmt::Debug,
+    {
+        let mut buf = Cursor::new(Vec::new());
+        value.serialize(&mut buf).unwrap();
+        buf.set_position(0);
+        let deser = T::deserialize(&mut buf).unwrap();
+        assert_eq!(deser, value);
+        assert_eq!(buf.get_ref().len(), value.encoded_size());
+    }
+
+    #[quickcheck]
+    fn basic_types_size_and_roundtrip(
+        key: Key,
+        table_id: TableId,
+        page_id: PageId,
+        lsn: Lsn,
+        slot_index: SlotIndex,
+        slot_entry: SlotEntry,
+        page_lsn: PageLsn,
+    ) -> TestResult {
+        assert_roundtrip(key);
+        assert_roundtrip(table_id);
+        assert_roundtrip(page_id);
+        assert_roundtrip(lsn);
+        assert_roundtrip(slot_index);
+        assert_roundtrip(slot_entry);
+        assert_roundtrip(page_lsn);
+        TestResult::passed()
     }
 }
