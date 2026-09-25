@@ -296,9 +296,29 @@ impl Page {
     /// Inserts a separator `Key` and associated child `PageId` into an internal `Page`.
     /// Primarily called by parent datastructure (e.g. `BTree`) after splitting a `Page`
     /// lower in the tree.
-    #[allow(dead_code)]
-    fn internal_insert(&mut self, _separator: Key, _right_child: PageId) -> Result<(), PageError> {
-        todo!()
+    pub fn internal_insert(
+        &mut self,
+        separator: Key,
+        right_child: PageId,
+    ) -> Result<(), PageError> {
+        let can_insert = matches!(self.free_space(), Some(free_space) if free_space >= Self::internal_entry_size(&separator));
+
+        let PageBody::Internal { keys, children } = &mut self.body else {
+            return Err(PageError::NotInternal);
+        };
+
+        let insert_pos = match keys.binary_search(&separator) {
+            Ok(_) => return Err(PageError::DuplicateKey),
+            Err(i) => i,
+        };
+
+        if !can_insert {
+            return Err(PageError::PageFull);
+        }
+
+        keys.insert(insert_pos, separator);
+        children.insert(insert_pos + 1, right_child);
+        Ok(())
     }
 
     /// Inserts a `ValidatedRow` into the `Page`. `ValidatedRow`s are those that are checked
@@ -775,10 +795,10 @@ mod tests {
 
     #[quickcheck]
     fn max_size_key_fits_after_internal_split(key_sizes: Vec<u16>, target: u16) -> TestResult {
-        let page_id = PageId::new(TableId::new(u32::MAX), u32::MAX);
         if key_sizes.is_empty() {
             return TestResult::discard();
         }
+        let child = |n: usize| PageId::new(TableId::new(1), n as u32);
 
         // largest string key whose internal entry still fits the limit
         let max_key_len = (0..MAX_INTERNAL_ENTRY_SIZE)
@@ -786,46 +806,49 @@ mod tests {
             .find(|&len| Page::internal_entry_size(&padded_key(0, len)) <= MAX_INTERNAL_ENTRY_SIZE)
             .unwrap();
 
-        // fill and internal page with keys 0, 2, 4, ... until one won't fit
-        let mut keys: Vec<Key> = Vec::new();
-        let mut children = vec![page_id];
-        for (i, size) in key_sizes.iter().cycle().enumerate() {
-            let key = padded_key(i * 2, 6 + *size as usize % (max_key_len - 5));
-            // this silliness is because I don't have an internal page insert yet
-            let page = Page::empty_page(
-                page_id,
-                PageBody::Internal {
-                    keys: keys.clone(),
-                    children: children.clone(),
-                },
-            );
-            if page.free_space().unwrap() < Page::internal_entry_size(&key) {
-                break;
-            }
-            keys.push(key);
-            children.push(page_id);
-        }
+        let mut page = Page::empty_page(
+            child(0),
+            PageBody::Internal {
+                keys: Vec::new(),
+                children: vec![child(0)],
+            },
+        );
 
-        let mut page = Page::empty_page(page_id, PageBody::Internal { keys, children });
+        // start from a valid internal page (no keys, one child), then fill it with
+        // keys 0, 2, 4, ... through the real insert until it reports PageFull
+        for (i, size) in key_sizes.iter().cycle().enumerate() {
+            let key = padded_key(i * 2, 6 + (*size as usize) % (max_key_len - 5));
+            match page.internal_insert(key, child(i + 1)) {
+                Ok(()) => {}
+                Err(PageError::PageFull) => break,
+                Err(e) => panic!("unexpected error while filling: {e:?}"),
+            }
+        }
         let key_count = page.num_items();
 
-        let (separator, right) = match page.split_page(page_id) {
+        let (separator, mut right) = match page.split_page(child(999_999)) {
             Ok(split) => split,
             Err(PageError::TooSmallToSplit(_)) => return TestResult::discard(),
-            Err(e) => panic!("Unexpected split error: {e:?}"),
+            Err(e) => panic!("unexpected split error: {e:?}"),
         };
 
-        // a max size key whose prefix lands between existing keys
-        let new_key = padded_key((target as usize % (key_count + 1)) * 2 + 1, max_key_len);
-        let half = if new_key >= separator { &right } else { &page };
-        let free = half.free_space().unwrap();
+        let big_key = padded_key((target as usize % (key_count + 1)) * 2 + 1, max_key_len);
+        let new_child = child(1_000_000);
+        let half = if big_key >= separator {
+            &mut right
+        } else {
+            &mut page
+        };
 
-        // TODO: change this to an actual insert once I have an insert method for internal pages
+        let result = half.internal_insert(big_key.clone(), new_child);
         assert!(
-            free >= Page::internal_entry_size(&new_key),
-            "max size target needs {} bytes but the target half only has {free}",
-            Page::internal_entry_size(&new_key)
+            result.is_ok(),
+            "max-size key didn't fit after split: {result:?}"
         );
+
+        // the new child sits immediately right of the new key
+        assert_eq!(half.body.find_child(&big_key), Some(new_child));
+
         TestResult::passed()
     }
     #[quickcheck]

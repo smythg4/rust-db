@@ -15,7 +15,7 @@ QUICKCHECK_TESTS=10000 cargo test
 ```
 
 ### Immediate To-Do
-  - [ ] Write `insert` for internal pages - will make current tests much nicer.
+  - [x] Write `insert` for internal pages - will make current tests much nicer.
   - [x] `Option` deserialize: return an `InvalidData` io error instead of panicking on bad tags
   - [x] Replace `expect`s in `Page::deserialize` with `PageError::Corrupt`; validate invariants on read (valid key
   in field 0, strictly sorted keys, children = keys + 1)
