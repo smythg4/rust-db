@@ -1,5 +1,5 @@
 use crate::commontypes::Key;
-use crate::page::PAGE_SIZE;
+use crate::page::{MAX_INTERNAL_ENTRY_SIZE, MAX_LEAF_ENTRY_SIZE, Page};
 use crate::traits::Serializable;
 use integer_encoding::*;
 use std::io::{Read, Write};
@@ -12,7 +12,7 @@ const FLOAT_FLAG: u8 = 2;
 const STRING_FLAG: u8 = 3;
 const BOOL_FLAG: u8 = 4;
 
-const MAX_FIELD_LEN: usize = PAGE_SIZE / 2;
+const MAX_FIELD_LEN: usize = MAX_LEAF_ENTRY_SIZE / 2;
 const MAX_NUM_FIELDS: usize = 255;
 
 #[derive(Error, Debug)]
@@ -184,12 +184,14 @@ impl TryFrom<Vec<RowValue>> for Row {
     type Error = RowError;
     fn try_from(fields: Vec<RowValue>) -> Result<Self, Self::Error> {
         if fields.is_empty() {
-            return Err(RowError::EmptyRow);
+            Err(RowError::EmptyRow)
+        } else if let Some(key_row) = fields.first()
+            && Key::try_from(key_row).is_ok()
+        {
+            Ok(Row { fields })
+        } else {
+            Err(RowError::InvalidFirstEntry)
         }
-        if Key::try_from(&fields[0]).is_err() {
-            return Err(RowError::InvalidFirstEntry);
-        }
-        Ok(Row { fields })
     }
 }
 
@@ -295,8 +297,14 @@ pub enum SchemaError {
     EmptyColumns,
     #[error("Too many columns")]
     TooManyColumns,
-    #[error("value too large for schema")]
-    RowTooLong,
+    #[error("Row required size: {0}. Rows cannot use more than {MAX_LEAF_ENTRY_SIZE}")]
+    RowTooLong(usize),
+    #[error("Key required size: {0}. Keys cannot use more than {MAX_INTERNAL_ENTRY_SIZE}")]
+    KeyTooLong(usize),
+    #[error("Field length: {0}. Fields cannot be longer than {MAX_FIELD_LEN}")]
+    FieldTooLong(usize),
+    #[error("Invalid key value in first row")]
+    InvalidKey,
 }
 
 /// ValidatedRow is the only type accepted for `insert` operations on the B+Tree
@@ -354,19 +362,30 @@ impl Schema {
     pub fn validate_row(&self, row: Row) -> Result<ValidatedRow, SchemaError> {
         let cols = &self.columns;
         let values = &row.fields;
+
         if cols.len() != values.len() {
             return Err(SchemaError::ColumnCountMismatch);
+        }
+        if Page::leaf_entry_size(&row) > MAX_LEAF_ENTRY_SIZE {
+            return Err(SchemaError::RowTooLong(Page::leaf_entry_size(&row)));
+        }
+        let key = match Key::try_from(&row.fields[0]) {
+            Ok(k) => k,
+            Err(_) => return Err(SchemaError::InvalidKey),
+        };
+        if Page::internal_entry_size(&key) > MAX_INTERNAL_ENTRY_SIZE {
+            return Err(SchemaError::KeyTooLong(Page::internal_entry_size(&key)));
         }
 
         for (i, (col, value)) in cols.iter().zip(values.iter()).enumerate() {
             match value.column_type() {
                 Some(c) if c == col.col_type => {
                     if value.encoded_size() > MAX_FIELD_LEN {
-                        return Err(SchemaError::RowTooLong);
+                        return Err(SchemaError::FieldTooLong(value.encoded_size()));
                     }
                 }
                 None if col.nullable => {}
-                None if !col.nullable => return Err(SchemaError::NullValueInNonNullCol(i)),
+                None => return Err(SchemaError::NullValueInNonNullCol(i)),
                 _ => return Err(SchemaError::TypeMismatch(i)),
             }
         }
@@ -609,7 +628,7 @@ pub(crate) mod tests {
         assert!(ser_result.is_err());
         assert!(matches!(
             ser_result.unwrap_err(),
-            RowValueError::FieldTooLong(2049)
+            RowValueError::FieldTooLong(_)
         ));
     }
 
@@ -667,23 +686,43 @@ pub(crate) mod tests {
     #[test]
     fn invalid_rows_fail_validation() {
         let schema = Schema {
-            columns: vec![Column::integer(), Column::nullable_string()],
+            columns: vec![Column::integer(), Column::nullable_string(), Column::bool()],
         };
 
         let wrong_type = Row {
-            fields: vec![RowValue::Integer(1), RowValue::Float(1.5)],
+            fields: vec![
+                RowValue::Integer(1),
+                RowValue::Float(1.5),
+                RowValue::Boolean(false),
+            ],
         };
         assert!(matches!(
             schema.validate_row(wrong_type),
             Err(SchemaError::TypeMismatch(1))
         ));
 
+        let null_key = Row {
+            fields: vec![
+                RowValue::Null,
+                RowValue::String("x".to_string()),
+                RowValue::Boolean(true),
+            ],
+        };
+        assert!(matches!(
+            schema.validate_row(null_key),
+            Err(SchemaError::InvalidKey)
+        ));
+
         let null_in_non_null = Row {
-            fields: vec![RowValue::Null, RowValue::String("x".to_string())],
+            fields: vec![
+                RowValue::Integer(10),
+                RowValue::String("x".to_string()),
+                RowValue::Null,
+            ],
         };
         assert!(matches!(
             schema.validate_row(null_in_non_null),
-            Err(SchemaError::NullValueInNonNullCol(0))
+            Err(SchemaError::NullValueInNonNullCol(2))
         ));
 
         let too_short = Row {

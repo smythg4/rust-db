@@ -138,9 +138,10 @@ impl Serializable for PageLsn {
         let mut buf = [0u8; 8];
         r.read_exact(&mut buf)?;
         let val = u64::from_be_bytes(buf);
-        Ok(match val {
-            0 => PageLsn(None),
-            n => PageLsn(Some(Lsn::new(n).unwrap())),
+        Ok(if val == 0 {
+            PageLsn(None)
+        } else {
+            PageLsn(Some(Lsn::new(val).unwrap()))
         })
     }
 

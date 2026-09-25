@@ -1,7 +1,7 @@
 use crate::commontypes::{
     Key, KeyError, LsnError, PAGE_ID_SIZE, PageId, PageLsn, SLOT_ENTRY_SIZE, SlotEntry,
 };
-use crate::schema::{Row, RowValueError, ValidatedRow};
+use crate::schema::{Row, RowValue, RowValueError, ValidatedRow};
 use crate::traits::Serializable;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 use std::ops::Range;
@@ -13,6 +13,14 @@ pub const INTERNAL_TAG: u8 = 2;
 pub const MAX_LEAF_HEADER_SIZE: usize = 46;
 pub const MAX_INTERNAL_HEADER_SIZE: usize = 28;
 
+/// The maximum size for an entry into a leaf, decided to ensure that upon a Page split
+/// an entry will fit after
+pub const MAX_LEAF_ENTRY_SIZE: usize = (PAGE_SIZE - MAX_LEAF_HEADER_SIZE) / 4;
+
+/// The maximum size for an key going into an internal page, decided to ensure that upon a Page split
+/// an entry will fit after
+pub const MAX_INTERNAL_ENTRY_SIZE: usize = PAGE_SIZE - MAX_INTERNAL_HEADER_SIZE - PAGE_ID_SIZE;
+
 #[derive(Error, Debug)]
 pub enum PageError {
     #[error(transparent)]
@@ -23,8 +31,6 @@ pub enum PageError {
     Value(#[from] RowValueError),
     #[error(transparent)]
     Key(#[from] KeyError),
-    #[error("Invalid page tag: {0}")]
-    InvalidTag(u8),
     #[error("Page got overfull before serialization")]
     PageOverFlow,
     #[error("Page too small to split: {0}")]
@@ -35,10 +41,26 @@ pub enum PageError {
     DuplicateKey,
     #[error("Attempt to insert into a non-leaf page")]
     NotLeaf,
-    #[error("page data was corrupt")]
-    CorruptData,
-    #[error("invalid data range: {0:?}")]
+    #[error("invariant violated")]
+    InvariantViolated,
+    #[error("Corrupt data found on page: {page_id:?}. {kind:?}")]
+    Corrupt {
+        page_id: Option<PageId>,
+        kind: CorruptionKind,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum CorruptionKind {
+    InvalidTag(u8),
     InvalidRange(Range<usize>),
+    MissingKey,
+    InvalidKey(RowValue),
+    UnsortedKeys,
+    UnsortedRecords,
+    PageWouldOverFlow,
+    InvalidLsn,
+    UnknownCorruption,
 }
 pub type RawPage = [u8; PAGE_SIZE];
 
@@ -258,12 +280,12 @@ impl Page {
 
     /// Returns the fully loaded cost for inserting a `Key` into an Internal page to include the slot entry
     /// and child page pointer
-    fn internal_entry_size(k: &Key) -> usize {
+    pub(crate) fn internal_entry_size(k: &Key) -> usize {
         k.encoded_size() + SLOT_ENTRY_SIZE + PAGE_ID_SIZE
     }
 
     /// Returns the fully loaded cost for inserting a `Row` into an Leaf page to include the slot entry
-    fn leaf_entry_size(r: &Row) -> usize {
+    pub(crate) fn leaf_entry_size(r: &Row) -> usize {
         r.encoded_size() + SLOT_ENTRY_SIZE
     }
 
@@ -354,10 +376,10 @@ impl Page {
                 let new_records = records.split_off(split_off_point);
                 let split_key: Key = new_records
                     .first()
-                    .ok_or(PageError::CorruptData)?
+                    .ok_or(PageError::InvariantViolated)?
                     .fields
                     .first()
-                    .ok_or(PageError::CorruptData)?
+                    .ok_or(PageError::InvariantViolated)?
                     .try_into()?;
 
                 let new_page = Page {
@@ -397,10 +419,16 @@ impl Serializable for Page {
         let is_leaf = match tag {
             INTERNAL_TAG => false,
             LEAF_TAG => true,
-            _ => return Err(PageError::InvalidTag(tag)),
+            _ => {
+                return Err(PageError::Corrupt {
+                    page_id: None,
+                    kind: CorruptionKind::InvalidTag(tag),
+                });
+            }
         };
 
         let page_id = PageId::deserialize(&mut cursor)?;
+
         let last_update = PageLsn::deserialize(&mut cursor)?;
         let parent = Option::<PageId>::deserialize(&mut cursor)?;
         let (next_page, prev_page) = if is_leaf {
@@ -420,27 +448,40 @@ impl Serializable for Page {
             for _ in 0..num_items {
                 let slot_range = SlotEntry::deserialize(&mut cursor)?.range();
                 if slot_range.is_empty() {
-                    return Err(PageError::CorruptData);
+                    return Err(PageError::Corrupt {
+                        page_id: Some(page_id),
+                        kind: CorruptionKind::InvalidRange(slot_range),
+                    });
                 }
-                records.push(Row::deserialize(
-                    &mut buf
-                        .get(slot_range.clone())
-                        .ok_or(PageError::InvalidRange(slot_range))?,
-                )?);
+                records.push(Row::deserialize(&mut buf.get(slot_range.clone()).ok_or(
+                    PageError::Corrupt {
+                        page_id: Some(page_id),
+                        kind: CorruptionKind::InvalidRange(slot_range),
+                    },
+                )?)?);
             }
 
             // check that all the keys are valid for the records
             let keys: Vec<Key> = records
                 .iter()
                 .map(|r| {
-                    let first = r.fields.first().ok_or(PageError::CorruptData)?;
-                    Key::try_from(first).map_err(|_| PageError::CorruptData)
+                    let first = r.fields.first().ok_or(PageError::Corrupt {
+                        page_id: Some(page_id),
+                        kind: CorruptionKind::MissingKey,
+                    })?;
+                    Key::try_from(first).map_err(|_| PageError::Corrupt {
+                        page_id: Some(page_id),
+                        kind: CorruptionKind::InvalidKey(first.clone()),
+                    })
                 })
                 .collect::<Result<Vec<Key>, PageError>>()?;
 
             // ensure the keys are sorted
             if !keys.iter().is_sorted_by(|a, b| a < b) {
-                return Err(PageError::CorruptData);
+                return Err(PageError::Corrupt {
+                    page_id: Some(page_id),
+                    kind: CorruptionKind::UnsortedKeys,
+                });
             }
             PageBody::Leaf {
                 next: next_page,
@@ -455,19 +496,24 @@ impl Serializable for Page {
             let mut keys = Vec::with_capacity(num_items);
             for _ in 0..num_items {
                 let slot_range = SlotEntry::deserialize(&mut cursor)?.range();
-                keys.push(Key::deserialize(
-                    &mut buf
-                        .get(slot_range.clone())
-                        .ok_or(PageError::InvalidRange(slot_range))?,
-                )?);
+                keys.push(Key::deserialize(&mut buf.get(slot_range.clone()).ok_or(
+                    PageError::Corrupt {
+                        page_id: Some(page_id),
+                        kind: CorruptionKind::InvalidRange(slot_range),
+                    },
+                )?)?);
             }
-            // ensure there's always one more child than keys
+            // ensure there's always one more child than keys - this is impossible to fail
             if keys.len() + 1 != children.len() {
-                return Err(PageError::CorruptData);
+                std::hint::cold_path();
+                return Err(PageError::InvariantViolated);
             }
             // ensure the keys are sorted
             if !keys.windows(2).all(|w| w[0] < w[1]) {
-                return Err(PageError::CorruptData);
+                return Err(PageError::Corrupt {
+                    page_id: Some(page_id),
+                    kind: CorruptionKind::UnsortedKeys,
+                });
             }
             PageBody::Internal { keys, children }
         };
@@ -481,7 +527,10 @@ impl Serializable for Page {
 
         // ensure that the page won't overflow PAGE_SIZE bytes
         if page.free_space().is_none() {
-            return Err(PageError::CorruptData);
+            return Err(PageError::Corrupt {
+                page_id: Some(page_id),
+                kind: CorruptionKind::PageWouldOverFlow,
+            });
         }
         Ok(page)
     }
@@ -825,23 +874,44 @@ mod tests {
         }
     }
 
+    fn increment_key_on_row(row: &Row) -> Row {
+        let mut new_row = row.clone();
+        let new_key = match &row.fields[0] {
+            RowValue::Integer(n) => RowValue::Integer(n.wrapping_add(1)),
+            RowValue::String(s) => RowValue::String(format!("{s}1")),
+            _ => unreachable!(),
+        };
+        new_row.fields[0] = new_key;
+        new_row
+    }
+
     #[quickcheck]
     fn page_insert_returns_page_full_when_full(
         mut page: Page,
-        SchemaRowPair(schema, row): SchemaRowPair,
+        SchemaRowPair(schema, mut row): SchemaRowPair,
     ) -> TestResult {
-        if !matches!(page.body, PageBody::Leaf { .. }) {
-            return TestResult::discard();
+        page.body = PageBody::Leaf {
+            records: Vec::new(),
+            next: None,
+            prev: None,
+        };
+
+        // fill the page up entries
+        while page.can_insert(&row) {
+            let vr = schema.validate_row(row.clone()).unwrap();
+            page.insert(vr).unwrap();
+            row = increment_key_on_row(&row);
         }
-        if page.can_insert(&row) {
-            return TestResult::discard();
-        }
+        let snapshot = page.clone();
 
-        let validated_row = schema.validate_row(row).unwrap();
+        // one more insert should trigger page full
+        let vr = schema.validate_row(row.clone()).unwrap();
+        let result = page.insert(vr);
+        assert!(matches!(result, Err(PageError::PageFull)));
 
-        let result = page.insert(validated_row);
+        // make sure the failed insert didn't change the underlying page
+        assert_eq!(page.as_raw_page().unwrap(), snapshot.as_raw_page().unwrap());
 
-        assert!(matches!(result, Err(PageError::PageFull)), "{result:?}");
         TestResult::passed()
     }
 

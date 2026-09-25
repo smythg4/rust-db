@@ -5,7 +5,10 @@ A learning project focused on learning more about databases.
 Wrapping up phase 1 with an easy to manipulate page structure. Right now the design leads me to read a 4KB chunk of memory, parse it into an in-memory version, perform all `Page` operations on that (`insert`, `split_page`, etc), then it can be serialized back into a `RawPage` of bytes to be flushed back to disk. This will cost a full 4KB read and parse to perform any operation, instead of working directly on the bytes, but has made writing tests far easier so I have the confidence to move on to phase 2.
 
 #### Testing
-Recent work has been primarily focused on good property based tests with the `quickcheck` crate. I was able to implement `Arbitrary` for all my base types and put operations through the wringer. I'm particularly proud of the ability to generate an arbitrary valid `Page`, call the `split_page` method, and ensure that both resultant pages not only conform to all the invariants, but also survive the roundtrip serialization.
+Recent work has been primarily focused on good property based tests with the `quickcheck` crate. I was able to implement `Arbitrary` for all my base types and put operations through the wringer.
+  - I'm particularly proud of the ability to generate an arbitrary valid `Page`, serialize it, mutate random bytes within, then reserialize to make sure it never panics, but returns a proper error instead.
+  - All basic types are tested with a roundtrip serialization check as well as a check of `.encoded_size()` against the actual encoding
+  length, instilling confidence in all calls to `.encoded_size()`.
 
 ```
 QUICKCHECK_TESTS=10000 cargo test
@@ -16,7 +19,7 @@ QUICKCHECK_TESTS=10000 cargo test
   - [x] Replace `expect`s in `Page::deserialize` with `PageError::Corrupt`; validate invariants on read (valid key
   in field 0, strictly sorted keys, children = keys + 1)
   - [x] Corrupt-input tests: random/mutated page bytes never panic; truncated values return `Err`
-  - [ ] Cap total row size (vs. usable leaf space) and key size (vs. internal node space) in `validate_row`; unify
+  - [x] Cap total row size (vs. usable leaf space) and key size (vs. internal node space) in `validate_row`; unify
   raw vs. encoded length limits
   - [x] Split leaves by bytes, not count, so a post-split retry always fits
   - [ ] `find_child` tests: boundaries + split-then-route
@@ -24,8 +27,9 @@ QUICKCHECK_TESTS=10000 cargo test
   - [x] Generators: integer keys in internal nodes, random `None` pointers (loosen `free_space_works`
   accordingly), fuller pages
   - [x] Round-trip + size tests for `PageLsn`, `Lsn`, `PageId`, `SlotEntry`, `Option<T>`
-  - [ ] Delete or rewrite `page_insert_returns_page_full_when_full`; tidy `validate_row`, `Row::try_from`,
+  - [x] Rewrite `page_insert_returns_page_full_when_full`; tidy `validate_row`, `Row::try_from`,
   `PageLsn::deserialize`
+  - [ ] Handle primative type errors as `PageError::Corrupt` in `Page::deserialize` where appropriate.
 
 ### Phase 0 — Types
 - When following the [cstack database tutorial](https://github.com/smythg4/cstack_db), raw `u32` and `usize` abounded. This time, I opted to create custom types for things like `PageId`, `SlotIndex`, `SlotEntry`, `Key`, `Row`, `RowValue`, and `ValidatedRow` for example.
@@ -39,12 +43,53 @@ QUICKCHECK_TESTS=10000 cargo test
 ### Phase 1 — Storage Layout
 - In-table data is represented as a `RowValue`, which currently supports `Integer(i64)`, `String(String)`, `Boolean(bool)`, `Float(f64)`, and `Null`.
 - `Schemas` hold `Columns` that are made up of `ColumnType` and a `nullable` flag. Primary Keys are always stored in the first element of the underlying `Vec`. Primary Keys can only be non-nullable `String` or `Integer` right now and a new `Schema` will be rejected if the first entry doesn't meet these requirements.
-- The fundamental unit of storage `Page` holds core metadata like `page_id: PageId`, `parent_id: Option<PageId>`, `Lsn` (not currently used, but will be important for WAL implementation), as well as a `PageBody` that is either a `Leaf` or `Internal`.
-  - `Internal` page bodies hold a list of keys and child `PageId`s. There should always be 1 more child than keys. This is enforced through `debug_assert!`s peppered throughout.
-  - `Leaf` page bodies hold a list of `Rows` and sibling pointers (`next: Option<PageId>
-`, `prev: Option<PageId>`) to allow quicker sequential scans.
+- The fundamental unit of storage `Page` holds core metadata like `page_id: PageId`, `parent: Option<PageId>`, `Lsn` (not currently used, but will be important for WAL implementation), as well as a `PageBody` that is either a `Leaf` or `Internal`.
+  - `Internal` page bodies hold a list of keys and child `PageId`s. There should always be 1 more child than keys. This is enforced through `debug_assert!`s for operations on `Page`s and `PageError::CorruptData` for deserialization.
+  - `Leaf` page bodies hold a list of `Rows` and sibling pointers (`next: Option<PageId>`, `prev: Option<PageId>`) to allow quicker sequential scans.
+- All data encoding is in Big Endian order.
 - One major shortcoming at this juncture is the need to read in the full 4KB page off disk and deserialize into this in-memory representation for any page modifications.
   - It's commented out right now, but my plan is to define a trait for `Page` that I can implement for a pure, raw-byte page representation and swap my current implementation out for something that's closer to 'zero-copy'.
+
+#### Page layout (4096 bytes)
+
+  | Header | Slot array → | Free space | ← Row / key data |
+  |:---:|:---:|:---:|:---:|
+  | fixed fields | grows toward the end | shrinks from both sides | grows toward the front |
+
+  All integers are big-endian. `Option<PageId>` fields are a 1-byte tag (`0` = `None`, `1` = `Some`) followed by
+  the 8-byte `PageId` only when `Some`.
+
+  #### Leaf header (≤ 46 bytes)
+
+  | Offset | Field | Size (bytes) | Notes |
+  |---:|---|---:|---|
+  | 0 | `tag` | 1 | `1` = leaf |
+  | 1 | `page_id` | 8 | `TableId` (u32) + page number (u32) |
+  | 9 | `lsn` | 8 | `0` = no LSN yet |
+  | 17 | `parent` | 1 + 8 | `Option<PageId>` |
+  | 26 | `next` | 1 + 8 | `Option<PageId>` |
+  | 35 | `prev` | 1 + 8 | `Option<PageId>` |
+  | 44 | `num_items` | 2 | number of records |
+
+  #### Internal header (≤ 28 bytes)
+
+  | Offset | Field | Size (bytes) | Notes |
+  |---:|---|---:|---|
+  | 0 | `tag` | 1 | `2` = internal |
+  | 1 | `page_id` | 8 | `TableId` (u32) + page number (u32) |
+  | 9 | `lsn` | 8 | `0` = no LSN yet |
+  | 17 | `parent` | 1 + 8 | `Option<PageId>` |
+  | 26 | `num_items` | 2 | number of keys |
+  | 28 | `children` | 8 × (`num_items` + 1) | child `PageId`s, followed by the slot array |
+
+  Offsets assume every `Option` is `Some`. Each `None` moves the fields after it 8 bytes earlier.
+
+  #### Slot entry (4 bytes)
+
+  | Field | Size (bytes) | Notes |
+  |---|---:|---|
+  | `offset` | 2 | byte offset from the start of the page |
+  | `length` | 2 | length of the encoded row or key |
   
 ### Phase 2 — BufferPoolManager
 - Reads pages off disk, deserializes into a proper `PageNode` struct
