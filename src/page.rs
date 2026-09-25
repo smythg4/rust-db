@@ -4,6 +4,7 @@ use crate::commontypes::{
 use crate::schema::{Row, RowValueError, ValidatedRow};
 use crate::traits::Serializable;
 use std::io::{Cursor, Read, Write};
+use std::ops::Range;
 use thiserror::Error;
 
 pub const PAGE_SIZE: usize = 4096;
@@ -34,6 +35,10 @@ pub enum PageError {
     DuplicateKey,
     #[error("Attempt to insert into a non-leaf page")]
     NotLeaf,
+    #[error("page data was corrupt")]
+    CorruptData,
+    #[error("invalid data range: {0:?}")]
+    InvalidRange(Range<usize>),
 }
 pub type RawPage = [u8; PAGE_SIZE];
 
@@ -71,6 +76,10 @@ impl Page {
             PageBody::Leaf { records, .. } => records.len(),
             PageBody::Internal { keys, .. } => keys.len(),
         }
+    }
+
+    pub fn is_root(&self) -> bool {
+        self.parent.is_none()
     }
 
     pub fn free_space(&self) -> Option<usize> {
@@ -272,20 +281,19 @@ impl Page {
                 debug_assert!(
                     records
                         .iter()
-                        .filter_map(|r| r.fields.first())
-                        .map(|k| Key::try_from(k).unwrap())
-                        .is_sorted()
+                        .map(|r| Key::try_from(&r.fields[0]).unwrap())
+                        .is_sorted_by(|a, b| a < b),
+                    "record aren't sorted by strictly increasing"
                 );
                 let split_point = records.len() / 2;
                 let new_records = records.split_off(split_point);
                 let split_key: Key = new_records
                     .first()
-                    .expect("missing promoting key")
+                    .ok_or(PageError::CorruptData)?
                     .fields
                     .first()
-                    .expect("missing primary key")
-                    .try_into()
-                    .expect("invalid key");
+                    .ok_or(PageError::CorruptData)?
+                    .try_into()?;
 
                 let new_page = Page {
                     page_id: new_page_id,
@@ -346,9 +354,28 @@ impl Serializable for Page {
             let mut records = Vec::with_capacity(num_items);
             for _ in 0..num_items {
                 let slot_range = SlotEntry::deserialize(&mut cursor)?.range();
+                if slot_range.is_empty() {
+                    return Err(PageError::CorruptData);
+                }
                 records.push(Row::deserialize(
-                    &mut buf.get(slot_range).expect("bad range for leaf page!"),
+                    &mut buf
+                        .get(slot_range.clone())
+                        .ok_or(PageError::InvalidRange(slot_range))?,
                 )?);
+            }
+
+            // check that all the keys are valid for the records
+            let keys: Vec<Key> = records
+                .iter()
+                .map(|r| {
+                    let first = r.fields.first().ok_or(PageError::CorruptData)?;
+                    Key::try_from(first).map_err(|_| PageError::CorruptData)
+                })
+                .collect::<Result<Vec<Key>, PageError>>()?;
+
+            // ensure the keys are sorted
+            if !keys.iter().is_sorted_by(|a, b| a < b) {
+                return Err(PageError::CorruptData);
             }
             PageBody::Leaf {
                 next: next_page,
@@ -364,17 +391,29 @@ impl Serializable for Page {
             for _ in 0..num_items {
                 let slot_range = SlotEntry::deserialize(&mut cursor)?.range();
                 keys.push(Key::deserialize(
-                    &mut buf.get(slot_range).expect("bad range for internal page!"),
+                    &mut buf
+                        .get(slot_range.clone())
+                        .ok_or(PageError::InvalidRange(slot_range))?,
                 )?);
+            }
+            if !keys.windows(2).all(|w| w[0] < w[1]) {
+                return Err(PageError::CorruptData);
             }
             PageBody::Internal { keys, children }
         };
-        Ok(Page {
+
+        let page = Page {
             page_id,
             parent,
             last_update,
             body,
-        })
+        };
+
+        // ensure that the page won't overflow PAGE_SIZE bytes
+        if page.free_space().is_none() {
+            return Err(PageError::CorruptData);
+        }
+        Ok(page)
     }
 
     fn encoded_size(&self) -> usize {
@@ -410,11 +449,15 @@ mod tests {
 
     impl Arbitrary for PageBody {
         fn arbitrary(g: &mut Gen) -> Self {
-            let kind = g.choose(&[INTERNAL_TAG, LEAF_TAG]).unwrap();
-            match *kind {
-                INTERNAL_TAG => {
-                    let mut keys: Vec<Key> =
-                        (0..10).map(|_| Key::String(String::arbitrary(g))).collect();
+            let coin_flip = bool::arbitrary(g);
+            match coin_flip {
+                true => {
+                    let coin_flip = bool::arbitrary(g);
+                    let mut keys: Vec<Key> = if coin_flip {
+                        (0..10).map(|_| Key::String(String::arbitrary(g))).collect()
+                    } else {
+                        (0..10).map(|_| Key::Integer(i64::arbitrary(g))).collect()
+                    };
                     keys.sort();
                     keys.dedup();
                     let children: Vec<PageId> = (0..keys.len() + 1)
@@ -422,18 +465,13 @@ mod tests {
                         .collect();
                     PageBody::Internal { keys, children }
                 }
-                LEAF_TAG => {
+                false => {
                     let mut records: Vec<Row> = (0..10).map(|_| Row::arbitrary(g)).collect();
                     records.sort_by_key(|r| Key::try_from(&r.fields[0]).unwrap());
                     records.dedup_by_key(|r| Key::try_from(&r.fields[0]).unwrap());
-                    let next = Some(PageId::new(
-                        TableId::new(u32::arbitrary(g)),
-                        u32::arbitrary(g),
-                    ));
-                    let prev = Some(PageId::new(
-                        TableId::new(u32::arbitrary(g)),
-                        u32::arbitrary(g),
-                    ));
+
+                    let next = Option::<PageId>::arbitrary(g);
+                    let prev = Option::<PageId>::arbitrary(g);
 
                     PageBody::Leaf {
                         records,
@@ -441,19 +479,16 @@ mod tests {
                         prev,
                     }
                 }
-                _ => unreachable!(),
             }
         }
     }
 
     impl Arbitrary for Page {
         fn arbitrary(g: &mut Gen) -> Self {
-            let page_id = PageId::new(TableId::new(u32::arbitrary(g)), u32::arbitrary(g));
+            let page_id = PageId::arbitrary(g);
             let last_update = PageLsn(Option::<Lsn>::arbitrary(g));
-            let parent = Some(PageId::new(
-                TableId::new(u32::arbitrary(g)),
-                u32::arbitrary(g),
-            ));
+
+            let parent = Option::<PageId>::arbitrary(g);
             let body = PageBody::arbitrary(g);
             let mut page = Page {
                 page_id,
@@ -501,11 +536,15 @@ mod tests {
             let is_duplicate = expected.contains_key(&key);
             let is_full = !page.can_insert(&row);
 
+            let page_clone = page.clone();
+
             let result = page.insert(validated_row);
             if is_duplicate {
                 assert!(matches!(result, Err(PageError::DuplicateKey)));
+                assert_eq!(page_clone, page);
             } else if is_full {
                 assert!(matches!(result, Err(PageError::PageFull)));
+                assert_eq!(page_clone, page);
             } else {
                 assert!(result.is_ok());
                 expected.insert(key, row.clone());
@@ -526,21 +565,23 @@ mod tests {
     #[quickcheck]
     fn split_page_roundtrip(mut page: Page) -> TestResult {
         let new_page_id = PageId::new(TableId::new(u32::MAX), u32::MAX);
-        if let Ok((_, new_page)) = page.split_page(new_page_id) {
-            let mut buf = Cursor::new(Vec::new());
-            page.serialize(&mut buf).unwrap();
-            buf.set_position(0);
-            let deser = Page::deserialize(&mut buf).unwrap();
-            assert_eq!(page, deser, "Original page doesn't roundtrip");
+        match page.split_page(new_page_id) {
+            Ok((_, new_page)) => {
+                let mut buf = Cursor::new(Vec::new());
+                page.serialize(&mut buf).unwrap();
+                buf.set_position(0);
+                let deser = Page::deserialize(&mut buf).unwrap();
+                assert_eq!(page, deser, "Original page doesn't roundtrip");
 
-            buf.set_position(0);
-            new_page.serialize(&mut buf).unwrap();
-            buf.set_position(0);
-            let deser = Page::deserialize(&mut buf).unwrap();
-            assert_eq!(new_page, deser, "New page doesn't roundtrip");
-            TestResult::passed()
-        } else {
-            TestResult::discard()
+                buf.set_position(0);
+                new_page.serialize(&mut buf).unwrap();
+                buf.set_position(0);
+                let deser = Page::deserialize(&mut buf).unwrap();
+                assert_eq!(new_page, deser, "New page doesn't roundtrip");
+                TestResult::passed()
+            }
+            Err(PageError::TooSmallToSplit(_)) => TestResult::discard(),
+            Err(_) => TestResult::failed(),
         }
     }
 
@@ -735,6 +776,55 @@ mod tests {
     }
 
     #[quickcheck]
+    fn random_inputs_never_panic_on_deserialize(raw_page: [u8; PAGE_SIZE]) -> TestResult {
+        let _ = Page::deserialize(&mut Cursor::new(raw_page));
+        // this will likely always fail, but it's possible that quickcheck generated a valid random input
+        // we only care that the call doesn't panic
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn mutated_pages_never_panic(page: Page, mutations: Vec<(u16, u8)>) -> TestResult {
+        // initial input Page is valid, we deconstruct it into raw bytes and make random
+        // modifications.
+        let mut bytes = page.as_raw_page().unwrap();
+        for &(pos, val) in &mutations {
+            bytes[pos as usize % PAGE_SIZE] = val;
+        }
+
+        let result = Page::deserialize(&mut &bytes[..]);
+
+        if mutations.is_empty() {
+            assert_eq!(result.unwrap(), page);
+        }
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn accepted_pages_are_valid(page: Page, mutations: Vec<(u16, u8)>) -> TestResult {
+        let mut bytes = page.as_raw_page().unwrap();
+        for &(pos, val) in &mutations {
+            bytes[pos as usize % PAGE_SIZE] = val;
+        }
+        match Page::deserialize(&mut &bytes[..]) {
+            Ok(decoded) => {
+                let again = decoded
+                    .as_raw_page()
+                    .expect("accepted page doesn't re-serialize");
+                assert_eq!(
+                    Page::deserialize(&mut &again[..])
+                        .unwrap()
+                        .as_raw_page()
+                        .unwrap(),
+                    decoded.as_raw_page().unwrap()
+                );
+                TestResult::passed()
+            }
+            Err(_) => TestResult::discard(),
+        }
+    }
+
+    #[quickcheck]
     fn duplicate_keys_trigger_error_on_insert(
         mut page: Page,
         SchemaRowPair(schema, row): SchemaRowPair,
@@ -757,18 +847,28 @@ mod tests {
     fn header_constant_is_right(page: Page) -> TestResult {
         let mut cursor = Cursor::new([0u8; PAGE_SIZE]);
         page.write_header(&mut cursor).unwrap();
+        let mut none_count = page.parent.is_none() as u64;
         match page.body {
             PageBody::Internal { .. } => {
-                assert_eq!(cursor.position(), MAX_INTERNAL_HEADER_SIZE as u64)
+                assert_eq!(
+                    cursor.position() + none_count * PAGE_ID_SIZE as u64,
+                    MAX_INTERNAL_HEADER_SIZE as u64
+                )
             }
-            PageBody::Leaf { .. } => assert_eq!(cursor.position(), MAX_LEAF_HEADER_SIZE as u64),
+            PageBody::Leaf { prev, next, .. } => {
+                none_count += prev.is_none() as u64 + next.is_none() as u64;
+                assert_eq!(
+                    cursor.position() + none_count * PAGE_ID_SIZE as u64,
+                    MAX_LEAF_HEADER_SIZE as u64
+                )
+            }
         };
         TestResult::passed()
     }
 
     #[test]
     fn basic_leaf_page_roundtrip() {
-        let records: Vec<Row> = (1..=5)
+        let mut records: Vec<Row> = (1..=5)
             .map(|j| Row {
                 fields: (0..10)
                     .map(|i| match i % 4 {
@@ -781,8 +881,11 @@ mod tests {
                     .collect(),
             })
             .collect();
+        records.sort_by_key(|r| Key::try_from(&r.fields[0]).unwrap());
+        records.dedup_by_key(|r| Key::try_from(&r.fields[0]).unwrap());
+
         let lpage = Page {
-            page_id: PageId::new(TableId::new(10), 10),
+            page_id: PageId::new(TableId::new(1), 10),
             last_update: PageLsn(Some(Lsn::new(10).unwrap())),
             parent: Some(PageId::new(TableId::new(1), 1)),
             body: PageBody::Leaf {
@@ -821,7 +924,9 @@ mod tests {
 
     #[quickcheck]
     fn free_space_works(page: Page) -> TestResult {
-        let free_space = page.free_space().unwrap();
+        let Some(free_space) = page.free_space() else {
+            return TestResult::discard();
+        };
 
         let mut raw_page = Cursor::new([0u8; PAGE_SIZE]);
         page.write_header(&mut raw_page).unwrap();
@@ -830,7 +935,11 @@ mod tests {
 
         let actual_free_space = data_offset - slot_offset;
 
-        assert_eq!(free_space, actual_free_space);
+        let max_header = match page.body {
+            PageBody::Internal { .. } => MAX_INTERNAL_HEADER_SIZE,
+            PageBody::Leaf { .. } => MAX_LEAF_HEADER_SIZE,
+        };
+        assert_eq!(free_space + (max_header - header_end), actual_free_space);
         TestResult::passed()
     }
 

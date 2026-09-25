@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::io::{Read, Write};
 pub trait Serializable
 where
@@ -35,7 +36,9 @@ where
         match tag[0] {
             0 => Ok(None),
             1 => Ok(Some(T::deserialize(r)?)),
-            _ => panic!("attempted to deserialize an invalid option tag"),
+            _ => Err(Self::Error::from(std::io::Error::from(
+                ErrorKind::InvalidData,
+            ))),
         }
     }
 

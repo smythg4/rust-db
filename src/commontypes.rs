@@ -347,6 +347,18 @@ mod tests {
         }
     }
 
+    impl Arbitrary for PageId {
+        fn arbitrary(g: &mut Gen) -> Self {
+            PageId(TableId::arbitrary(g), u32::arbitrary(g))
+        }
+    }
+
+    impl Arbitrary for TableId {
+        fn arbitrary(g: &mut Gen) -> Self {
+            TableId(u32::arbitrary(g))
+        }
+    }
+
     #[quickcheck]
     fn key_encoded_sizes(key: Key) -> TestResult {
         let mut bytes = Cursor::new(Vec::new());

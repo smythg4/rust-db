@@ -295,6 +295,8 @@ pub enum SchemaError {
     EmptyColumns,
     #[error("Too many columns")]
     TooManyColumns,
+    #[error("value too large for schema")]
+    RowTooLong,
 }
 
 /// ValidatedRow is the only type accepted for `insert` operations on the B+Tree
@@ -358,7 +360,11 @@ impl Schema {
 
         for (i, (col, value)) in cols.iter().zip(values.iter()).enumerate() {
             match value.column_type() {
-                Some(c) if c == col.col_type => {}
+                Some(c) if c == col.col_type => {
+                    if value.encoded_size() > MAX_FIELD_LEN {
+                        return Err(SchemaError::RowTooLong);
+                    }
+                }
                 None if col.nullable => {}
                 None if !col.nullable => return Err(SchemaError::NullValueInNonNullCol(i)),
                 _ => return Err(SchemaError::TypeMismatch(i)),
