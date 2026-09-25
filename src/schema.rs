@@ -465,7 +465,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn valid_row_from_schema(schema: &Schema, g: &mut Gen) -> Row {
+    pub(crate) fn valid_row_from_schema(schema: &Schema, g: &mut Gen) -> Row {
         Row {
             fields: schema
                 .columns

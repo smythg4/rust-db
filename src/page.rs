@@ -212,13 +212,14 @@ impl Page {
     }
 
     pub fn insert(&mut self, validated_row: ValidatedRow) -> Result<(), PageError> {
+        let PageBody::Leaf { .. } = &mut self.body else {
+            return Err(PageError::NotLeaf);
+        };
         let new_key = validated_row.primary_key();
         let row: Row = validated_row.into();
-        if !self.can_insert(&row) {
-            return Err(PageError::PageFull);
-        }
+        let can_insert = self.can_insert(&row);
         let PageBody::Leaf { records, .. } = &mut self.body else {
-            return Err(PageError::NotLeaf);
+            unreachable!();
         };
 
         let insert_pos = match records.binary_search_by(|r| r.cmp_key(&new_key)) {
@@ -226,6 +227,9 @@ impl Page {
             Err(i) => i,
         };
 
+        if !can_insert {
+            return Err(PageError::PageFull);
+        }
         records.insert(insert_pos, row);
         Ok(())
     }
@@ -235,16 +239,19 @@ impl Page {
         let curr_page_id = self.page_id;
         match &mut self.body {
             PageBody::Internal { keys, children } => {
-                if keys.len() < 2 {
+                if keys.len() < 3 {
                     return Err(PageError::TooSmallToSplit(self.page_id));
                 }
-                debug_assert!(keys.iter().is_sorted());
+                debug_assert!(
+                    keys.windows(2).all(|w| w[0] < w[1]),
+                    "keys aren't strictly increasing"
+                );
                 let split_point = keys.len() / 2;
-                let new_keys = keys.split_off(split_point);
+                let mut new_keys = keys.split_off(split_point);
                 let new_children = children.split_off(split_point + 1);
-                let split_key = keys.pop().expect("missing key to promote!").clone();
-                debug_assert_eq!(keys.len(), children.len() + 1);
-                debug_assert_eq!(new_keys.len(), new_children.len() + 1);
+                let split_key = new_keys.remove(0);
+                debug_assert_eq!(keys.len() + 1, children.len());
+                debug_assert_eq!(new_keys.len() + 1, new_children.len());
                 Ok((
                     split_key,
                     Page {
@@ -271,8 +278,8 @@ impl Page {
                 );
                 let split_point = records.len() / 2;
                 let new_records = records.split_off(split_point);
-                let split_key: Key = records
-                    .last()
+                let split_key: Key = new_records
+                    .first()
                     .expect("missing promoting key")
                     .fields
                     .first()
@@ -280,7 +287,6 @@ impl Page {
                     .try_into()
                     .expect("invalid key");
 
-                debug_assert_eq!(new_records.len(), records.len());
                 let new_page = Page {
                     page_id: new_page_id,
                     last_update: PageLsn(None),
@@ -391,22 +397,27 @@ impl PageBody {
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use quickcheck::{Arbitrary, Gen, TestResult};
     use quickcheck_macros::quickcheck;
 
     use super::*;
     use crate::commontypes::{Lsn, TableId};
-    use crate::schema::RowValue;
     use crate::schema::tests::SchemaRowPair;
+    use crate::schema::tests::valid_row_from_schema;
+    use crate::schema::{RowValue, Schema};
 
     impl Arbitrary for PageBody {
         fn arbitrary(g: &mut Gen) -> Self {
             let kind = g.choose(&[INTERNAL_TAG, LEAF_TAG]).unwrap();
             match *kind {
                 INTERNAL_TAG => {
-                    let keys: Vec<Key> =
+                    let mut keys: Vec<Key> =
                         (0..10).map(|_| Key::String(String::arbitrary(g))).collect();
-                    let children: Vec<PageId> = (0..11)
+                    keys.sort();
+                    keys.dedup();
+                    let children: Vec<PageId> = (0..keys.len() + 1)
                         .map(|_| PageId::new(TableId::new(u32::arbitrary(g)), u32::arbitrary(g)))
                         .collect();
                     PageBody::Internal { keys, children }
@@ -414,6 +425,7 @@ mod tests {
                 LEAF_TAG => {
                     let mut records: Vec<Row> = (0..10).map(|_| Row::arbitrary(g)).collect();
                     records.sort_by_key(|r| Key::try_from(&r.fields[0]).unwrap());
+                    records.dedup_by_key(|r| Key::try_from(&r.fields[0]).unwrap());
                     let next = Some(PageId::new(
                         TableId::new(u32::arbitrary(g)),
                         u32::arbitrary(g),
@@ -443,12 +455,262 @@ mod tests {
                 u32::arbitrary(g),
             ));
             let body = PageBody::arbitrary(g);
-            Page {
+            let mut page = Page {
                 page_id,
                 last_update,
                 parent,
                 body,
+            };
+            while page.free_space().is_none() {
+                page.body = PageBody::arbitrary(g);
             }
+            page
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct SchemaWithRows(Schema, Vec<Row>);
+
+    impl Arbitrary for SchemaWithRows {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let schema = Schema::arbitrary(g);
+            let n = usize::arbitrary(g) % 25;
+            let rows: Vec<Row> = (0..n).map(|_| valid_row_from_schema(&schema, g)).collect();
+            SchemaWithRows(schema, rows)
+        }
+    }
+
+    #[quickcheck]
+    fn insertion_order_on_leaves(
+        SchemaWithRows(schema, rows): SchemaWithRows,
+        mut page: Page,
+    ) -> TestResult {
+        if let PageBody::Leaf { records, .. } = &mut page.body {
+            records.clear();
+        } else {
+            return TestResult::discard();
+        };
+        use std::collections::BTreeMap;
+        let mut expected = BTreeMap::new();
+
+        for row in rows {
+            let validated_row = schema.validate_row(row).unwrap();
+            let key = validated_row.primary_key();
+            let row: Row = validated_row.clone().into();
+
+            let is_duplicate = expected.contains_key(&key);
+            let is_full = !page.can_insert(&row);
+
+            let result = page.insert(validated_row);
+            if is_duplicate {
+                assert!(matches!(result, Err(PageError::DuplicateKey)));
+            } else if is_full {
+                assert!(matches!(result, Err(PageError::PageFull)));
+            } else {
+                assert!(result.is_ok());
+                expected.insert(key, row.clone());
+            }
+        }
+        let PageBody::Leaf {
+            records: actual_records,
+            ..
+        } = page.body
+        else {
+            unreachable!()
+        };
+        let expected_records: Vec<Row> = expected.into_values().collect();
+        assert_eq!(expected_records, actual_records);
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn split_page_roundtrip(mut page: Page) -> TestResult {
+        let new_page_id = PageId::new(TableId::new(u32::MAX), u32::MAX);
+        if let Ok((_, new_page)) = page.split_page(new_page_id) {
+            let mut buf = Cursor::new(Vec::new());
+            page.serialize(&mut buf).unwrap();
+            buf.set_position(0);
+            let deser = Page::deserialize(&mut buf).unwrap();
+            assert_eq!(page, deser, "Original page doesn't roundtrip");
+
+            buf.set_position(0);
+            new_page.serialize(&mut buf).unwrap();
+            buf.set_position(0);
+            let deser = Page::deserialize(&mut buf).unwrap();
+            assert_eq!(new_page, deser, "New page doesn't roundtrip");
+            TestResult::passed()
+        } else {
+            TestResult::discard()
+        }
+    }
+
+    #[quickcheck]
+    fn split_page_key_in_right_spot(mut page: Page) -> TestResult {
+        let new_page_id = PageId::new(TableId::new(u32::MAX), u32::MAX);
+        if let Ok((split_key, new_page)) = page.split_page(new_page_id) {
+            match page.body {
+                PageBody::Internal { keys, .. } => {
+                    assert!(!keys.is_empty());
+                    assert!(keys.iter().all(|k| k < &split_key));
+                    let PageBody::Internal { keys: new_keys, .. } = new_page.body else {
+                        unreachable!()
+                    };
+                    assert!(!new_keys.is_empty());
+                    assert!(new_keys.iter().all(|k| k > &split_key));
+                }
+                PageBody::Leaf { records, .. } => {
+                    assert!(!records.is_empty());
+                    assert!(
+                        records
+                            .iter()
+                            .all(|r| r.cmp_key(&split_key) == Ordering::Less)
+                    );
+                    let PageBody::Leaf {
+                        records: new_records,
+                        ..
+                    } = new_page.body
+                    else {
+                        unreachable!()
+                    };
+                    assert!(!new_records.is_empty());
+                    assert!(
+                        new_records
+                            .iter()
+                            .all(|r| r.cmp_key(&split_key) != Ordering::Less)
+                    );
+                }
+            };
+            TestResult::passed()
+        } else {
+            TestResult::discard()
+        }
+    }
+
+    #[quickcheck]
+    fn sibling_and_parent_pointers_correct_after_split(mut page: Page) -> TestResult {
+        if matches!(page.body, PageBody::Internal { .. }) {
+            return TestResult::discard();
+        }
+        let original_id = page.page_id;
+        let new_page_id = PageId::new(TableId::new(u32::MAX), u32::MAX);
+        let PageBody::Leaf {
+            next: old_next,
+            prev: old_prev,
+            ..
+        } = page.body.clone()
+        else {
+            unreachable!()
+        };
+        if let Ok((_, new_page)) = page.split_page(new_page_id) {
+            match page.body {
+                PageBody::Internal { .. } => unreachable!(),
+                PageBody::Leaf { next, prev, .. } => {
+                    assert_eq!(prev, old_prev, "original page prev pointer wasn't retained");
+                    assert_eq!(
+                        next,
+                        Some(new_page_id),
+                        "original page doesn't point to new page"
+                    );
+                    let PageBody::Leaf {
+                        prev: new_prev,
+                        next: new_next,
+                        ..
+                    } = new_page.body
+                    else {
+                        unreachable!()
+                    };
+                    assert_eq!(
+                        new_prev,
+                        Some(original_id),
+                        "new page prev pointer doesn't point to original page"
+                    );
+                    assert_eq!(
+                        new_next, old_next,
+                        "new page next pointer doesn't point to original page's original next"
+                    );
+                }
+            };
+            assert_eq!(
+                page.parent, new_page.parent,
+                "new and original page should have same parent"
+            );
+            TestResult::passed()
+        } else {
+            TestResult::discard()
+        }
+    }
+
+    #[quickcheck]
+    fn no_rows_lost_in_split(mut page: Page) -> TestResult {
+        let new_page_id = PageId::new(TableId::new(u32::MAX), u32::MAX);
+        let mut original_keys: Vec<Key> = Vec::new();
+        let mut original_children: Vec<PageId> = Vec::new();
+        let mut original_records: Vec<Row> = Vec::new();
+
+        match &page.body {
+            PageBody::Internal { keys, children } => {
+                original_keys = keys.clone();
+                original_children = children.clone();
+            }
+            PageBody::Leaf { records, .. } => {
+                original_records = records.clone();
+            }
+        };
+
+        if let Ok((split_key, new_page)) = page.split_page(new_page_id) {
+            match new_page.body {
+                PageBody::Internal {
+                    keys: new_keys,
+                    children: new_children,
+                } => {
+                    let PageBody::Internal {
+                        keys: old_keys,
+                        children: old_children,
+                    } = page.body.clone()
+                    else {
+                        unreachable!()
+                    };
+                    let combined_keys: Vec<Key> = old_keys
+                        .clone()
+                        .into_iter()
+                        .chain(new_keys.into_iter())
+                        .collect();
+                    let combined_children: Vec<PageId> = old_children
+                        .clone()
+                        .into_iter()
+                        .chain(new_children.into_iter())
+                        .collect();
+
+                    // remove the split key from the internal node original list of Keys
+                    let remove_pos = original_keys.binary_search(&split_key).unwrap();
+                    original_keys.remove(remove_pos);
+
+                    assert_eq!(original_keys, combined_keys);
+                    assert_eq!(original_children, combined_children);
+                }
+                PageBody::Leaf {
+                    records: new_records,
+                    ..
+                } => {
+                    let PageBody::Leaf {
+                        records: old_records,
+                        ..
+                    } = page.body.clone()
+                    else {
+                        unreachable!()
+                    };
+                    let combined_records: Vec<Row> = old_records
+                        .clone()
+                        .into_iter()
+                        .chain(new_records.into_iter())
+                        .collect();
+                    assert_eq!(original_records, combined_records);
+                }
+            }
+
+            TestResult::passed()
+        } else {
+            TestResult::discard()
         }
     }
 

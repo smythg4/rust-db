@@ -312,7 +312,7 @@ impl Serializable for Key {
             Self::Integer(_) => 1 + size_of::<i64>(),
             Self::String(s) => {
                 let length = s.len();
-                let varlen = length.encode_var_vec().len();
+                let varlen = length.required_space();
                 1 + varlen + length
             }
         }
