@@ -30,7 +30,7 @@ QUICKCHECK_TESTS=10000 cargo test
   - [x] Rewrite `page_insert_returns_page_full_when_full`; tidy `validate_row`, `Row::try_from`,
   `PageLsn::deserialize`
   - [x] `find_child` tests: boundaries + split-then-route
-  - [ ] Handle primitive type errors as `PageError::Corrupt { kind }` in `Page::deserialize` where appropriate.
+  - [x] Handle primitive type errors as `PageError::Corrupt { kind }` in `Page::deserialize` where appropriate.
   - [x] Add a `merge_page` method for use when deletions reduce page size to half full
   - [x] Write test cases for `merge_page`
     - [x] Test for `PageFull` errors
@@ -44,10 +44,10 @@ QUICKCHECK_TESTS=10000 cargo test
     - [ ] `leaf_borrow` needs to make sure the `other` `Page` is the proper neighbor.
     - [ ] Both `borrow`s needs to check that the donor `Page` isn't empty and that the new entries actually fits in the current `Page`
   - [ ] Add tests for `internal_remove`, `leaf_remove`, `internal_borrow`, and `leaf_borrow`.
-    - [ ] `remove` returns `Ok(None)` for non-existent entries or `Key` not in range.
-    - [ ] `remove` returns `Err(NotLeaf)` or `Err(NotInternal)` if the `Page` type is wrong.
-    - [ ] `remove` followed by `insert` from the return results in the same `Page`
-    - [ ] Confirm proper `fild_child` routing after a `Key` removal.
+    - [x] `remove` returns `Ok(None)` for non-existent entries or `Key` not in range.
+    - [x] `remove` returns `Err(NotLeaf)` or `Err(NotInternal)` if the `Page` type is wrong.
+    - [x] `remove` followed by `insert` from the return results in the same `Page`
+    - [ ] Confirm proper `find_child` routing after a `Key` removal.
     - [ ] `borrow` returns error on empty `Pages`
     - [ ] `borrow` returns the correct `Key` to insert in the parent `Page`
     - [ ] `borrow` then `borrow_back` results in the original same `Page`

@@ -82,6 +82,14 @@ pub(crate) fn leaf_schema() -> (Schema, usize) {
     (schema, max_payload)
 }
 
+pub(crate) fn higher_key(key: &Key) -> Key {
+    match key {
+        Key::Integer(n) if *n < i64::MAX => Key::Integer(n.wrapping_add(1)),
+        Key::Integer(_) => Key::String("()".to_string()),
+        Key::String(s) => Key::String(format!("{s}s")),
+    }
+}
+
 pub(crate) fn valid_row_from_schema(schema: &Schema, g: &mut Gen) -> ValidatedRow {
     loop {
         let row = Row {

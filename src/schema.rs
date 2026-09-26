@@ -321,6 +321,11 @@ impl ValidatedRow {
             _ => unreachable!("shouldn't be able to get another option from a Validated Row"),
         }
     }
+
+    #[cfg(test)]
+    pub(crate) fn from_row(row: Row) -> Self {
+        ValidatedRow(row)
+    }
 }
 
 impl From<ValidatedRow> for Row {

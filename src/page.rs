@@ -70,14 +70,16 @@ pub enum MergeFailReason {
 pub enum CorruptionKind {
     InvalidTag(u8),
     InvalidRange(Range<usize>),
+    CorruptRow { slot: usize },
+    CorruptKey { slot: usize },
     MissingKey,
     InvalidKey(RowValue),
     UnsortedKeys,
-    UnsortedRecords,
     PageWouldOverFlow,
-    InvalidLsn,
-    UnknownCorruption,
     CheckSumMismatch,
+    InvalidPointerTag,
+    SlotArrayOverflow,
+    ChildPointerOverflow,
 }
 pub type RawPage = [u8; PAGE_SIZE];
 
@@ -734,15 +736,22 @@ impl Serializable for Page {
         };
 
         let page_id = PageId::deserialize(&mut cursor)?;
-
         let last_update = PageLsn::deserialize(&mut cursor)?;
+
+        // helper closure for error mapping
+        let corrupt = |kind| PageError::Corrupt {
+            page_id: Some(page_id),
+            kind,
+        };
 
         // skip the crc32 portion
         cursor.set_position(CHECKSUM_OFFSET as u64 + 4);
 
         let (next_page, prev_page) = if is_leaf {
-            let np = Option::<PageId>::deserialize(&mut cursor)?;
-            let pp = Option::<PageId>::deserialize(&mut cursor)?;
+            let np = Option::<PageId>::deserialize(&mut cursor)
+                .map_err(|_| corrupt(CorruptionKind::InvalidPointerTag))?;
+            let pp = Option::<PageId>::deserialize(&mut cursor)
+                .map_err(|_| corrupt(CorruptionKind::InvalidPointerTag))?;
             (np, pp)
         } else {
             (None, None)
@@ -754,43 +763,38 @@ impl Serializable for Page {
 
         let body = if is_leaf {
             let mut records = Vec::with_capacity(num_items);
-            for _ in 0..num_items {
-                let slot_range = SlotEntry::deserialize(&mut cursor)?.range();
+            for i in 0..num_items {
+                let slot_range = SlotEntry::deserialize(&mut cursor)
+                    .map_err(|_| corrupt(CorruptionKind::SlotArrayOverflow))?
+                    .range();
                 if slot_range.is_empty() {
-                    return Err(PageError::Corrupt {
-                        page_id: Some(page_id),
-                        kind: CorruptionKind::InvalidRange(slot_range),
-                    });
+                    return Err(corrupt(CorruptionKind::InvalidRange(slot_range)));
                 }
-                records.push(Row::deserialize(&mut buf.get(slot_range.clone()).ok_or(
-                    PageError::Corrupt {
-                        page_id: Some(page_id),
-                        kind: CorruptionKind::InvalidRange(slot_range),
-                    },
-                )?)?);
+                let mut row_bytes = buf
+                    .get(slot_range.clone())
+                    .ok_or_else(|| corrupt(CorruptionKind::InvalidRange(slot_range)))?;
+                let row = Row::deserialize(&mut row_bytes)
+                    .map_err(|_| corrupt(CorruptionKind::CorruptRow { slot: i }))?;
+                records.push(row);
             }
 
             // check that all the keys are valid for the records
             let keys: Vec<Key> = records
                 .iter()
-                .map(|r| {
-                    let first = r.fields.first().ok_or(PageError::Corrupt {
-                        page_id: Some(page_id),
-                        kind: CorruptionKind::MissingKey,
-                    })?;
-                    Key::try_from(first).map_err(|_| PageError::Corrupt {
-                        page_id: Some(page_id),
-                        kind: CorruptionKind::InvalidKey(first.clone()),
-                    })
+                .enumerate()
+                .map(|(i, r)| {
+                    let first = r
+                        .fields
+                        .first()
+                        .ok_or_else(|| corrupt(CorruptionKind::MissingKey))?;
+                    Key::try_from(first)
+                        .map_err(|_| corrupt(CorruptionKind::CorruptKey { slot: i }))
                 })
                 .collect::<Result<Vec<Key>, PageError>>()?;
 
             // ensure the keys are sorted
             if !keys.iter().is_sorted_by(|a, b| a < b) {
-                return Err(PageError::Corrupt {
-                    page_id: Some(page_id),
-                    kind: CorruptionKind::UnsortedKeys,
-                });
+                return Err(corrupt(CorruptionKind::UnsortedKeys));
             }
             PageBody::Leaf {
                 next: next_page,
@@ -800,17 +804,25 @@ impl Serializable for Page {
         } else {
             let mut children = Vec::with_capacity(num_items + 1);
             for _ in 0..num_items + 1 {
-                children.push(PageId::deserialize(&mut cursor)?);
+                children.push(
+                    PageId::deserialize(&mut cursor)
+                        .map_err(|_| corrupt(CorruptionKind::ChildPointerOverflow))?,
+                );
             }
             let mut keys = Vec::with_capacity(num_items);
-            for _ in 0..num_items {
-                let slot_range = SlotEntry::deserialize(&mut cursor)?.range();
-                keys.push(Key::deserialize(&mut buf.get(slot_range.clone()).ok_or(
-                    PageError::Corrupt {
-                        page_id: Some(page_id),
-                        kind: CorruptionKind::InvalidRange(slot_range),
-                    },
-                )?)?);
+            for i in 0..num_items {
+                let slot_range = SlotEntry::deserialize(&mut cursor)
+                    .map_err(|_| corrupt(CorruptionKind::SlotArrayOverflow))?
+                    .range();
+                if slot_range.is_empty() {
+                    return Err(corrupt(CorruptionKind::InvalidRange(slot_range)));
+                }
+                let mut key_bytes = buf
+                    .get(slot_range.clone())
+                    .ok_or_else(|| corrupt(CorruptionKind::InvalidRange(slot_range)))?;
+                let key = Key::deserialize(&mut key_bytes)
+                    .map_err(|_| corrupt(CorruptionKind::CorruptKey { slot: i }))?;
+                keys.push(key);
             }
             // ensure there's always one more child than keys - this is impossible to fail
             if keys.len() + 1 != children.len() {
@@ -819,10 +831,7 @@ impl Serializable for Page {
             }
             // ensure the keys are sorted
             if !keys.windows(2).all(|w| w[0] < w[1]) {
-                return Err(PageError::Corrupt {
-                    page_id: Some(page_id),
-                    kind: CorruptionKind::UnsortedKeys,
-                });
+                return Err(corrupt(CorruptionKind::UnsortedKeys));
             }
             PageBody::Internal { keys, children }
         };
@@ -835,10 +844,7 @@ impl Serializable for Page {
 
         // ensure that the page won't overflow PAGE_SIZE bytes
         if page.free_space().is_none() {
-            return Err(PageError::Corrupt {
-                page_id: Some(page_id),
-                kind: CorruptionKind::PageWouldOverFlow,
-            });
+            return Err(corrupt(CorruptionKind::PageWouldOverFlow));
         }
         Ok(page)
     }
@@ -1571,8 +1577,15 @@ mod tests {
         for &(pos, val) in &mutations {
             bytes[pos as usize % PAGE_SIZE] = val;
         }
+        // reset the checksum so that the checksum trigger doesn't catch the error
+        let crc = Page::page_checksum(&bytes);
+        bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
 
         let result = Page::deserialize(&mut &bytes[..]);
+
+        if let Err(e) = &result {
+            assert_matches!(e, PageError::Corrupt { .. });
+        }
 
         if mutations.is_empty() {
             assert_unchanged(&result.unwrap(), &page);
@@ -1775,16 +1788,252 @@ mod tests {
 
         // above every separator -> rightmost child
         // (any String sorts after every Integer; a longer string sorts after its prefix)
-        let above = match last {
-            Key::Integer(_) => Key::String(String::new()),
-            Key::String(s) => Key::String(format!("{s}~")),
-        };
+        let above = higher_key(last);
         assert_eq!(
             page.body.find_child(&above),
             children.last().copied(),
             "above all"
         );
 
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn remove_then_insert_leaf_stays_same(LeafPage(mut page): LeafPage, target: u8) -> TestResult {
+        if page.records().unwrap().is_empty() {
+            return TestResult::discard();
+        }
+        let snapshot = page.clone();
+        let target = target as usize % page.records().unwrap().len();
+        let target_row = page.records().unwrap().get(target).cloned().unwrap();
+        let target_key = Key::try_from(&target_row.fields[0]).unwrap();
+
+        // remove the target key
+        let returned_row = page
+            .leaf_remove(&target_key)
+            .unwrap()
+            .expect("key is on the page");
+
+        // make sure what came out is what we expected
+        assert_eq!(target_row, returned_row);
+
+        // insert back what was returned
+        page.leaf_insert(ValidatedRow::from_row(returned_row))
+            .unwrap();
+
+        // make sure nothing changed
+        assert_unchanged(&snapshot, &page);
+
+        // remove it again
+        let returned_row = page
+            .leaf_remove(&target_key)
+            .unwrap()
+            .expect("key is on the page");
+
+        // make sure what came out is what we expected
+        assert_eq!(target_row, returned_row);
+
+        // insert back what was returned - again
+        page.leaf_insert(ValidatedRow::from_row(returned_row))
+            .unwrap();
+
+        // make sure nothing changed
+        assert_unchanged(&snapshot, &page);
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn remove_then_insert_internal_stays_same(
+        InternalPage(mut page): InternalPage,
+        target: u8,
+    ) -> TestResult {
+        if page.keys().unwrap().is_empty() || page.children().unwrap().is_empty() {
+            return TestResult::discard();
+        }
+        let snapshot = page.clone();
+
+        let target = target as usize % page.keys().unwrap().len();
+        let target_key = page.keys().unwrap().get(target).cloned().unwrap();
+        let target_child = page.children().unwrap().get(target + 1).cloned().unwrap();
+
+        // try to remove the key
+        let (returned_key, returned_child) = page
+            .internal_remove(&target_key)
+            .unwrap()
+            .expect("key is on the page");
+        // make sure the returned values match
+        assert_eq!(target_key, returned_key);
+        assert_eq!(target_child, returned_child);
+
+        // insert what was returned
+        page.internal_insert(returned_key, returned_child).unwrap();
+
+        // make sure the page is back to its original shape
+        assert_unchanged(&snapshot, &page);
+
+        // remove it again
+        let (returned_key, returned_child) = page
+            .internal_remove(&target_key)
+            .unwrap()
+            .expect("key is on the page");
+        // make sure the returned values match
+        assert_eq!(target_key, returned_key);
+        assert_eq!(target_child, returned_child);
+
+        // insert what was returned - again
+        page.internal_insert(returned_key, returned_child).unwrap();
+
+        // make sure the page is back to its original shape
+        assert_unchanged(&snapshot, &page);
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn leaf_remove_returns_none_when_its_not_there(
+        LeafPage(mut page): LeafPage,
+        target: u8,
+    ) -> TestResult {
+        if page.records().unwrap().is_empty() {
+            return TestResult::discard();
+        }
+
+        // find a key in the page
+        let target = target as usize % page.records().unwrap().len();
+        let target_row = page.records().unwrap().get(target).cloned().unwrap();
+        let target_key = ValidatedRow::from_row(target_row).primary_key();
+
+        // remove it
+        page.leaf_remove(&target_key)
+            .unwrap()
+            .expect("key is on the page");
+
+        // take a snapshot
+        let snapshot = page.clone();
+
+        // try again - should return `Ok(None)`
+        let result = page
+            .leaf_remove(&target_key)
+            .expect("leaf_remove shouldn't fail");
+
+        assert_eq!(result, None);
+        assert_unchanged(&snapshot, &page);
+
+        // find a key outside the range
+        let last_key =
+            ValidatedRow::from_row(page.records().unwrap().last().cloned().unwrap()).primary_key();
+
+        let out_of_bounds_key = higher_key(&last_key);
+
+        let result = page
+            .leaf_remove(&out_of_bounds_key)
+            .expect("leaf_remove shouldn't fail");
+
+        assert_eq!(result, None);
+        assert_unchanged(&snapshot, &page);
+
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn internal_remove_returns_none_when_its_not_there(
+        InternalPage(mut page): InternalPage,
+        target: u8,
+    ) -> TestResult {
+        if page.keys().unwrap().is_empty() {
+            return TestResult::discard();
+        }
+
+        // find a key in the page
+        let target = target as usize % page.keys().unwrap().len();
+        let target_key = page.keys().unwrap().get(target).cloned().unwrap();
+
+        // remove it
+        page.internal_remove(&target_key)
+            .unwrap()
+            .expect("key is on the page");
+
+        // take a snapshot
+        let snapshot = page.clone();
+
+        // try again - should return `Ok(None)`
+        let result = page
+            .internal_remove(&target_key)
+            .expect("internal_remove shouldn't fail");
+
+        assert_eq!(result, None);
+        assert_unchanged(&snapshot, &page);
+
+        // find a key outside the range
+        let last_key = page.keys().unwrap().last().cloned().unwrap();
+
+        let out_of_bounds_key = higher_key(&last_key);
+
+        let result = page
+            .internal_remove(&out_of_bounds_key)
+            .expect("internal_remove shouldn't fail");
+
+        assert_eq!(result, None);
+        assert_unchanged(&snapshot, &page);
+
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn removes_fail_with_wrong_page_type(
+        LeafPage(mut leaf): LeafPage,
+        InternalPage(mut internal): InternalPage,
+    ) -> TestResult {
+        let internal_key = internal.keys().unwrap().first().cloned().unwrap();
+        let leaf_key =
+            ValidatedRow::from_row(leaf.records().unwrap().first().cloned().unwrap()).primary_key();
+
+        let res1 = internal.leaf_remove(&internal_key);
+        let res2 = leaf.internal_remove(&leaf_key);
+
+        assert_matches!(res1, Err(PageError::NotLeaf));
+        assert_matches!(res2, Err(PageError::NotInternal));
+
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn find_child_after_internal_remove(
+        InternalPage(mut page): InternalPage,
+        target: u8,
+        probes: Vec<Key>,
+    ) -> TestResult {
+        let old_keys = page.keys().unwrap().to_vec();
+        let old_children = page.children().unwrap().to_vec();
+        if old_keys.is_empty() {
+            return TestResult::discard();
+        }
+
+        // remove separator i (and it's right child i+1)
+        let i = target as usize % old_keys.len();
+        page.internal_remove(&old_keys[i])
+            .unwrap()
+            .expect("separator is one the page");
+
+        let expected_after_remove = |probe: &Key| {
+            let old_index = old_keys.iter().filter(|k| *k <= probe).count();
+            if old_index == i + 1 {
+                old_children[i]
+            } else {
+                old_children[old_index]
+            }
+        };
+
+        let boundary_probes = old_keys
+            .iter()
+            .cloned()
+            .chain([higher_key(old_keys.last().unwrap())]);
+        for probe in probes.into_iter().chain(boundary_probes) {
+            assert_eq!(
+                page.body.find_child(&probe),
+                Some(expected_after_remove(&probe)),
+                "routing {probe:?} after removing keys[{i}]"
+            );
+        }
         TestResult::passed()
     }
 }
