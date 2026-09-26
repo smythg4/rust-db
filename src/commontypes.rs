@@ -326,9 +326,9 @@ impl Serializable for Key {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::*;
     use quickcheck::{Arbitrary, Gen, TestResult};
     use quickcheck_macros::quickcheck;
-    use std::io::Cursor;
 
     impl Arbitrary for Key {
         fn arbitrary(g: &mut Gen) -> Self {
@@ -404,7 +404,7 @@ mod tests {
     #[test]
     fn zero_lsns_trigger_errors() {
         let result = Lsn::new(0);
-        assert!(matches!(result, Err(LsnError::ZeroLsn)))
+        assert_matches!(result, Err(LsnError::ZeroLsn))
     }
 
     #[test]
@@ -412,22 +412,8 @@ mod tests {
         let null_result = Key::try_from(&RowValue::Null);
         let float_result = Key::try_from(&RowValue::Float(10.0));
 
-        assert!(matches!(null_result, Err(KeyError::NullKey)));
-        assert!(matches!(float_result, Err(KeyError::NotOrderable)));
-    }
-
-    fn assert_roundtrip<T>(value: T)
-    where
-        T: Serializable + PartialEq + std::fmt::Debug,
-        T::Error: std::fmt::Debug,
-    {
-        let mut buf = Cursor::new(Vec::new());
-        value.serialize(&mut buf).unwrap();
-        buf.set_position(0);
-        let deser = T::deserialize(&mut buf).unwrap();
-        assert_eq!(deser, value);
-        assert_eq!(buf.get_ref().len(), value.encoded_size());
-        assert_eq!(buf.position() as usize, value.encoded_size());
+        assert_matches!(null_result, Err(KeyError::NullKey));
+        assert_matches!(float_result, Err(KeyError::NotOrderable));
     }
 
     #[quickcheck]

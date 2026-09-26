@@ -321,9 +321,6 @@ impl ValidatedRow {
             _ => unreachable!("shouldn't be able to get another option from a Validated Row"),
         }
     }
-    pub fn into_inner(self) -> Row {
-        self.0
-    }
 }
 
 impl From<ValidatedRow> for Row {
@@ -404,7 +401,7 @@ mod tests {
     use crate::test_support::*;
     use quickcheck::{Arbitrary, Gen, TestResult};
     use quickcheck_macros::quickcheck;
-    use std::io::{Cursor, Seek};
+    use std::io::Cursor;
 
     impl Arbitrary for ColumnType {
         fn arbitrary(g: &mut Gen) -> Self {
@@ -509,30 +506,13 @@ mod tests {
 
     #[quickcheck]
     fn encoded_sizes(value: RowValue) -> TestResult {
-        let mut bytes = Cursor::new(Vec::new());
-        value.serialize(&mut bytes).unwrap();
-        assert_eq!(value.encoded_size(), bytes.into_inner().len());
+        assert_roundtrip(value);
         TestResult::passed()
     }
 
     #[quickcheck]
-    fn encoded_row_sizes(row: Row) -> TestResult {
-        let mut bytes = Cursor::new(Vec::new());
-        row.serialize(&mut bytes).unwrap();
-        assert_eq!(row.encoded_size(), bytes.into_inner().len());
-        TestResult::passed()
-    }
-
-    #[quickcheck]
-    fn roundtrip_basic(fields: Vec<RowValue>) -> TestResult {
-        let row = Row { fields };
-        let mut bytes = Cursor::new(Vec::new());
-        row.serialize(&mut bytes).unwrap();
-
-        bytes.seek(std::io::SeekFrom::Start(0)).unwrap();
-        let deser = Row::deserialize(&mut bytes).unwrap();
-
-        assert_eq!(row, deser);
+    fn row_roundtrip(row: Row) -> TestResult {
+        assert_roundtrip(row);
         TestResult::passed()
     }
 
@@ -546,7 +526,7 @@ mod tests {
         .unwrap();
         let result = schema.validate_row(row);
 
-        assert!(matches!(result, Err(SchemaError::RowTooLong(_))));
+        assert_matches!(result, Err(SchemaError::RowTooLong(_)));
     }
 
     #[test]
@@ -562,7 +542,7 @@ mod tests {
         .unwrap();
         let result = schema.validate_row(row);
 
-        assert!(matches!(result, Err(SchemaError::KeyTooLong(_))));
+        assert_matches!(result, Err(SchemaError::KeyTooLong(_)));
 
         let row = Row::try_from(vec![
             RowValue::String("a".repeat(test_boundary)),
@@ -581,14 +561,11 @@ mod tests {
             fields.push(RowValue::Null);
         }
         let row = Row { fields };
-        let mut bytes = Cursor::new(Vec::new());
+        let mut bytes = Vec::new();
         let ser_result = row.serialize(&mut bytes);
 
         assert!(ser_result.is_err());
-        assert!(matches!(
-            ser_result.unwrap_err(),
-            RowValueError::TooManyFields(256)
-        ));
+        assert_matches!(ser_result.unwrap_err(), RowValueError::TooManyFields(256));
     }
 
     #[test]
@@ -599,29 +576,26 @@ mod tests {
             RowValue::Integer(5),
             RowValue::Boolean(true),
         ];
-        assert!(matches!(
+        assert_matches!(
             Row::try_from(fields.clone()),
             Err(RowError::InvalidFirstEntry)
-        ));
+        );
 
         // Float first entries will be rejected
         fields.remove(0);
         fields.insert(0, RowValue::Float(0.0));
-        assert!(matches!(
+        assert_matches!(
             Row::try_from(fields.clone()),
             Err(RowError::InvalidFirstEntry)
-        ));
+        );
 
         // Bool first entries will be rejected
         fields.remove(0);
         fields.insert(0, RowValue::Boolean(true));
-        assert!(matches!(
-            Row::try_from(fields),
-            Err(RowError::InvalidFirstEntry)
-        ));
+        assert_matches!(Row::try_from(fields), Err(RowError::InvalidFirstEntry));
 
         // Empty vectors will be rejected
-        assert!(matches!(Row::try_from(Vec::new()), Err(RowError::EmptyRow)));
+        assert_matches!(Row::try_from(Vec::new()), Err(RowError::EmptyRow));
     }
 
     #[test]
@@ -629,14 +603,11 @@ mod tests {
         let row = Row {
             fields: vec![RowValue::String("a".repeat(MAX_FIELD_LEN + 1))],
         };
-        let mut bytes = Cursor::new(Vec::new());
+        let mut bytes = Vec::new();
         let ser_result = row.serialize(&mut bytes);
 
         assert!(ser_result.is_err());
-        assert!(matches!(
-            ser_result.unwrap_err(),
-            RowValueError::FieldTooLong(_)
-        ));
+        assert_matches!(ser_result.unwrap_err(), RowValueError::FieldTooLong(_));
     }
 
     #[quickcheck]
@@ -703,10 +674,10 @@ mod tests {
                 RowValue::Boolean(false),
             ],
         };
-        assert!(matches!(
+        assert_matches!(
             schema.validate_row(wrong_type),
             Err(SchemaError::TypeMismatch(1))
-        ));
+        );
 
         let null_key = Row {
             fields: vec![
@@ -715,10 +686,7 @@ mod tests {
                 RowValue::Boolean(true),
             ],
         };
-        assert!(matches!(
-            schema.validate_row(null_key),
-            Err(SchemaError::InvalidKey)
-        ));
+        assert_matches!(schema.validate_row(null_key), Err(SchemaError::InvalidKey));
 
         let null_in_non_null = Row {
             fields: vec![
@@ -727,18 +695,18 @@ mod tests {
                 RowValue::Null,
             ],
         };
-        assert!(matches!(
+        assert_matches!(
             schema.validate_row(null_in_non_null),
             Err(SchemaError::NullValueInNonNullCol(2))
-        ));
+        );
 
         let too_short = Row {
             fields: vec![RowValue::Integer(1)],
         };
-        assert!(matches!(
+        assert_matches!(
             schema.validate_row(too_short),
             Err(SchemaError::ColumnCountMismatch)
-        ));
+        );
     }
 
     #[test]
@@ -748,10 +716,7 @@ mod tests {
             Column::string(),
             Column::nullable_float(),
         ]);
-        assert!(matches!(
-            schema_result,
-            Err(SchemaError::NullablePrimaryKey)
-        ));
+        assert_matches!(schema_result, Err(SchemaError::NullablePrimaryKey));
     }
 
     #[test]
@@ -762,7 +727,7 @@ mod tests {
             Column::string(),
             Column::nullable_float(),
         ]);
-        assert!(matches!(schema_result, Err(SchemaError::NonOrdPrimaryKey)));
+        assert_matches!(schema_result, Err(SchemaError::NonOrdPrimaryKey));
 
         // Bools can't be primary keys
         let schema_result = Schema::try_from(vec![
@@ -770,20 +735,20 @@ mod tests {
             Column::string(),
             Column::nullable_float(),
         ]);
-        assert!(matches!(schema_result, Err(SchemaError::NonOrdPrimaryKey)));
+        assert_matches!(schema_result, Err(SchemaError::NonOrdPrimaryKey));
     }
 
     #[test]
     fn schemas_fail_with_too_many_columns() {
         let cols: Vec<Column> = (0..MAX_NUM_FIELDS + 1).map(|_| Column::integer()).collect();
         let schema_result = Schema::try_from(cols);
-        assert!(matches!(schema_result, Err(SchemaError::TooManyColumns)));
+        assert_matches!(schema_result, Err(SchemaError::TooManyColumns));
     }
 
     #[test]
     fn schemas_fail_with_no_columns() {
         let schema_result = Schema::try_from(vec![]);
-        assert!(matches!(schema_result, Err(SchemaError::EmptyColumns)));
+        assert_matches!(schema_result, Err(SchemaError::EmptyColumns));
     }
 
     #[quickcheck]

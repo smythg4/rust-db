@@ -1,18 +1,25 @@
 use crate::commontypes::{Key, PageId, TableId};
 use crate::page::{MAX_INTERNAL_ENTRY_SIZE, MAX_LEAF_ENTRY_SIZE, Page, PageBody, PageError};
 use crate::schema::{Column, ColumnType, Row, RowValue, Schema, ValidatedRow};
+use crate::traits::Serializable;
 use quickcheck::{Arbitrary, Gen};
+use std::io::Cursor;
 
-pub(crate) const DUMMY_PAGE_ID: PageId = PageId::new(TableId::new(u32::MAX), u32::MAX);
-
-/// Fixed-width key prefix so string keys sort by their index regardless of padding.
-pub(crate) fn padded_key(index: usize, total_len: usize) -> Key {
-    let prefix = format!("{index:06}");
-    Key::String(format!(
-        "{prefix}{}",
-        "x".repeat(total_len.saturating_sub(prefix.len()))
-    ))
-}
+/// Like `assert!(matches!(..))`, but prints the actual value on failure.
+macro_rules! assert_matches {
+      ($value:expr, $pattern:pat $(if $guard:expr)? $(,)?) => {
+          match $value {
+              $pattern $(if $guard)? => {}
+              ref other => panic!(
+                  "assertion failed: `{}` does not match `{}`\n  value: {:?}",
+                  stringify!($value),
+                  stringify!($pattern),
+                  other
+              ),
+          }
+      };
+  }
+pub(crate) use assert_matches;
 
 #[derive(Debug, Clone)]
 pub(crate) struct SchemaWithRows(pub(crate) Schema, pub(crate) Vec<Row>);
@@ -22,7 +29,7 @@ impl Arbitrary for SchemaWithRows {
         let schema = Schema::arbitrary(g);
         let n = usize::arbitrary(g) % 25;
         let rows: Vec<Row> = (0..n)
-            .map(|_| valid_row_from_schema(&schema, g).into_inner())
+            .map(|_| valid_row_from_schema(&schema, g).into())
             .collect();
         SchemaWithRows(schema, rows)
     }
@@ -34,9 +41,32 @@ pub(crate) struct SchemaRowPair(pub(crate) Schema, pub(crate) Row);
 impl Arbitrary for SchemaRowPair {
     fn arbitrary(g: &mut Gen) -> Self {
         let schema = Schema::arbitrary(g);
-        let row = valid_row_from_schema(&schema, g).into_inner();
+        let row = valid_row_from_schema(&schema, g).into();
         SchemaRowPair(schema, row)
     }
+}
+
+pub(crate) fn assert_roundtrip<T>(value: T)
+where
+    T: Serializable + PartialEq + std::fmt::Debug,
+    T::Error: std::fmt::Debug,
+{
+    let mut buf = Cursor::new(Vec::new());
+    value.serialize(&mut buf).unwrap();
+    buf.set_position(0);
+    let deser = T::deserialize(&mut buf).unwrap();
+    assert_eq!(deser, value);
+    assert_eq!(buf.get_ref().len(), value.encoded_size());
+    assert_eq!(buf.position() as usize, value.encoded_size());
+}
+
+/// Fixed-width key prefix so string keys sort by their index regardless of padding.
+pub(crate) fn padded_key(index: usize, total_len: usize) -> Key {
+    let prefix = format!("{index:06}");
+    Key::String(format!(
+        "{prefix}{}",
+        "x".repeat(total_len.saturating_sub(prefix.len()))
+    ))
 }
 
 /// Two-column schema (integer key + string payload) and the largest payload that still validates.

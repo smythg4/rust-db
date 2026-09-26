@@ -616,6 +616,31 @@ impl Page {
     }
 
     #[allow(dead_code)]
+    pub(crate) fn leaf_remove(&mut self, key: &Key) -> Result<Option<Row>, PageError> {
+        match &mut self.body {
+            PageBody::Leaf { records, .. } => match records.binary_search_by(|r| r.cmp_key(key)) {
+                Ok(i) => Ok(Some(records.remove(i))),
+                Err(_) => Ok(None),
+            },
+            _ => Err(PageError::NotLeaf),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn internal_remove(
+        &mut self,
+        key: &Key,
+    ) -> Result<Option<(Key, PageId)>, PageError> {
+        match &mut self.body {
+            PageBody::Internal { keys, children } => match keys.binary_search(key) {
+                Ok(i) => Ok(Some((keys.remove(i), children.remove(i + 1)))),
+                Err(_) => Ok(None),
+            },
+            _ => Err(PageError::NotInternal),
+        }
+    }
+
+    #[allow(dead_code)]
     // little helper function for tests
     fn delete_last(&mut self) {
         match &mut self.body {
@@ -626,6 +651,44 @@ impl Page {
             PageBody::Leaf { records, .. } => {
                 let _ = records.pop();
             }
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn next(&self) -> Result<Option<PageId>, PageError> {
+        match self.body {
+            PageBody::Leaf { next, .. } => Ok(next),
+            _ => Err(PageError::NotLeaf),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_next(&mut self, new: Option<PageId>) -> Result<(), PageError> {
+        match &mut self.body {
+            PageBody::Leaf { next, .. } => {
+                *next = new;
+                Ok(())
+            }
+            _ => Err(PageError::NotLeaf),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn prev(&self) -> Result<Option<PageId>, PageError> {
+        match self.body {
+            PageBody::Leaf { prev, .. } => Ok(prev),
+            _ => Err(PageError::NotInternal),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn set_prev(&mut self, new: Option<PageId>) -> Result<(), PageError> {
+        match &mut self.body {
+            PageBody::Leaf { prev, .. } => {
+                *prev = new;
+                Ok(())
+            }
+            _ => Err(PageError::NotInternal),
         }
     }
 }
@@ -864,6 +927,32 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Clone)]
+    struct LeafPage(Page);
+
+    #[derive(Debug, Clone)]
+    struct InternalPage(Page);
+
+    impl Arbitrary for LeafPage {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let mut page = Page::arbitrary(g);
+            while page.records().is_none() {
+                page = Page::arbitrary(g);
+            }
+            LeafPage(page)
+        }
+    }
+
+    impl Arbitrary for InternalPage {
+        fn arbitrary(g: &mut Gen) -> Self {
+            let mut page = Page::arbitrary(g);
+            while page.children().is_none() {
+                page = Page::arbitrary(g);
+            }
+            InternalPage(page)
+        }
+    }
+
     #[quickcheck]
     fn split_then_merge_roundtrip(mut page: Page) -> TestResult {
         let snapshot = page.clone();
@@ -892,9 +981,9 @@ mod tests {
     }
 
     #[quickcheck]
-    fn merges_fail_with_invalid_pointers(mut page: Page) -> TestResult {
+    fn merges_fail_with_invalid_pointers(LeafPage(mut page): LeafPage) -> TestResult {
         // if it's under full, we know it can fit into itself. We only want leaf pages for this test
-        if !page.is_underfull() || matches!(page.body, PageBody::Internal { .. }) {
+        if !page.is_underfull() {
             return TestResult::discard();
         }
 
@@ -908,46 +997,37 @@ mod tests {
         let snapshot2 = new_page.clone();
 
         // now we have a new page that we're positive we can merge! Let's mess with it.
-        let PageBody::Leaf { next, .. } = &mut page.body else {
-            unreachable!()
-        };
-        *next = None;
+        page.set_next(None).unwrap();
         let snapshot1 = page.clone();
         let result = page.leaf_merge_from_right(&mut new_page);
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(PageError::InvalidMerge(MergeFailReason::PointerMismatch(
                 None,
                 _
             )))
-        ));
+        );
         assert_unchanged(&page, &snapshot1);
         assert_unchanged(&new_page, &snapshot2);
 
         // trying again but with a `Some` value
-        let PageBody::Leaf { next, .. } = &mut page.body else {
-            unreachable!()
-        };
-        *next = Some(page.page_id);
+        page.set_next(Some(page.page_id)).unwrap();
         let snapshot1 = page.clone();
         let result = page.leaf_merge_from_right(&mut new_page);
 
-        assert!(matches!(
+        assert_matches!(
             result,
             Err(PageError::InvalidMerge(MergeFailReason::PointerMismatch(
                 Some(_),
                 Some(_)
             )))
-        ));
+        );
         assert_unchanged(&page, &snapshot1);
         assert_unchanged(&new_page, &snapshot2);
 
         // trying again with the right pointer value
-        let PageBody::Leaf { next, .. } = &mut page.body else {
-            unreachable!()
-        };
-        *next = Some(page_id);
+        page.set_next(Some(page_id)).unwrap();
 
         let result = page
             .leaf_merge_from_right(&mut new_page)
@@ -984,10 +1064,7 @@ mod tests {
             PageBody::Internal { .. } => page.internal_merge_from_right(&mut page2, dummy_key),
         };
 
-        assert!(matches!(
-            result,
-            Err(PageError::InvalidMerge(MergeFailReason::Keys))
-        ));
+        assert_matches!(result, Err(PageError::InvalidMerge(MergeFailReason::Keys)));
         assert_unchanged(&page, &snapshot1);
         assert_unchanged(&page2, &snapshot2);
         TestResult::passed()
@@ -1007,9 +1084,8 @@ mod tests {
 
         // separator_with generates a valid separator based on the left pages last entry. Discard results where
         // left page is empty
-        let PageBody::Internal { keys, .. } = &left.body else {
-            unreachable!()
-        };
+        let keys = left.keys().unwrap();
+
         let Some(Key::String(last)) = keys.last() else {
             return TestResult::discard();
         };
@@ -1023,7 +1099,7 @@ mod tests {
         // make sure that the too big key results in a full page
         let (mut l, mut r) = (left.clone(), right.clone());
         let result = l.internal_merge_from_right(&mut r, separator_with(too_big));
-        assert!(matches!(result, Err(PageError::PageFull)), "{result:?}");
+        assert_matches!(result, Err(PageError::PageFull));
         assert_unchanged(&l, &left);
         assert_unchanged(&r, &right);
 
@@ -1069,7 +1145,7 @@ mod tests {
             PageBody::Internal { .. } => page.internal_merge_from_right(&mut page2, dummy_key),
         };
 
-        assert!(matches!(result, Err(PageError::PageFull)));
+        assert_matches!(result, Err(PageError::PageFull));
         assert_unchanged(&page, &snapshot1);
         assert_unchanged(&page2, &snapshot2);
         TestResult::passed()
@@ -1089,20 +1165,20 @@ mod tests {
             (PageBody::Leaf { .. }, PageBody::Internal { .. }) => {
                 let result = page1.leaf_merge_from_right(&mut page2);
 
-                assert!(matches!(
+                assert_matches!(
                     result,
                     Err(PageError::InvalidMerge(MergeFailReason::MismatchMerge))
-                ));
+                );
                 assert_unchanged(&page1, &snapshot1);
                 assert_unchanged(&page2, &snapshot2);
                 TestResult::passed()
             }
             (PageBody::Internal { .. }, PageBody::Leaf { .. }) => {
                 let result = page1.internal_merge_from_right(&mut page2, dummy_key);
-                assert!(matches!(
+                assert_matches!(
                     result,
                     Err(PageError::InvalidMerge(MergeFailReason::MismatchMerge))
-                ));
+                );
                 assert_unchanged(&page1, &snapshot1);
                 assert_unchanged(&page2, &snapshot2);
                 TestResult::passed()
@@ -1127,7 +1203,7 @@ mod tests {
                 .unwrap()
         };
 
-        let mut page = fill_leaf(DUMMY_PAGE_ID, payload_sizes);
+        let mut page = fill_leaf(child(1), payload_sizes);
         let count = page.records().unwrap().len() as i64;
         let new_id = page.page_id.wrapping_add(1);
 
@@ -1194,15 +1270,56 @@ mod tests {
     }
 
     #[quickcheck]
-    fn insertion_order_on_leaves(
-        SchemaWithRows(schema, rows): SchemaWithRows,
-        mut page: Page,
-    ) -> TestResult {
-        if let PageBody::Leaf { records, .. } = &mut page.body {
-            records.clear();
-        } else {
+    fn insertion_order_on_internals(mut keys: Vec<Key>) -> TestResult {
+        use std::collections::BTreeMap;
+
+        if keys.is_empty() {
             return TestResult::discard();
-        };
+        }
+
+        let first = keys.remove(0);
+
+        let leftmost = child(2);
+        let mut expected = BTreeMap::new();
+        expected.insert(first.clone(), child(3));
+        let mut page = Page::new_root(child(1), leftmost, first, child(3));
+
+        for (i, key) in keys.into_iter().enumerate() {
+            let right_child = child(4 + i as u32);
+            let is_duplicate = expected.contains_key(&key);
+            let is_full = Page::internal_entry_size(&key) > page.free_space().unwrap();
+            let before = page.clone();
+
+            let result = page.internal_insert(key.clone(), right_child);
+
+            if is_duplicate {
+                assert_matches!(result, Err(PageError::DuplicateKey));
+                assert_unchanged(&before, &page);
+            } else if is_full {
+                assert_matches!(result, Err(PageError::PageFull));
+                assert_unchanged(&before, &page);
+            } else {
+                assert!(result.is_ok(), "{result:?}");
+                expected.insert(key.clone(), right_child);
+                // routing the new key must land on the child inserted with it
+                assert_eq!(page.body.find_child(&key), Some(right_child));
+            }
+        }
+
+        let expected_keys: Vec<Key> = expected.keys().cloned().collect();
+        assert_eq!(page.keys().unwrap(), expected_keys.as_slice());
+        // children: the untouched leftmost child, then each key's right child in key order
+        let expected_children: Vec<PageId> = std::iter::once(leftmost)
+            .chain(expected.values().copied())
+            .collect();
+        assert_eq!(page.children().unwrap(), expected_children.as_slice());
+
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn insertion_order_on_leaves(SchemaWithRows(schema, rows): SchemaWithRows) -> TestResult {
+        let mut page = Page::empty_leaf(child(1));
         use std::collections::BTreeMap;
         let mut expected = BTreeMap::new();
 
@@ -1218,23 +1335,17 @@ mod tests {
 
             let result = page.leaf_insert(validated_row);
             if is_duplicate {
-                assert!(matches!(result, Err(PageError::DuplicateKey)));
+                assert_matches!(result, Err(PageError::DuplicateKey));
                 assert_unchanged(&page_clone, &page);
             } else if is_full {
-                assert!(matches!(result, Err(PageError::PageFull)));
+                assert_matches!(result, Err(PageError::PageFull));
                 assert_unchanged(&page_clone, &page);
             } else {
                 assert!(result.is_ok());
                 expected.insert(key, row.clone());
             }
         }
-        let PageBody::Leaf {
-            records: actual_records,
-            ..
-        } = page.body
-        else {
-            unreachable!()
-        };
+        let actual_records = page.records().unwrap();
         let expected_records: Vec<Row> = expected.into_values().collect();
         assert_eq!(expected_records, actual_records);
         TestResult::passed()
@@ -1247,17 +1358,8 @@ mod tests {
             return TestResult::discard();
         };
 
-        let mut buf = Cursor::new(Vec::new());
-        page.serialize(&mut buf).unwrap();
-        buf.set_position(0);
-        let deser = Page::deserialize(&mut buf).unwrap();
-        assert_unchanged(&page, &deser);
-
-        buf.set_position(0);
-        new_page.serialize(&mut buf).unwrap();
-        buf.set_position(0);
-        let deser = Page::deserialize(&mut buf).unwrap();
-        assert_unchanged(&new_page, &deser);
+        assert_roundtrip(page);
+        assert_roundtrip(new_page);
         TestResult::passed()
     }
 
@@ -1271,9 +1373,7 @@ mod tests {
             PageBody::Internal { keys, .. } => {
                 assert!(!keys.is_empty());
                 assert!(keys.iter().all(|k| k < &split_key));
-                let PageBody::Internal { keys: new_keys, .. } = new_page.body else {
-                    unreachable!()
-                };
+                let new_keys = new_page.keys().unwrap();
                 assert!(!new_keys.is_empty());
                 assert!(new_keys.iter().all(|k| k > &split_key));
             }
@@ -1284,13 +1384,7 @@ mod tests {
                         .iter()
                         .all(|r| r.cmp_key(&split_key) == Ordering::Less)
                 );
-                let PageBody::Leaf {
-                    records: new_records,
-                    ..
-                } = new_page.body
-                else {
-                    unreachable!()
-                };
+                let new_records = new_page.records().unwrap();
                 assert!(!new_records.is_empty());
                 assert!(
                     new_records
@@ -1303,19 +1397,10 @@ mod tests {
     }
 
     #[quickcheck]
-    fn sibling_pointers_correct_after_split(mut page: Page) -> TestResult {
-        if matches!(page.body, PageBody::Internal { .. }) {
-            return TestResult::discard();
-        }
+    fn sibling_pointers_correct_after_split(LeafPage(mut page): LeafPage) -> TestResult {
         let original_id = page.page_id;
-        let PageBody::Leaf {
-            next: old_next,
-            prev: old_prev,
-            ..
-        } = page.body.clone()
-        else {
-            unreachable!()
-        };
+        let old_next = page.next().unwrap();
+        let old_prev = page.prev().unwrap();
         let new_id = page.page_id.wrapping_add(1);
         let Some((_split_key, new_page)) = try_split(&mut page, new_id) else {
             return TestResult::discard();
@@ -1329,14 +1414,8 @@ mod tests {
                     Some(new_id),
                     "original page doesn't point to new page"
                 );
-                let PageBody::Leaf {
-                    prev: new_prev,
-                    next: new_next,
-                    ..
-                } = new_page.body
-                else {
-                    unreachable!()
-                };
+                let new_prev = new_page.prev().unwrap();
+                let new_next = new_page.next().unwrap();
                 assert_eq!(
                     new_prev,
                     Some(original_id),
@@ -1376,20 +1455,11 @@ mod tests {
                 keys: new_keys,
                 children: new_children,
             } => {
-                let PageBody::Internal {
-                    keys: old_keys,
-                    children: old_children,
-                } = page.body.clone()
-                else {
-                    unreachable!()
-                };
-                let combined_keys: Vec<Key> = old_keys
-                    .clone()
-                    .into_iter()
-                    .chain(new_keys.into_iter())
-                    .collect();
+                let old_keys = page.keys().unwrap().to_vec();
+                let old_children = page.children().unwrap().to_vec();
+                let combined_keys: Vec<Key> =
+                    old_keys.into_iter().chain(new_keys.into_iter()).collect();
                 let combined_children: Vec<PageId> = old_children
-                    .clone()
                     .into_iter()
                     .chain(new_children.into_iter())
                     .collect();
@@ -1446,7 +1516,7 @@ mod tests {
         // one more insert should trigger page full
         let vr = schema.validate_row(row.clone()).unwrap();
         let result = page.leaf_insert(vr);
-        assert!(matches!(result, Err(PageError::PageFull)));
+        assert_matches!(result, Err(PageError::PageFull));
 
         // make sure the failed insert didn't change the underlying page
         assert_unchanged(&page, &snapshot);
@@ -1530,12 +1600,9 @@ mod tests {
 
     #[quickcheck]
     fn duplicate_keys_trigger_error_on_insert(
-        mut page: Page,
+        LeafPage(mut page): LeafPage,
         SchemaRowPair(schema, row): SchemaRowPair,
     ) -> TestResult {
-        if !matches!(page.body, PageBody::Leaf { .. }) {
-            return TestResult::discard();
-        }
         if !page.can_insert(&row) {
             return TestResult::discard();
         }
@@ -1543,7 +1610,7 @@ mod tests {
         let _ = page.leaf_insert(validated_row.clone()); // this might error if the key already exists, but we're guaranteed to have it in there after calling it
         let result = page.leaf_insert(validated_row); // this is the check that matters
 
-        assert!(matches!(result, Err(PageError::DuplicateKey)), "{result:?}");
+        assert_matches!(result, Err(PageError::DuplicateKey));
         TestResult::passed()
     }
 
@@ -1615,13 +1682,7 @@ mod tests {
             last_update: PageLsn(Some(Lsn::new(10).unwrap())),
             body: PageBody::Internal { keys, children },
         };
-        let mut bytes = Vec::with_capacity(PAGE_SIZE);
-        ipage.serialize(&mut bytes).unwrap();
-
-        assert_eq!(bytes.len(), PAGE_SIZE);
-        let deser = Page::deserialize(&mut Cursor::new(bytes)).unwrap();
-
-        assert_unchanged(&deser, &ipage);
+        assert_roundtrip(ipage);
     }
 
     #[quickcheck]
@@ -1647,13 +1708,83 @@ mod tests {
 
     #[quickcheck]
     fn page_quickcheck_roundtrip(page: Page) -> TestResult {
-        let mut bytes = Cursor::new(Vec::new());
-        page.serialize(&mut bytes).unwrap();
+        assert_roundtrip(page);
+        TestResult::passed()
+    }
 
-        bytes.set_position(0);
-        let deser_page = Page::deserialize(&mut bytes).unwrap();
+    /// Linear scan to find appropriate child entry. First index where separator <= key
+    fn expected_child(page: &Page, key: &Key) -> PageId {
+        let keys = page.keys().unwrap();
+        let idx = keys.iter().filter(|k| *k <= key).count();
+        page.children().unwrap()[idx]
+    }
 
-        assert_unchanged(&page, &deser_page);
+    #[quickcheck]
+    fn find_child_matches_linear_scan(InternalPage(page): InternalPage, key: Key) -> TestResult {
+        assert_eq!(
+            page.body.find_child(&key),
+            Some(expected_child(&page, &key))
+        );
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn find_child_on_leaf_is_none(LeafPage(page): LeafPage, key: Key) -> TestResult {
+        assert_eq!(page.body.find_child(&key), None);
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn find_child_boundaries(InternalPage(page): InternalPage) -> TestResult {
+        let keys = page.keys().unwrap();
+        let children = page.children().unwrap();
+
+        // check that we have at least one key
+        let (Some(first), Some(last)) = (keys.first(), keys.last()) else {
+            return TestResult::discard();
+        };
+
+        // below every separator -> leftmost child
+        // (Integer(i64::MIN) is the smallest possible Key; skip if it's already a separator)
+        let below = Key::Integer(i64::MIN);
+        if &below < first {
+            assert_eq!(page.body.find_child(&below), Some(children[0]), "below all");
+        }
+
+        // exactly equal to a separator -> the child to its right
+        for (i, k) in keys.iter().enumerate() {
+            assert_eq!(
+                page.body.find_child(k),
+                Some(children[i + 1]),
+                "equal to keys[{i}]"
+            );
+        }
+
+        // one below an integer separator -> the child to its left
+        for (i, k) in keys.iter().enumerate() {
+            if let Key::Integer(n) = k
+                && let Some(m) = n.checked_sub(1)
+            {
+                assert_eq!(
+                    page.body.find_child(&Key::Integer(m)),
+                    Some(children[i]),
+                    "just below keys[{i}]"
+                );
+            }
+        }
+
+        // above every separator -> rightmost child
+        // (any String sorts after every Integer; a longer string sorts after its prefix)
+        let above = match last {
+            Key::Integer(_) => Key::String(String::new()),
+            Key::String(s) => Key::String(format!("{s}~")),
+        };
+        assert_eq!(
+            page.body.find_child(&above),
+            children.last().copied(),
+            "above all"
+        );
+
         TestResult::passed()
     }
 }
