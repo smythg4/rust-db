@@ -255,8 +255,8 @@ impl ColumnType {
 /// and whether or not the field is nullable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
-    col_type: ColumnType,
-    nullable: bool,
+    pub(crate) col_type: ColumnType,
+    pub(crate) nullable: bool,
 }
 
 macro_rules! column_constructors {
@@ -321,6 +321,9 @@ impl ValidatedRow {
             _ => unreachable!("shouldn't be able to get another option from a Validated Row"),
         }
     }
+    pub fn into_inner(self) -> Row {
+        self.0
+    }
 }
 
 impl From<ValidatedRow> for Row {
@@ -333,7 +336,7 @@ impl From<ValidatedRow> for Row {
 /// Float) as well as an `nullable` flag indicated whether or not the field is nullable.
 #[derive(Debug, Clone)]
 pub struct Schema {
-    columns: Vec<Column>,
+    pub(crate) columns: Vec<Column>,
 }
 
 impl TryFrom<Vec<Column>> for Schema {
@@ -395,10 +398,10 @@ impl Schema {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    use crate::commontypes::{PAGE_ID_SIZE, SLOT_ENTRY_SIZE};
-
+mod tests {
     use super::*;
+    use crate::commontypes::{PAGE_ID_SIZE, SLOT_ENTRY_SIZE};
+    use crate::test_support::*;
     use quickcheck::{Arbitrary, Gen, TestResult};
     use quickcheck_macros::quickcheck;
     use std::io::{Cursor, Seek};
@@ -489,48 +492,6 @@ pub(crate) mod tests {
                     }))
                     .collect(),
             }
-        }
-    }
-
-    pub(crate) fn valid_row_from_schema(schema: &Schema, g: &mut Gen) -> Row {
-        let vr = loop {
-            let row = Row {
-                fields: schema
-                    .columns
-                    .iter()
-                    .map(|c| {
-                        let coin_flip = bool::arbitrary(g);
-                        match c.col_type {
-                            _ if c.nullable && coin_flip => RowValue::Null,
-                            ColumnType::Bool => RowValue::Boolean(bool::arbitrary(g)),
-                            ColumnType::Float => {
-                                let mut f = f64::arbitrary(g);
-                                while f.is_nan() {
-                                    f = f64::arbitrary(g);
-                                }
-                                RowValue::Float(f)
-                            }
-                            ColumnType::Integer => RowValue::Integer(i64::arbitrary(g)),
-                            ColumnType::String => RowValue::String(String::arbitrary(g)),
-                        }
-                    })
-                    .collect(),
-            };
-            if let Ok(vr) = schema.validate_row(row) {
-                break vr;
-            }
-        };
-        vr.0
-    }
-
-    #[derive(Debug, Clone)]
-    pub(crate) struct SchemaRowPair(pub(crate) Schema, pub(crate) Row);
-
-    impl Arbitrary for SchemaRowPair {
-        fn arbitrary(g: &mut Gen) -> Self {
-            let schema = Schema::arbitrary(g);
-            let row = valid_row_from_schema(&schema, g);
-            SchemaRowPair(schema, row)
         }
     }
 

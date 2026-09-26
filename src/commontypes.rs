@@ -19,6 +19,9 @@ impl PageId {
     pub const fn get_page_num(self) -> u32 {
         self.1
     }
+    pub fn wrapping_add(&self, n: u32) -> Self {
+        PageId(self.0, self.1.wrapping_add(n))
+    }
 }
 
 impl std::fmt::Display for PageId {

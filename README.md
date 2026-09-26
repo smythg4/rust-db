@@ -32,12 +32,13 @@ QUICKCHECK_TESTS=10000 cargo test
   - [ ] `find_child` tests: boundaries + split-then-route
   - [ ] Handle primative type errors as `PageError::Corrupt` in `Page::deserialize` where appropriate.
   - [x] Add a `merge_page` method for use when deletions reduce page size to half full
-  - [ ] Write test cases for `merge_page`
+  - [x] Write test cases for `merge_page`
     - [x] Test for `PageFull` errors
-    - [ ] Test for `InvalidMerge` errors (duplicate keys, unsorted keys, page type mismatch)
-    - [ ] Test for original page preservation after merge failure
+    - [x] Test for `InvalidMerge` errors (duplicate keys, unsorted keys, bad pointers, page type mismatch)
+    - [x] Test for original page preservation after merge failure
     - [x] Test for `Page` split, then remerge. Should always succeed and be byte-for-byte of original. Ensure the new page id is provided as the "Freed page"
   - [ ] Add `internal_remove` method to remove a key from an internal page, add `leaf_remove` to remove a record from a leaf page.
+  - [ ] Move common test helpers into a test_support.rs module. Build some more helpers to remove redundancy inside tests.
 
 ### Phase 0 — Types
 - When following the [cstack database tutorial](https://github.com/smythg4/cstack_db), raw `u32` and `usize` abounded. This time, I opted to create custom types for things like `PageId`, `SlotIndex`, `SlotEntry`, `Key`, `Row`, `RowValue`, and `ValidatedRow` for example.
@@ -58,6 +59,7 @@ QUICKCHECK_TESTS=10000 cargo test
 - Byte manipulation lives in exactly one place: the serialize/deserialize pair. Everything above that boundary works with typed data, not raw `&mut [u8]` — this is what makes the offset/node-type-confusion bug class from cstack_db structurally impossible here.
 - One major shortcoming at this juncture is the need to read in the full 4KB page off disk and deserialize into this in-memory representation for any page modifications.
   - It's commented out right now, but my plan is to define a trait for `Page` that I can implement for a pure, raw-byte page representation and swap my current implementation out for something that's closer to 'zero-copy'.
+  - I think I'll be able to keep my tests for the new `Page` implementation if I implement `Arbitrary` for the new type that makes a naive `Page` (the current type), converts it to raw bytes, then reads those in.
 
 #### Page layout (4096 bytes)
 

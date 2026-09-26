@@ -53,12 +53,19 @@ pub enum PageError {
         page_id: Option<PageId>,
         kind: CorruptionKind,
     },
-    #[error("Attempt to merge two dissimilar Pages")]
-    MismatchMerge,
-    #[error("Attempt to merge leaf page with a non-neighbor")]
-    InvalidMerge,
+    #[error("Merge Invalid: {0}")]
+    InvalidMerge(MergeFailReason),
 }
 
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum MergeFailReason {
+    #[error("Unable to merge Leaf pages with Internal pages")]
+    MismatchMerge,
+    #[error("Right neighbor is {0:?} but provided {1:?}")]
+    PointerMismatch(Option<PageId>, Option<PageId>),
+    #[error("Keys aren't sorted or duplicate key found")]
+    Keys,
+}
 #[derive(Debug, Clone, PartialEq)]
 pub enum CorruptionKind {
     InvalidTag(u8),
@@ -104,7 +111,7 @@ impl Page {
         Self::empty_page(page_id, body)
     }
 
-    fn empty_page(page_id: PageId, body: PageBody) -> Self {
+    pub(crate) fn empty_page(page_id: PageId, body: PageBody) -> Self {
         Page {
             page_id,
             last_update: PageLsn(None),
@@ -510,7 +517,7 @@ impl Page {
                                 right_key <= left_key
                             })
                         {
-                            return Err(PageError::InvalidMerge);
+                            return Err(PageError::InvalidMerge(MergeFailReason::Keys));
                         }
                         // leaf merge: append right_records, take over right_next
                         let right_records = right_records.drain(..);
@@ -518,22 +525,28 @@ impl Page {
                         *next = *right_next;
                         Ok(right_id)
                     }
-                    _ => Err(PageError::InvalidMerge),
+                    _ => Err(PageError::InvalidMerge(MergeFailReason::PointerMismatch(
+                        *next,
+                        Some(right_id),
+                    ))),
                 }
             }
-            _ => Err(PageError::MismatchMerge),
+            _ => Err(PageError::InvalidMerge(MergeFailReason::MismatchMerge)),
         }
     }
 
+    /// If the merge is legal, this will drain the right `Page` of any entries and merge them into
+    /// this one. Right `Page` won't be affected in the event of failure. `separator` will be installed
+    /// at the right point in the newly merged `Page`. Returns the `PageId` of the
+    /// merged `Page` that can be recycled to a free list.
     pub fn internal_merge_from_right(
         &mut self,
         right: &mut Page,
         separator: Key,
     ) -> Result<PageId, PageError> {
-        if !self
-            .free_space()
-            .is_some_and(|free| free >= right.entries_size())
-        {
+        if !self.free_space().is_some_and(|free| {
+            free >= right.entries_size() + Self::internal_entry_size(&separator)
+        }) {
             return Err(PageError::PageFull);
         }
         let right_id = right.page_id;
@@ -548,12 +561,12 @@ impl Page {
                 // reject if there's a key on the right and it's less than the separator
                 // assumes keys list is sorted
                 if right_keys.first().is_some_and(|k| k <= &separator) {
-                    return Err(PageError::InvalidMerge);
+                    return Err(PageError::InvalidMerge(MergeFailReason::Keys));
                 }
                 // reject if there's a key on the left and it's greater than the separator
                 // assumes keys list is sorted
                 if keys.last().is_some_and(|k| k >= &separator) {
-                    return Err(PageError::InvalidMerge);
+                    return Err(PageError::InvalidMerge(MergeFailReason::Keys));
                 }
                 let right_keys = right_keys.drain(..);
                 let right_children = right_children.drain(..);
@@ -566,7 +579,7 @@ impl Page {
                 children.extend(right_children);
                 Ok(right_id)
             }
-            _ => Err(PageError::MismatchMerge),
+            _ => Err(PageError::InvalidMerge(MergeFailReason::MismatchMerge)),
         }
     }
 
@@ -577,6 +590,41 @@ impl Page {
             }
             PageBody::Leaf { records, .. } => {
                 records.iter().map(Self::leaf_entry_size).sum::<usize>()
+            }
+        }
+    }
+
+    pub fn records(&self) -> Option<&[Row]> {
+        match &self.body {
+            PageBody::Leaf { records, .. } => Some(records),
+            _ => None,
+        }
+    }
+
+    pub fn keys(&self) -> Option<&[Key]> {
+        match &self.body {
+            PageBody::Internal { keys, .. } => Some(keys),
+            _ => None,
+        }
+    }
+
+    pub fn children(&self) -> Option<&[PageId]> {
+        match &self.body {
+            PageBody::Internal { children, .. } => Some(children),
+            _ => None,
+        }
+    }
+
+    #[allow(dead_code)]
+    // little helper function for tests
+    fn delete_last(&mut self) {
+        match &mut self.body {
+            PageBody::Internal { keys, children } => {
+                let _ = keys.pop();
+                let _ = children.pop();
+            }
+            PageBody::Leaf { records, .. } => {
+                let _ = records.pop();
             }
         }
     }
@@ -759,9 +807,8 @@ mod tests {
 
     use super::*;
     use crate::commontypes::{Lsn, TableId};
-    use crate::schema::tests::SchemaRowPair;
-    use crate::schema::tests::valid_row_from_schema;
-    use crate::schema::{Column, RowValue, Schema};
+    use crate::schema::RowValue;
+    use crate::test_support::*;
 
     impl Arbitrary for PageBody {
         fn arbitrary(g: &mut Gen) -> Self {
@@ -817,50 +864,15 @@ mod tests {
         }
     }
 
-    #[derive(Debug, Clone)]
-    struct SchemaWithRows(Schema, Vec<Row>);
-
-    impl Arbitrary for SchemaWithRows {
-        fn arbitrary(g: &mut Gen) -> Self {
-            let schema = Schema::arbitrary(g);
-            let n = usize::arbitrary(g) % 25;
-            let rows: Vec<Row> = (0..n).map(|_| valid_row_from_schema(&schema, g)).collect();
-            SchemaWithRows(schema, rows)
-        }
-    }
-
-    /// Fixed-width key prefix so string keys sort by their index regardless of padding.
-    fn padded_key(index: usize, total_len: usize) -> Key {
-        let prefix = format!("{index:06}");
-        Key::String(format!(
-            "{prefix}{}",
-            "x".repeat(total_len.saturating_sub(prefix.len()))
-        ))
-    }
-
-    /// Two-column schema (integer key + string payload) and the largest payload that still validates.
-    fn leaf_schema() -> (Schema, usize) {
-        let schema = Schema::try_from(vec![Column::integer(), Column::string()]).unwrap();
-        let row_with = |key: i64, len: usize| Row {
-            fields: vec![RowValue::Integer(key), RowValue::String("p".repeat(len))],
-        };
-        let max_payload = (0..MAX_LEAF_ENTRY_SIZE)
-            .rev()
-            .find(|&len| schema.validate_row(row_with(0, len)).is_ok())
-            .expect("some payload must validate");
-        (schema, max_payload)
-    }
-
     #[quickcheck]
     fn split_then_merge_roundtrip(mut page: Page) -> TestResult {
-        let snapshot = match page.as_raw_page() {
-            Ok(ss) => ss,
-            Err(PageError::TooSmallToSplit(_)) => return TestResult::discard(),
-            Err(e) => panic!("Unexpected split error: {e:?}"),
+        let snapshot = page.clone();
+        let new_id = page.page_id.wrapping_add(1);
+
+        let Some((separator, mut new_page)) = try_split(&mut page, new_id) else {
+            return TestResult::discard();
         };
 
-        let page_id = PageId::new(TableId::new(u32::MAX), u32::MAX);
-        let (separator, mut new_page) = page.split_page(page_id).unwrap();
         let freed_id = match &page.body {
             PageBody::Internal { .. } => page.internal_merge_from_right(&mut new_page, separator),
             PageBody::Leaf { .. } => page.leaf_merge_from_right(&mut new_page),
@@ -868,14 +880,163 @@ mod tests {
         .unwrap();
 
         // make sure the PageId returned is the one we put in as the right page
-        assert_eq!(freed_id, page_id);
+        assert_eq!(freed_id, new_id);
 
         // make sure the page is identical to where we started after the roundtrip
-        assert_eq!(page.as_raw_page().unwrap(), snapshot);
+        assert_unchanged(&page, &snapshot);
 
         // make sure the "freed" page was cleared of any entries
         assert_eq!(new_page.entries_size(), 0);
 
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn merges_fail_with_invalid_pointers(mut page: Page) -> TestResult {
+        // if it's under full, we know it can fit into itself. We only want leaf pages for this test
+        if !page.is_underfull() || matches!(page.body, PageBody::Internal { .. }) {
+            return TestResult::discard();
+        }
+
+        // generate an id that's different from the given page's
+        let page_id = page.page_id.wrapping_add(1);
+
+        let Some((_, mut new_page)) = try_split(&mut page, page_id) else {
+            return TestResult::discard();
+        };
+
+        let snapshot2 = new_page.clone();
+
+        // now we have a new page that we're positive we can merge! Let's mess with it.
+        let PageBody::Leaf { next, .. } = &mut page.body else {
+            unreachable!()
+        };
+        *next = None;
+        let snapshot1 = page.clone();
+        let result = page.leaf_merge_from_right(&mut new_page);
+
+        assert!(matches!(
+            result,
+            Err(PageError::InvalidMerge(MergeFailReason::PointerMismatch(
+                None,
+                _
+            )))
+        ));
+        assert_unchanged(&page, &snapshot1);
+        assert_unchanged(&new_page, &snapshot2);
+
+        // trying again but with a `Some` value
+        let PageBody::Leaf { next, .. } = &mut page.body else {
+            unreachable!()
+        };
+        *next = Some(page.page_id);
+        let snapshot1 = page.clone();
+        let result = page.leaf_merge_from_right(&mut new_page);
+
+        assert!(matches!(
+            result,
+            Err(PageError::InvalidMerge(MergeFailReason::PointerMismatch(
+                Some(_),
+                Some(_)
+            )))
+        ));
+        assert_unchanged(&page, &snapshot1);
+        assert_unchanged(&new_page, &snapshot2);
+
+        // trying again with the right pointer value
+        let PageBody::Leaf { next, .. } = &mut page.body else {
+            unreachable!()
+        };
+        *next = Some(page_id);
+
+        let result = page
+            .leaf_merge_from_right(&mut new_page)
+            .expect("it should work this time");
+
+        assert_eq!(result, page_id, "freed PageId doesn't match");
+
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn merges_fail_with_duplicate_keys(mut page: Page) -> TestResult {
+        // if it's under full, we know it can fit into itself
+        if !page.is_underfull() {
+            return TestResult::discard();
+        }
+
+        let mut page2 = page.clone();
+        // make up a key to serve as the separator
+        let dummy_key = Key::Integer(0);
+
+        let mut snapshot1 = page.clone();
+        let snapshot2 = page2.clone();
+
+        let result = match &mut page.body {
+            PageBody::Leaf { next, .. } => {
+                // tidy up the next pointer so we know that's not causing the error
+                *next = Some(page2.page_id);
+                // update the snapshot
+                snapshot1 = page.clone();
+
+                page.leaf_merge_from_right(&mut page2)
+            }
+            PageBody::Internal { .. } => page.internal_merge_from_right(&mut page2, dummy_key),
+        };
+
+        assert!(matches!(
+            result,
+            Err(PageError::InvalidMerge(MergeFailReason::Keys))
+        ));
+        assert_unchanged(&page, &snapshot1);
+        assert_unchanged(&page2, &snapshot2);
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn internal_merge_counts_the_separator_size(key_sizes: Vec<u16>) -> TestResult {
+        if key_sizes.is_empty() {
+            return TestResult::discard();
+        }
+
+        let left = fill_internal(child(1), key_sizes);
+        let free = left.free_space().unwrap();
+
+        // build the right page as empty as possible
+        let right = internal_with_one_child(999);
+
+        // separator_with generates a valid separator based on the left pages last entry. Discard results where
+        // left page is empty
+        let PageBody::Internal { keys, .. } = &left.body else {
+            unreachable!()
+        };
+        let Some(Key::String(last)) = keys.last() else {
+            return TestResult::discard();
+        };
+        let separator_with = |extra: usize| Key::String(format!("{last}{}", "z".repeat(extra)));
+
+        // find the smallest key that won't fit
+        let too_big = (1..)
+            .find(|&n| Page::internal_entry_size(&separator_with(n)) > free)
+            .unwrap();
+
+        // make sure that the too big key results in a full page
+        let (mut l, mut r) = (left.clone(), right.clone());
+        let result = l.internal_merge_from_right(&mut r, separator_with(too_big));
+        assert!(matches!(result, Err(PageError::PageFull)), "{result:?}");
+        assert_unchanged(&l, &left);
+        assert_unchanged(&r, &right);
+
+        // try a key that's one byte smaller and confirm that it fits
+        if too_big > 1 {
+            let (mut l, mut r) = (left.clone(), right.clone());
+            let result = l.internal_merge_from_right(&mut r, separator_with(too_big - 1));
+            assert!(
+                result.is_ok(),
+                "separator that fits was rejected: {result:?}"
+            );
+            assert!(l.as_raw_page().is_ok(), "merged page doesn't serialize");
+        }
         TestResult::passed()
     }
 
@@ -891,6 +1052,9 @@ mod tests {
         // make up a key to serve as the separator
         let dummy_key = Key::Integer(0);
 
+        let mut snapshot1 = page.clone();
+        let snapshot2 = page2.clone();
+
         // this example will have duplicate keys and failed separator checks, but
         // the overfull check should occur first
 
@@ -898,21 +1062,57 @@ mod tests {
             PageBody::Leaf { next, .. } => {
                 // make sure this page points to the correct way
                 *next = Some(page2.page_id);
+                // update the snapshot
+                snapshot1 = page.clone();
                 page.leaf_merge_from_right(&mut page2)
             }
             PageBody::Internal { .. } => page.internal_merge_from_right(&mut page2, dummy_key),
         };
 
-        println!("{:?}", result);
         assert!(matches!(result, Err(PageError::PageFull)));
-
+        assert_unchanged(&page, &snapshot1);
+        assert_unchanged(&page2, &snapshot2);
         TestResult::passed()
     }
 
     #[quickcheck]
-    fn max_size_row_fits_after_leaf_split(payload_sizes: Vec<u16>, target: u8) -> TestResult {
-        let page_id = PageId::new(TableId::new(u32::MAX), u32::MAX);
+    fn merges_fail_with_dissimilar_pages(mut page1: Page, mut page2: Page) -> TestResult {
+        // make sure both pages are underfull
+        if !page1.is_underfull() || !page2.is_underfull() {
+            return TestResult::discard();
+        }
+        let dummy_key = Key::String("dummy".into());
+        let snapshot1 = page1.clone();
+        let snapshot2 = page2.clone();
+        // make sure the pages are of different types
+        match (&mut page1.body, &mut page2.body) {
+            (PageBody::Leaf { .. }, PageBody::Internal { .. }) => {
+                let result = page1.leaf_merge_from_right(&mut page2);
 
+                assert!(matches!(
+                    result,
+                    Err(PageError::InvalidMerge(MergeFailReason::MismatchMerge))
+                ));
+                assert_unchanged(&page1, &snapshot1);
+                assert_unchanged(&page2, &snapshot2);
+                TestResult::passed()
+            }
+            (PageBody::Internal { .. }, PageBody::Leaf { .. }) => {
+                let result = page1.internal_merge_from_right(&mut page2, dummy_key);
+                assert!(matches!(
+                    result,
+                    Err(PageError::InvalidMerge(MergeFailReason::MismatchMerge))
+                ));
+                assert_unchanged(&page1, &snapshot1);
+                assert_unchanged(&page2, &snapshot2);
+                TestResult::passed()
+            }
+            _ => TestResult::discard(),
+        }
+    }
+
+    #[quickcheck]
+    fn max_size_row_fits_after_leaf_split(payload_sizes: Vec<u16>, target: u8) -> TestResult {
         if payload_sizes.is_empty() {
             return TestResult::discard();
         }
@@ -927,22 +1127,11 @@ mod tests {
                 .unwrap()
         };
 
-        // generate an empty leaf page
-        let mut page = Page::empty_leaf(page_id);
-        let mut count = 0i64;
-
-        // fill it up with various sized rows and keys 0, 10, 20, ...
-        for len in payload_sizes.iter().cycle() {
-            let len = *len as usize % (max_payload + 1);
-            match page.leaf_insert(make_row(count * 10, len)) {
-                Ok(()) => count += 1,
-                Err(PageError::PageFull) => break,
-                Err(e) => panic!("Unexpected error: {e:?}"),
-            }
-        }
+        let mut page = fill_leaf(DUMMY_PAGE_ID, payload_sizes);
+        let count = page.records().unwrap().len() as i64;
 
         // split the page! (the new one will have a duplicate page id, but that's fine for the test)
-        let (separator, mut right) = page.split_page(page_id).unwrap();
+        let (separator, mut right) = page.split_page(DUMMY_PAGE_ID).unwrap();
 
         // generate a key that lands between entries
         let key = (target as i64 % (count + 1)) * 10 - 5;
@@ -968,7 +1157,6 @@ mod tests {
         if key_sizes.is_empty() {
             return TestResult::discard();
         }
-        let child = |n: usize| PageId::new(TableId::new(1), n as u32);
 
         // largest string key whose internal entry still fits the limit
         let max_key_len = (0..MAX_INTERNAL_ENTRY_SIZE)
@@ -976,30 +1164,12 @@ mod tests {
             .find(|&len| Page::internal_entry_size(&padded_key(0, len)) <= MAX_INTERNAL_ENTRY_SIZE)
             .unwrap();
 
-        let mut page = Page::empty_page(
-            child(0),
-            PageBody::Internal {
-                keys: Vec::new(),
-                children: vec![child(0)],
-            },
-        );
-
-        // start from a valid internal page (no keys, one child), then fill it with
-        // keys 0, 2, 4, ... through the real insert until it reports PageFull
-        for (i, size) in key_sizes.iter().cycle().enumerate() {
-            let key = padded_key(i * 2, 6 + (*size as usize) % (max_key_len - 5));
-            match page.internal_insert(key, child(i + 1)) {
-                Ok(()) => {}
-                Err(PageError::PageFull) => break,
-                Err(e) => panic!("unexpected error while filling: {e:?}"),
-            }
-        }
+        let mut page = fill_internal(child(1), key_sizes);
         let key_count = page.num_items();
+        let new_id = page.page_id.wrapping_add(1);
 
-        let (separator, mut right) = match page.split_page(child(999_999)) {
-            Ok(split) => split,
-            Err(PageError::TooSmallToSplit(_)) => return TestResult::discard(),
-            Err(e) => panic!("unexpected split error: {e:?}"),
+        let Some((separator, mut right)) = try_split(&mut page, new_id) else {
+            return TestResult::discard();
         };
 
         let big_key = padded_key((target as usize % (key_count + 1)) * 2 + 1, max_key_len);
@@ -1021,6 +1191,7 @@ mod tests {
 
         TestResult::passed()
     }
+
     #[quickcheck]
     fn insertion_order_on_leaves(
         SchemaWithRows(schema, rows): SchemaWithRows,
@@ -1047,10 +1218,10 @@ mod tests {
             let result = page.leaf_insert(validated_row);
             if is_duplicate {
                 assert!(matches!(result, Err(PageError::DuplicateKey)));
-                assert_eq!(page_clone, page);
+                assert_unchanged(&page_clone, &page);
             } else if is_full {
                 assert!(matches!(result, Err(PageError::PageFull)));
-                assert_eq!(page_clone, page);
+                assert_unchanged(&page_clone, &page);
             } else {
                 assert!(result.is_ok());
                 expected.insert(key, row.clone());
@@ -1070,31 +1241,28 @@ mod tests {
 
     #[quickcheck]
     fn split_page_roundtrip(mut page: Page) -> TestResult {
-        let new_page_id = PageId::new(TableId::new(u32::MAX), u32::MAX);
-        match page.split_page(new_page_id) {
-            Ok((_, new_page)) => {
-                let mut buf = Cursor::new(Vec::new());
-                page.serialize(&mut buf).unwrap();
-                buf.set_position(0);
-                let deser = Page::deserialize(&mut buf).unwrap();
-                assert_eq!(page, deser, "Original page doesn't roundtrip");
+        let new_id = page.page_id.wrapping_add(1);
+        let Some((_, new_page)) = try_split(&mut page, new_id) else {
+            return TestResult::discard();
+        };
 
-                buf.set_position(0);
-                new_page.serialize(&mut buf).unwrap();
-                buf.set_position(0);
-                let deser = Page::deserialize(&mut buf).unwrap();
-                assert_eq!(new_page, deser, "New page doesn't roundtrip");
-                TestResult::passed()
-            }
-            Err(PageError::TooSmallToSplit(_)) => TestResult::discard(),
-            Err(_) => TestResult::failed(),
-        }
+        let mut buf = Cursor::new(Vec::new());
+        page.serialize(&mut buf).unwrap();
+        buf.set_position(0);
+        let deser = Page::deserialize(&mut buf).unwrap();
+        assert_unchanged(&page, &deser);
+
+        buf.set_position(0);
+        new_page.serialize(&mut buf).unwrap();
+        buf.set_position(0);
+        let deser = Page::deserialize(&mut buf).unwrap();
+        assert_unchanged(&new_page, &deser);
+        TestResult::passed()
     }
 
     #[quickcheck]
     fn split_page_key_in_right_spot(mut page: Page) -> TestResult {
-        let new_page_id = PageId::new(TableId::new(u32::MAX), u32::MAX);
-        if let Ok((split_key, new_page)) = page.split_page(new_page_id) {
+        if let Ok((split_key, new_page)) = page.split_page(DUMMY_PAGE_ID) {
             match page.body {
                 PageBody::Internal { keys, .. } => {
                     assert!(!keys.is_empty());
@@ -1139,7 +1307,6 @@ mod tests {
             return TestResult::discard();
         }
         let original_id = page.page_id;
-        let new_page_id = PageId::new(TableId::new(u32::MAX), u32::MAX);
         let PageBody::Leaf {
             next: old_next,
             prev: old_prev,
@@ -1148,14 +1315,14 @@ mod tests {
         else {
             unreachable!()
         };
-        if let Ok((_, new_page)) = page.split_page(new_page_id) {
+        if let Ok((_, new_page)) = page.split_page(DUMMY_PAGE_ID) {
             match page.body {
                 PageBody::Internal { .. } => unreachable!(),
                 PageBody::Leaf { next, prev, .. } => {
                     assert_eq!(prev, old_prev, "original page prev pointer wasn't retained");
                     assert_eq!(
                         next,
-                        Some(new_page_id),
+                        Some(DUMMY_PAGE_ID),
                         "original page doesn't point to new page"
                     );
                     let PageBody::Leaf {
@@ -1185,7 +1352,6 @@ mod tests {
 
     #[quickcheck]
     fn no_rows_lost_in_split(mut page: Page) -> TestResult {
-        let new_page_id = PageId::new(TableId::new(u32::MAX), u32::MAX);
         let mut original_keys: Vec<Key> = Vec::new();
         let mut original_children: Vec<PageId> = Vec::new();
         let mut original_records: Vec<Row> = Vec::new();
@@ -1200,7 +1366,7 @@ mod tests {
             }
         };
 
-        if let Ok((split_key, new_page)) = page.split_page(new_page_id) {
+        if let Ok((split_key, new_page)) = page.split_page(DUMMY_PAGE_ID) {
             match new_page.body {
                 PageBody::Internal {
                     keys: new_keys,
@@ -1257,17 +1423,6 @@ mod tests {
         }
     }
 
-    fn increment_key_on_row(row: &Row) -> Row {
-        let mut new_row = row.clone();
-        let new_key = match &row.fields[0] {
-            RowValue::Integer(n) => RowValue::Integer(n.wrapping_add(1)),
-            RowValue::String(s) => RowValue::String(format!("{s}1")),
-            _ => unreachable!(),
-        };
-        new_row.fields[0] = new_key;
-        new_row
-    }
-
     #[quickcheck]
     fn page_insert_returns_page_full_when_full(
         mut page: Page,
@@ -1293,8 +1448,7 @@ mod tests {
         assert!(matches!(result, Err(PageError::PageFull)));
 
         // make sure the failed insert didn't change the underlying page
-        assert_eq!(page.as_raw_page().unwrap(), snapshot.as_raw_page().unwrap());
-
+        assert_unchanged(&page, &snapshot);
         TestResult::passed()
     }
 
@@ -1350,7 +1504,7 @@ mod tests {
         let result = Page::deserialize(&mut &bytes[..]);
 
         if mutations.is_empty() {
-            assert_eq!(result.unwrap(), page);
+            assert_unchanged(&result.unwrap(), &page);
         }
         TestResult::passed()
     }
@@ -1366,13 +1520,7 @@ mod tests {
                 let again = decoded
                     .as_raw_page()
                     .expect("accepted page doesn't re-serialize");
-                assert_eq!(
-                    Page::deserialize(&mut &again[..])
-                        .unwrap()
-                        .as_raw_page()
-                        .unwrap(),
-                    decoded.as_raw_page().unwrap()
-                );
+                assert_unchanged(&Page::deserialize(&mut &again[..]).unwrap(), &decoded);
                 TestResult::passed()
             }
             Err(_) => TestResult::discard(),
@@ -1454,7 +1602,7 @@ mod tests {
         assert_eq!(bytes.len(), PAGE_SIZE);
         let deser = Page::deserialize(&mut Cursor::new(bytes)).unwrap();
 
-        assert_eq!(deser, lpage);
+        assert_unchanged(&deser, &lpage);
     }
 
     #[test]
@@ -1472,7 +1620,7 @@ mod tests {
         assert_eq!(bytes.len(), PAGE_SIZE);
         let deser = Page::deserialize(&mut Cursor::new(bytes)).unwrap();
 
-        assert_eq!(deser, ipage);
+        assert_unchanged(&deser, &ipage);
     }
 
     #[quickcheck]
@@ -1504,10 +1652,7 @@ mod tests {
         bytes.set_position(0);
         let deser_page = Page::deserialize(&mut bytes).unwrap();
 
-        assert_eq!(
-            page.as_raw_page().unwrap(),
-            deser_page.as_raw_page().unwrap()
-        );
+        assert_unchanged(&page, &deser_page);
         TestResult::passed()
     }
 }
