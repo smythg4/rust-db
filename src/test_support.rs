@@ -115,15 +115,15 @@ pub(crate) fn fill_internal(start_id: PageId, key_sizes: Vec<u16>) -> Page {
 
     // build a left page and fill it all the way up with various sized keys (should have a tiny space available at the end)
     let mut left = Page::empty_page(
-        child(1),
+        start_id,
         PageBody::Internal {
             keys: Vec::new(),
-            children: vec![start_id],
+            children: vec![start_id.wrapping_add(1)],
         },
     );
     for (i, size) in key_sizes.iter().cycle().enumerate() {
         let key = padded_key(i * 2, 6 + (*size as usize) % (max_key_len - 5));
-        match left.internal_insert(key, start_id.wrapping_add(i as u32)) {
+        match left.internal_insert(key, start_id.wrapping_add(i as u32 + 2)) {
             Ok(()) => {}
             Err(PageError::PageFull) => break,
             Err(e) => panic!("unexpected error while filling: {e:?}"),
@@ -164,7 +164,7 @@ pub(crate) fn internal_with_one_child(id: u32) -> Page {
         child(id),
         PageBody::Internal {
             keys: Vec::new(),
-            children: vec![child(999)],
+            children: vec![child(id).wrapping_add(1)],
         },
     )
 }

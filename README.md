@@ -145,8 +145,16 @@ pub enum PageBody {
   `None` on a cache miss instead of loading from disk.
 
 ### Phase 3 — BTree over the BPM
-- `BTree` struct holding a reference to the BPM (similar to `Table` and
-  `Pager` here).
+- `BTree` struct holding a reference to the BPM (similar to `Table` and `Pager` from cstack).
+```
+pub struct BTree {
+  id: TableId,
+  bpm: Arc<BufferPoolManager>,
+  root_page: PageId,
+  schema: Schema,
+  ...
+}
+```
 - Delete, including underflow handling (merge with / borrow from a sibling).
   Conspicuously absent from cstack_db — this is the mirror image of
   split-on-insert, and at least as fiddly as the key-promotion bookkeeping in
@@ -156,8 +164,17 @@ pub enum PageBody {
   freed pages are reusable.
 - A minimal catalog/system table to durably store user-defined schema
   definitions themselves, since schemas are no longer fixed at compile time.
+- Implement a `vacuum` method that performs:
+  - Complete sequential scan, gathering all records in one place.
+  - Builds full leaf `Page`s out of the collection and connects sibling pointers
+  - Bottom up construction of internal `Page`s until reaching the root
+  - Update `self.root_page`
 
-### Phase 4 — concurrency
+### Phase 3.5 - REPL / Dumb Queries
+- Now the project is ready to interact with, implement a simple REPL and allow some basic "stored procedures" like `INSERT <Row>`, `SELECT <Key>`, `DELETE <Key>`, `UPDATE <Key> <Row>`.
+- Maybe I'll start with a default dummy `Schema` to avoid all the `Table` declarations with the REPL.
+
+### Phase 4 — Concurrency
 - `RwLock`-guarded pages (built in Phase 2) used for real.
 - Latch crabbing (lock coupling) for B+Tree traversal: hold the parent's
   latch, acquire the child's, release the parent once the child is confirmed
@@ -184,10 +201,18 @@ ARIES in one pass:
   mid-transaction, restart, assert recovery produces a consistent state) —
   the only way to know ARIES is actually correct rather than "looks right".
 
-### Phase 6 — TransactionManager, then QueryEngine
+### Phase 6 — TransactionManager
 - Basic `TransactionManager`: begin/commit/abort, transaction IDs, hooked
   into WAL. A single global lock serializing all transactions is a
   reasonable v1 concurrency model — get commit/abort/WAL integration correct
   before attempting real isolation levels (2PL/MVCC).
+- Add `BEGIN`, `ABORT`, and `COMMIT` to the dumb REPL.
+
+### Phase 7 - QueryEngine
 - Basic `QueryEngine`: thin dispatch layer once everything below it works,
-  similar in spirit to `vm.rs` here.
+  similar in spirit to `vm.rs` from cstack's tutorial.
+- Add support for range selections
+- Maybe support `JOIN`? That's gonna be fun.
+
+### Phase 8 - Consensus
+- RAFT or VSR, whichever I find easier to implement

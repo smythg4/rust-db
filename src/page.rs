@@ -1129,9 +1129,10 @@ mod tests {
 
         let mut page = fill_leaf(DUMMY_PAGE_ID, payload_sizes);
         let count = page.records().unwrap().len() as i64;
+        let new_id = page.page_id.wrapping_add(1);
 
         // split the page! (the new one will have a duplicate page id, but that's fine for the test)
-        let (separator, mut right) = page.split_page(DUMMY_PAGE_ID).unwrap();
+        let (separator, mut right) = page.split_page(new_id).unwrap();
 
         // generate a key that lands between entries
         let key = (target as i64 % (count + 1)) * 10 - 5;
@@ -1262,43 +1263,43 @@ mod tests {
 
     #[quickcheck]
     fn split_page_key_in_right_spot(mut page: Page) -> TestResult {
-        if let Ok((split_key, new_page)) = page.split_page(DUMMY_PAGE_ID) {
-            match page.body {
-                PageBody::Internal { keys, .. } => {
-                    assert!(!keys.is_empty());
-                    assert!(keys.iter().all(|k| k < &split_key));
-                    let PageBody::Internal { keys: new_keys, .. } = new_page.body else {
-                        unreachable!()
-                    };
-                    assert!(!new_keys.is_empty());
-                    assert!(new_keys.iter().all(|k| k > &split_key));
-                }
-                PageBody::Leaf { records, .. } => {
-                    assert!(!records.is_empty());
-                    assert!(
-                        records
-                            .iter()
-                            .all(|r| r.cmp_key(&split_key) == Ordering::Less)
-                    );
-                    let PageBody::Leaf {
-                        records: new_records,
-                        ..
-                    } = new_page.body
-                    else {
-                        unreachable!()
-                    };
-                    assert!(!new_records.is_empty());
-                    assert!(
-                        new_records
-                            .iter()
-                            .all(|r| r.cmp_key(&split_key) != Ordering::Less)
-                    );
-                }
-            };
-            TestResult::passed()
-        } else {
-            TestResult::discard()
-        }
+        let new_id = page.page_id.wrapping_add(1);
+        let Some((split_key, new_page)) = try_split(&mut page, new_id) else {
+            return TestResult::discard();
+        };
+        match page.body {
+            PageBody::Internal { keys, .. } => {
+                assert!(!keys.is_empty());
+                assert!(keys.iter().all(|k| k < &split_key));
+                let PageBody::Internal { keys: new_keys, .. } = new_page.body else {
+                    unreachable!()
+                };
+                assert!(!new_keys.is_empty());
+                assert!(new_keys.iter().all(|k| k > &split_key));
+            }
+            PageBody::Leaf { records, .. } => {
+                assert!(!records.is_empty());
+                assert!(
+                    records
+                        .iter()
+                        .all(|r| r.cmp_key(&split_key) == Ordering::Less)
+                );
+                let PageBody::Leaf {
+                    records: new_records,
+                    ..
+                } = new_page.body
+                else {
+                    unreachable!()
+                };
+                assert!(!new_records.is_empty());
+                assert!(
+                    new_records
+                        .iter()
+                        .all(|r| r.cmp_key(&split_key) != Ordering::Less)
+                );
+            }
+        };
+        TestResult::passed()
     }
 
     #[quickcheck]
@@ -1315,39 +1316,39 @@ mod tests {
         else {
             unreachable!()
         };
-        if let Ok((_, new_page)) = page.split_page(DUMMY_PAGE_ID) {
-            match page.body {
-                PageBody::Internal { .. } => unreachable!(),
-                PageBody::Leaf { next, prev, .. } => {
-                    assert_eq!(prev, old_prev, "original page prev pointer wasn't retained");
-                    assert_eq!(
-                        next,
-                        Some(DUMMY_PAGE_ID),
-                        "original page doesn't point to new page"
-                    );
-                    let PageBody::Leaf {
-                        prev: new_prev,
-                        next: new_next,
-                        ..
-                    } = new_page.body
-                    else {
-                        unreachable!()
-                    };
-                    assert_eq!(
-                        new_prev,
-                        Some(original_id),
-                        "new page prev pointer doesn't point to original page"
-                    );
-                    assert_eq!(
-                        new_next, old_next,
-                        "new page next pointer doesn't point to original page's original next"
-                    );
-                }
-            };
-            TestResult::passed()
-        } else {
-            TestResult::discard()
-        }
+        let new_id = page.page_id.wrapping_add(1);
+        let Some((_split_key, new_page)) = try_split(&mut page, new_id) else {
+            return TestResult::discard();
+        };
+        match page.body {
+            PageBody::Internal { .. } => unreachable!(),
+            PageBody::Leaf { next, prev, .. } => {
+                assert_eq!(prev, old_prev, "original page prev pointer wasn't retained");
+                assert_eq!(
+                    next,
+                    Some(new_id),
+                    "original page doesn't point to new page"
+                );
+                let PageBody::Leaf {
+                    prev: new_prev,
+                    next: new_next,
+                    ..
+                } = new_page.body
+                else {
+                    unreachable!()
+                };
+                assert_eq!(
+                    new_prev,
+                    Some(original_id),
+                    "new page prev pointer doesn't point to original page"
+                );
+                assert_eq!(
+                    new_next, old_next,
+                    "new page next pointer doesn't point to original page's original next"
+                );
+            }
+        };
+        TestResult::passed()
     }
 
     #[quickcheck]
@@ -1365,62 +1366,62 @@ mod tests {
                 original_records = records.clone();
             }
         };
+        let new_id = page.page_id.wrapping_add(1);
 
-        if let Ok((split_key, new_page)) = page.split_page(DUMMY_PAGE_ID) {
-            match new_page.body {
-                PageBody::Internal {
-                    keys: new_keys,
-                    children: new_children,
-                } => {
-                    let PageBody::Internal {
-                        keys: old_keys,
-                        children: old_children,
-                    } = page.body.clone()
-                    else {
-                        unreachable!()
-                    };
-                    let combined_keys: Vec<Key> = old_keys
-                        .clone()
-                        .into_iter()
-                        .chain(new_keys.into_iter())
-                        .collect();
-                    let combined_children: Vec<PageId> = old_children
-                        .clone()
-                        .into_iter()
-                        .chain(new_children.into_iter())
-                        .collect();
+        let Some((split_key, new_page)) = try_split(&mut page, new_id) else {
+            return TestResult::discard();
+        };
+        match new_page.body {
+            PageBody::Internal {
+                keys: new_keys,
+                children: new_children,
+            } => {
+                let PageBody::Internal {
+                    keys: old_keys,
+                    children: old_children,
+                } = page.body.clone()
+                else {
+                    unreachable!()
+                };
+                let combined_keys: Vec<Key> = old_keys
+                    .clone()
+                    .into_iter()
+                    .chain(new_keys.into_iter())
+                    .collect();
+                let combined_children: Vec<PageId> = old_children
+                    .clone()
+                    .into_iter()
+                    .chain(new_children.into_iter())
+                    .collect();
 
-                    // remove the split key from the internal node original list of Keys
-                    let remove_pos = original_keys.binary_search(&split_key).unwrap();
-                    original_keys.remove(remove_pos);
+                // remove the split key from the internal node original list of Keys
+                let remove_pos = original_keys.binary_search(&split_key).unwrap();
+                original_keys.remove(remove_pos);
 
-                    assert_eq!(original_keys, combined_keys);
-                    assert_eq!(original_children, combined_children);
-                }
-                PageBody::Leaf {
-                    records: new_records,
-                    ..
-                } => {
-                    let PageBody::Leaf {
-                        records: old_records,
-                        ..
-                    } = page.body.clone()
-                    else {
-                        unreachable!()
-                    };
-                    let combined_records: Vec<Row> = old_records
-                        .clone()
-                        .into_iter()
-                        .chain(new_records.into_iter())
-                        .collect();
-                    assert_eq!(original_records, combined_records);
-                }
+                assert_eq!(original_keys, combined_keys);
+                assert_eq!(original_children, combined_children);
             }
-
-            TestResult::passed()
-        } else {
-            TestResult::discard()
+            PageBody::Leaf {
+                records: new_records,
+                ..
+            } => {
+                let PageBody::Leaf {
+                    records: old_records,
+                    ..
+                } = page.body.clone()
+                else {
+                    unreachable!()
+                };
+                let combined_records: Vec<Row> = old_records
+                    .clone()
+                    .into_iter()
+                    .chain(new_records.into_iter())
+                    .collect();
+                assert_eq!(original_records, combined_records);
+            }
         }
+
+        TestResult::passed()
     }
 
     #[quickcheck]
