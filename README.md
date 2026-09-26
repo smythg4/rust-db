@@ -23,14 +23,21 @@ QUICKCHECK_TESTS=10000 cargo test
   - [x] Cap total row size (vs. usable leaf space) and key size (vs. internal node space) in `validate_row`; unify
   raw vs. encoded length limits
   - [x] Split leaves by bytes, not count, so a post-split retry always fits
-  - [ ] `find_child` tests: boundaries + split-then-route
   - [x] Split tests: discard only `TooSmallToSplit`; strict leaf sortedness `debug_assert`
   - [x] Generators: integer keys in internal nodes, random `None` pointers (loosen `free_space_works`
   accordingly), fuller pages
   - [x] Round-trip + size tests for `PageLsn`, `Lsn`, `PageId`, `SlotEntry`, `Option<T>`
   - [x] Rewrite `page_insert_returns_page_full_when_full`; tidy `validate_row`, `Row::try_from`,
   `PageLsn::deserialize`
+  - [ ] `find_child` tests: boundaries + split-then-route
   - [ ] Handle primative type errors as `PageError::Corrupt` in `Page::deserialize` where appropriate.
+  - [x] Add a `merge_page` method for use when deletions reduce page size to half full
+  - [ ] Write test cases for `merge_page`
+    - [x] Test for `PageFull` errors
+    - [ ] Test for `InvalidMerge` errors (duplicate keys, unsorted keys, page type mismatch)
+    - [ ] Test for original page preservation after merge failure
+    - [x] Test for `Page` split, then remerge. Should always succeed and be byte-for-byte of original. Ensure the new page id is provided as the "Freed page"
+  - [ ] Add `internal_remove` method to remove a key from an internal page, add `leaf_remove` to remove a record from a leaf page.
 
 ### Phase 0 — Types
 - When following the [cstack database tutorial](https://github.com/smythg4/cstack_db), raw `u32` and `usize` abounded. This time, I opted to create custom types for things like `PageId`, `SlotIndex`, `SlotEntry`, `Key`, `Row`, `RowValue`, and `ValidatedRow` for example.
@@ -47,7 +54,8 @@ QUICKCHECK_TESTS=10000 cargo test
 - The fundamental unit of storage `Page` holds core metadata like `page_id: PageId` and `Lsn` (not currently used, but will be important for WAL implementation), as well as a `PageBody` that is either a `Leaf` or `Internal`.
   - `Internal` page bodies hold a list of keys and child `PageId`s. There should always be 1 more child than keys. This is enforced through `debug_assert!`s for operations on `Page`s and `PageError::CorruptData` for deserialization.
   - `Leaf` page bodies hold a list of `Rows` and sibling pointers (`next: Option<PageId>`, `prev: Option<PageId>`) to allow quicker sequential scans.
-- All data encoding is in Big Endian order.
+- All numerical encoding is in Big Endian order.
+- Byte manipulation lives in exactly one place: the serialize/deserialize pair. Everything above that boundary works with typed data, not raw `&mut [u8]` — this is what makes the offset/node-type-confusion bug class from cstack_db structurally impossible here.
 - One major shortcoming at this juncture is the need to read in the full 4KB page off disk and deserialize into this in-memory representation for any page modifications.
   - It's commented out right now, but my plan is to define a trait for `Page` that I can implement for a pure, raw-byte page representation and swap my current implementation out for something that's closer to 'zero-copy'.
 
@@ -93,24 +101,20 @@ QUICKCHECK_TESTS=10000 cargo test
   | `length` | 2 | length of the encoded row or key |
   
 ### Phase 2 — BufferPoolManager
-- Reads pages off disk, deserializes into a proper `PageNode` struct
-  (`enum PageNode { Leaf(LeafData), Internal(InternalData) }`), serializes
+- Reads pages off disk, deserializes into a proper `Page` struct, serializes
   back to bytes only at the swap boundary (eviction or shutdown).
-  - Byte manipulation lives in exactly one place: the serialize/deserialize
-    pair. Everything above that boundary works with typed data, not raw
-    `&mut [u8]` — this is what makes the offset/node-type-confusion bug class
-    from cstack_db structurally impossible here.
+- Need to design all BPM methods to be `&self` to enable concurrency in later stages
 - `RwLock`-guarded pages (`RwLock<Option<Box<PageFrame>>>` per frame).
   - `RwLock` chosen deliberately for real cross-thread concurrency, not by
     default — `RefCell` gets the same `&self`-based win far cheaper if this
     stays single-threaded.
 - Pin counting via RAII guard (increment on fetch, decrement on `Drop`) — a
-  bookkeeping mechanism, not the eviction policy itself.
+  bookkeeping mechanism that informs the eviction policy if it's safe to evict.
 - Clock eviction policy: reference bit per frame, set on access, cleared as
   the clock hand sweeps past without evicting. Only `pin_count == 0` frames
   are eligible.
-- Dirty bit set on write-guard drop; only serialize-and-write on
-  eviction/flush if dirty.
+    - This will be a separate type stored by the BPM. Consider defining a trait `EvictionPolicy` to allow easy swap outs and experimentation with different policies.
+- Dirty bit set on write-guard drop
 - One access path only (`fetch_page`, always faults in on a miss) — no
   separate forcing/non-forcing variants. Half of cstack_db's session-restart
   bugs were exactly a call site using the read-only accessor that returned

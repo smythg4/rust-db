@@ -53,6 +53,10 @@ pub enum PageError {
         page_id: Option<PageId>,
         kind: CorruptionKind,
     },
+    #[error("Attempt to merge two dissimilar Pages")]
+    MismatchMerge,
+    #[error("Attempt to merge leaf page with a non-neighbor")]
+    InvalidMerge,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -293,6 +297,14 @@ impl Page {
         Self::leaf_entry_size(row) <= free_space
     }
 
+    /// Returns `true` if the `Page` is underfull and should be merged with another
+    pub fn is_underfull(&self) -> bool {
+        match self.free_space() {
+            Some(fs) => fs > PAGE_SIZE / 2,
+            None => false,
+        }
+    }
+
     /// Inserts a separator `Key` and associated child `PageId` into an internal `Page`.
     /// Primarily called by parent datastructure (e.g. `BTree`) after splitting a `Page`
     /// lower in the tree.
@@ -465,6 +477,106 @@ impl Page {
                 // connect current node to new right neighbor
                 *next = Some(new_page_id);
                 Ok((split_key, new_page))
+            }
+        }
+    }
+
+    /// If the merge is legal, this will drain the right `Page` of any entries and merge them into
+    /// this one. Right `Page` won't be affected in the event of failure. Returns the `PageId` of the
+    /// merged `Page` that can be recycled to a free list.
+    pub fn leaf_merge_from_right(&mut self, right: &mut Page) -> Result<PageId, PageError> {
+        if !self
+            .free_space()
+            .is_some_and(|free| free >= right.entries_size())
+        {
+            return Err(PageError::PageFull);
+        }
+        let right_id = right.page_id;
+        match (&mut self.body, &mut right.body) {
+            (
+                PageBody::Leaf { records, next, .. },
+                PageBody::Leaf {
+                    records: right_records,
+                    next: right_next,
+                    ..
+                },
+            ) => {
+                match *next {
+                    Some(id) if id == right_id => {
+                        if let Some(left_max) = records.last()
+                            && right_records.first().is_some_and(|right_min| {
+                                let left_key = Key::try_from(&left_max.fields[0]).unwrap();
+                                let right_key = Key::try_from(&right_min.fields[0]).unwrap();
+                                right_key <= left_key
+                            })
+                        {
+                            return Err(PageError::InvalidMerge);
+                        }
+                        // leaf merge: append right_records, take over right_next
+                        let right_records = right_records.drain(..);
+                        records.extend(right_records);
+                        *next = *right_next;
+                        Ok(right_id)
+                    }
+                    _ => Err(PageError::InvalidMerge),
+                }
+            }
+            _ => Err(PageError::MismatchMerge),
+        }
+    }
+
+    pub fn internal_merge_from_right(
+        &mut self,
+        right: &mut Page,
+        separator: Key,
+    ) -> Result<PageId, PageError> {
+        if !self
+            .free_space()
+            .is_some_and(|free| free >= right.entries_size())
+        {
+            return Err(PageError::PageFull);
+        }
+        let right_id = right.page_id;
+        match (&mut self.body, &mut right.body) {
+            (
+                PageBody::Internal { keys, children },
+                PageBody::Internal {
+                    keys: right_keys,
+                    children: right_children,
+                },
+            ) => {
+                // reject if there's a key on the right and it's less than the separator
+                // assumes keys list is sorted
+                if right_keys.first().is_some_and(|k| k <= &separator) {
+                    return Err(PageError::InvalidMerge);
+                }
+                // reject if there's a key on the left and it's greater than the separator
+                // assumes keys list is sorted
+                if keys.last().is_some_and(|k| k >= &separator) {
+                    return Err(PageError::InvalidMerge);
+                }
+                let right_keys = right_keys.drain(..);
+                let right_children = right_children.drain(..);
+
+                // push the key in between the two lists
+                keys.push(separator);
+                // add the right side keys
+                keys.extend(right_keys);
+                // add the right side children
+                children.extend(right_children);
+                Ok(right_id)
+            }
+            _ => Err(PageError::MismatchMerge),
+        }
+    }
+
+    fn entries_size(&self) -> usize {
+        match &self.body {
+            PageBody::Internal { keys, .. } => {
+                keys.iter().map(Self::internal_entry_size).sum::<usize>()
+            }
+            PageBody::Leaf { records, .. } => {
+                records.iter().map(Self::leaf_entry_size).sum::<usize>()
             }
         }
     }
@@ -737,6 +849,64 @@ mod tests {
             .find(|&len| schema.validate_row(row_with(0, len)).is_ok())
             .expect("some payload must validate");
         (schema, max_payload)
+    }
+
+    #[quickcheck]
+    fn split_then_merge_roundtrip(mut page: Page) -> TestResult {
+        let snapshot = match page.as_raw_page() {
+            Ok(ss) => ss,
+            Err(PageError::TooSmallToSplit(_)) => return TestResult::discard(),
+            Err(e) => panic!("Unexpected split error: {e:?}"),
+        };
+
+        let page_id = PageId::new(TableId::new(u32::MAX), u32::MAX);
+        let (separator, mut new_page) = page.split_page(page_id).unwrap();
+        let freed_id = match &page.body {
+            PageBody::Internal { .. } => page.internal_merge_from_right(&mut new_page, separator),
+            PageBody::Leaf { .. } => page.leaf_merge_from_right(&mut new_page),
+        }
+        .unwrap();
+
+        // make sure the PageId returned is the one we put in as the right page
+        assert_eq!(freed_id, page_id);
+
+        // make sure the page is identical to where we started after the roundtrip
+        assert_eq!(page.as_raw_page().unwrap(), snapshot);
+
+        // make sure the "freed" page was cleared of any entries
+        assert_eq!(new_page.entries_size(), 0);
+
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn merges_fail_when_not_small_enough(mut page: Page) -> TestResult {
+        // make sure we a page whose data size is less than the free space available
+        if page.entries_size() < page.free_space().unwrap_or(usize::MAX) {
+            return TestResult::discard();
+        }
+        // clone that page, so we know that these can't safely merge
+        let mut page2 = page.clone();
+
+        // make up a key to serve as the separator
+        let dummy_key = Key::Integer(0);
+
+        // this example will have duplicate keys and failed separator checks, but
+        // the overfull check should occur first
+
+        let result = match &mut page.body {
+            PageBody::Leaf { next, .. } => {
+                // make sure this page points to the correct way
+                *next = Some(page2.page_id);
+                page.leaf_merge_from_right(&mut page2)
+            }
+            PageBody::Internal { .. } => page.internal_merge_from_right(&mut page2, dummy_key),
+        };
+
+        println!("{:?}", result);
+        assert!(matches!(result, Err(PageError::PageFull)));
+
+        TestResult::passed()
     }
 
     #[quickcheck]
