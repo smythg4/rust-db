@@ -37,7 +37,8 @@ QUICKCHECK_TESTS=10000 cargo test
     - [x] Test for `InvalidMerge` errors (duplicate keys, unsorted keys, bad pointers, page type mismatch)
     - [x] Test for original page preservation after merge failure
     - [x] Test for `Page` split, then remerge. Should always succeed and be byte-for-byte of original. Ensure the new page id is provided as the "Freed page"
-  - [ ] Add `internal_remove` method to remove a key from an internal page, add `leaf_remove` to remove a record from a leaf page.
+  - [ ] Add `internal_remove` method to remove a key from an internal page
+  - [ ] Add `leaf_remove` to remove a record from a leaf page
   - [ ] Move common test helpers into a test_support.rs module. Build some more helpers to remove redundancy inside tests.
 
 ### Phase 0 — Types
@@ -55,6 +56,27 @@ QUICKCHECK_TESTS=10000 cargo test
 - The fundamental unit of storage `Page` holds core metadata like `page_id: PageId` and `Lsn` (not currently used, but will be important for WAL implementation), as well as a `PageBody` that is either a `Leaf` or `Internal`.
   - `Internal` page bodies hold a list of keys and child `PageId`s. There should always be 1 more child than keys. This is enforced through `debug_assert!`s for operations on `Page`s and `PageError::CorruptData` for deserialization.
   - `Leaf` page bodies hold a list of `Rows` and sibling pointers (`next: Option<PageId>`, `prev: Option<PageId>`) to allow quicker sequential scans.
+```
+#[derive(Debug, PartialEq, Clone)]
+pub struct Page {
+    page_id: PageId,
+    last_update: PageLsn,
+    body: PageBody,
+}
+
+#[derive(Debug, PartialEq, Clone)]
+pub enum PageBody {
+    Leaf {
+        records: Vec<Row>,
+        next: Option<PageId>,
+        prev: Option<PageId>,
+    },
+    Internal {
+        keys: Vec<Key>,
+        children: Vec<PageId>,
+    },
+}
+```
 - All numerical encoding is in Big Endian order.
 - Byte manipulation lives in exactly one place: the serialize/deserialize pair. Everything above that boundary works with typed data, not raw `&mut [u8]` — this is what makes the offset/node-type-confusion bug class from cstack_db structurally impossible here.
 - One major shortcoming at this juncture is the need to read in the full 4KB page off disk and deserialize into this in-memory representation for any page modifications.
