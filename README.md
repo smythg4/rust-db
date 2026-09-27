@@ -4,6 +4,8 @@ A learning project focused on learning more about databases.
 ### Current Status
 Wrapping up phase 1 with an easy to manipulate page structure. Right now the design leads me to read a 4KB chunk of memory, parse it into an in-memory version, perform all `Page` operations on that (`insert`, `split_page`, etc), then it can be serialized back into a `RawPage` of bytes to be flushed back to disk. This will cost a full 4KB read and parse any time a we page something into and out of the `BufferPoolManager`. It's a reasonable cost to pay for now to ensure correctness.
 
+Once done with phase 1, I need to decide if I want the `BufferPoolManager` to be `async` from the get-go. I'm thinking yes because I'd hate to have retrofit everything back after building up a `BTree`. This is where `Go` would be a little nicer...
+
 #### Testing
 Recent work has been primarily focused on good property based tests with the `quickcheck` crate. I was able to implement `Arbitrary` for all my base types and put operations through the wringer.
   - I'm particularly proud of the ability to generate an arbitrary valid `Page`, serialize it, mutate random bytes within, then reserialize to make sure it never panics, but returns a proper error instead.
@@ -40,19 +42,22 @@ QUICKCHECK_TESTS=10000 cargo test
   - [x] Move common test helpers into a test_support.rs module. Build some more helpers to remove redundancy inside tests.
   - [x] Add `internal_remove` method to remove a key from an internal page. Returns (`Key`, `PageId`) for separator `Key` and child `PageId`
   - [x] Add `leaf_remove` to remove a record from a leaf page. Returns `Row` removed.
-  - [ ] Add `internal_borrow` and `leaf_borrow` to move a single entry from one page to another. Should return a new separator `Key` to insert into the parent. Will need both `left` and `right` varieties and needs a `Key` from the parent `Page` to insert into one of the `Page`s.
-    - [ ] `leaf_borrow` needs to make sure the `other` `Page` is the proper neighbor.
-    - [ ] Both `borrow`s needs to check that the donor `Page` isn't empty and that the new entries actually fits in the current `Page`
+  - [x] Add `internal_borrow` and `leaf_borrow` to move a single entry from one page to another. Should return a new separator `Key` to insert into the parent. Will need both `left` and `right` varieties and needs a `Key` from the parent `Page` to insert into one of the `Page`s for `internal` variants.
+    - [x] `leaf_borrow` needs to make sure the `other` `Page` is the proper neighbor.
+    - [x] Both `borrow`s needs to check that the donor `Page` isn't empty and that the new entries actually fits in the current `Page`
   - [ ] Add tests for `internal_remove`, `leaf_remove`, `internal_borrow`, and `leaf_borrow`.
     - [x] `remove` returns `Ok(None)` for non-existent entries or `Key` not in range.
     - [x] `remove` returns `Err(NotLeaf)` or `Err(NotInternal)` if the `Page` type is wrong.
     - [x] `remove` followed by `insert` from the return results in the same `Page`
     - [x] Confirm proper `find_child` routing after a `Key` removal.
-    - [ ] `borrow` returns error on empty `Pages`
-    - [ ] `borrow` returns the correct `Key` to insert in the parent `Page`
+    - [ ] `borrow` returns error on empty `Pages` (currently leaves only)
+    - [ ] `borrow` returns `Err(NotLeaf)` or `Err(NotInternal)` if the `Page` type is wrong (currently leaves only)
+    - [x] `borrow` returns the correct `Key` to insert in the parent `Page`
     - [x] `borrow` then `borrow_back` results in the original same `Page`
     - [ ] `borrow` results in no loss between the two `Page`s (just like `no_loss_on_split`)
     - [ ] Every failed `borrow` leaves both `Page`s unchanged.
+  - [x] Check for overlapping `SlotEntries` on deserialize
+  - [x] Write a `check_invariants` method ala SQLite that's called as a `debug_assert` on all `Page` modifications.
 
 
 ### Phase 0 — Types
@@ -160,6 +165,7 @@ pub enum PageBody {
   `None` on a cache miss instead of loading from disk.
 - `DiskManager` layer will contain methods like `read_page(id: PageId)` and `write_page(raw: &RawPage)`.
   - File listing could be a map with `TableId` -> `Path` and `PageId` -> `offset`.
+- `ReadGuard`s will need to implement `Deref` and `WriteGuard`s will need to implement `Deref` and `DerefMut` for `Page` so I can use them with `Page` operations.
 
 ```
 struct BufferPoolManager<Dm: DiskManager> {
