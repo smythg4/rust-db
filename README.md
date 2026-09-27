@@ -47,10 +47,10 @@ QUICKCHECK_TESTS=10000 cargo test
     - [x] `remove` returns `Ok(None)` for non-existent entries or `Key` not in range.
     - [x] `remove` returns `Err(NotLeaf)` or `Err(NotInternal)` if the `Page` type is wrong.
     - [x] `remove` followed by `insert` from the return results in the same `Page`
-    - [ ] Confirm proper `find_child` routing after a `Key` removal.
+    - [x] Confirm proper `find_child` routing after a `Key` removal.
     - [ ] `borrow` returns error on empty `Pages`
     - [ ] `borrow` returns the correct `Key` to insert in the parent `Page`
-    - [ ] `borrow` then `borrow_back` results in the original same `Page`
+    - [x] `borrow` then `borrow_back` results in the original same `Page`
     - [ ] `borrow` results in no loss between the two `Page`s (just like `no_loss_on_split`)
     - [ ] Every failed `borrow` leaves both `Page`s unchanged.
 

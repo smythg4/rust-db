@@ -1,10 +1,13 @@
 use crate::commontypes::{
     Key, KeyError, LsnError, PAGE_ID_SIZE, PageId, PageLsn, SLOT_ENTRY_SIZE, SlotEntry,
 };
+use crate::page::BorrowFailReason::PointerMismatch;
 use crate::schema::{Row, RowValue, RowValueError, ValidatedRow};
 use crate::traits::Serializable;
 use crc32_light::Crc32Stream;
+use std::cmp::Ordering;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
+use std::iter::Iterator;
 use std::ops::Range;
 use thiserror::Error;
 
@@ -55,8 +58,19 @@ pub enum PageError {
     },
     #[error("Merge Invalid: {0}")]
     InvalidMerge(MergeFailReason),
+    #[error("Borrow Invalid: {0}")]
+    InvalidBorrow(BorrowFailReason),
 }
 
+#[derive(Error, Debug, Clone, PartialEq)]
+pub enum BorrowFailReason {
+    #[error("Attempt to borrow from empty page: {0}")]
+    EmptyBorrow(PageId),
+    #[error("Inserting Key outside page bounds: {0:?}")]
+    KeysOutOfOrder(Key),
+    #[error("Right neighbor is {0:?} but provided {1:?}")]
+    PointerMismatch(Option<PageId>, Option<PageId>),
+}
 #[derive(Error, Debug, Clone, PartialEq)]
 pub enum MergeFailReason {
     #[error("Unable to merge Leaf pages with Internal pages")]
@@ -585,6 +599,154 @@ impl Page {
         }
     }
 
+    /// Accepts a row from the right leaf neighbor. Returns the promoted Key to replace in the parent on success
+    pub fn leaf_borrow_from_right(&mut self, right_page: &mut Page) -> Result<Key, PageError> {
+        if matches!(self.body, PageBody::Internal { .. })
+            || matches!(right_page.body, PageBody::Internal { .. })
+        {
+            return Err(PageError::NotLeaf);
+        }
+
+        // make sure the right page is actually THIS page's right page
+        let right_page_id = right_page.page_id;
+        match self.next()? {
+            Some(np) if np == right_page_id => {}
+            other => {
+                return Err(PageError::InvalidBorrow(PointerMismatch(
+                    other,
+                    Some(right_page_id),
+                )));
+            }
+        };
+
+        // make sure there's a record to borrow from the right page.
+        let Some(borrow_rec) = right_page.records().unwrap().next() else {
+            return Err(PageError::InvalidBorrow(BorrowFailReason::EmptyBorrow(
+                right_page.page_id,
+            )));
+        };
+
+        let borrowed_key =
+            Key::try_from(&borrow_rec.fields[0]).expect("stored row has a valid key");
+
+        // make sure this key is greater than all this page's current keys
+        if self
+            .records()
+            .unwrap()
+            .last()
+            .is_some_and(|r| r.cmp_key(&borrowed_key) != Ordering::Less)
+        {
+            return Err(PageError::InvalidBorrow(BorrowFailReason::KeysOutOfOrder(
+                borrowed_key.clone(),
+            )));
+        }
+
+        // need some spare rows to leave the right neighbor alive and parent pointers valid
+        if right_page.records().is_some_and(|recs| recs.count() < 2) {
+            return Err(PageError::InvalidBorrow(BorrowFailReason::EmptyBorrow(
+                right_page.page_id,
+            )));
+        }
+
+        // make sure there's space in this page to put it
+        if self
+            .free_space()
+            .is_none_or(|fs| fs < Page::leaf_entry_size(borrow_rec))
+        {
+            return Err(PageError::PageFull);
+        }
+
+        // now we're ready to actually take the record!
+        let PageBody::Leaf { records, .. } = &mut right_page.body else {
+            unreachable!()
+        };
+        let stolen_record = records.remove(0);
+
+        // we checked that there were at least two records in the right_page
+        let promoted_key = Key::try_from(&records.first().unwrap().fields[0]).unwrap();
+
+        let PageBody::Leaf { records, .. } = &mut self.body else {
+            unreachable!()
+        };
+        records.push(stolen_record);
+
+        Ok(promoted_key)
+    }
+
+    /// Accepts a row from the left leaf neighbor. Returns the promoted Key to replace in the parent on success
+    pub fn leaf_borrow_from_left(&mut self, left_page: &mut Page) -> Result<Key, PageError> {
+        if matches!(self.body, PageBody::Internal { .. })
+            || matches!(left_page.body, PageBody::Internal { .. })
+        {
+            return Err(PageError::NotLeaf);
+        }
+
+        // make sure the left page is actually THIS page's left page
+        let left_page_id = left_page.page_id;
+        match self.prev()? {
+            Some(pp) if pp == left_page_id => {}
+            other => {
+                return Err(PageError::InvalidBorrow(PointerMismatch(
+                    Some(left_page_id),
+                    other,
+                )));
+            }
+        };
+
+        // make sure there's a record to borrow from the left page.
+        let Some(borrow_rec) = left_page.records().unwrap().last() else {
+            return Err(PageError::InvalidBorrow(BorrowFailReason::EmptyBorrow(
+                left_page.page_id,
+            )));
+        };
+
+        let borrowed_key =
+            Key::try_from(&borrow_rec.fields[0]).expect("stored row has a valid key");
+
+        // make sure this key is less than all this page's current keys
+        if self
+            .records()
+            .unwrap()
+            .next()
+            .is_some_and(|r| r.cmp_key(&borrowed_key) != Ordering::Greater)
+        {
+            return Err(PageError::InvalidBorrow(BorrowFailReason::KeysOutOfOrder(
+                borrowed_key.clone(),
+            )));
+        }
+
+        // need some spare rows to leave the left neighbor alive and parent pointers valid
+        if left_page.records().is_some_and(|recs| recs.count() < 2) {
+            return Err(PageError::InvalidBorrow(BorrowFailReason::EmptyBorrow(
+                left_page.page_id,
+            )));
+        }
+
+        // make sure there's space in this page to put it
+        if self
+            .free_space()
+            .is_none_or(|fs| fs < Page::leaf_entry_size(borrow_rec))
+        {
+            return Err(PageError::PageFull);
+        }
+
+        // now we're ready to actually take the record!
+        let PageBody::Leaf { records, .. } = &mut left_page.body else {
+            unreachable!()
+        };
+        let stolen_record = records.pop().expect("left page has entries");
+
+        // in this case we use the borrowed_key as the promoted separator key
+        let promoted_key = borrowed_key.clone();
+
+        let PageBody::Leaf { records, .. } = &mut self.body else {
+            unreachable!()
+        };
+        records.insert(0, stolen_record);
+
+        Ok(promoted_key)
+    }
+
     fn entries_size(&self) -> usize {
         match &self.body {
             PageBody::Internal { keys, .. } => {
@@ -596,23 +758,26 @@ impl Page {
         }
     }
 
-    pub fn records(&self) -> Option<&[Row]> {
+    // Note: changed these helps to return iterators.
+    // Reasoning: these can be a part of the `Page` trait and when I shift to raw byte pages
+    // these methods can return a `RecordIter` for example that lazily walk the slots in the page.
+    pub fn records(&self) -> Option<impl Iterator<Item = &Row>> {
         match &self.body {
-            PageBody::Leaf { records, .. } => Some(records),
+            PageBody::Leaf { records, .. } => Some(records.iter()),
             _ => None,
         }
     }
 
-    pub fn keys(&self) -> Option<&[Key]> {
+    pub fn keys(&self) -> Option<impl Iterator<Item = &Key>> {
         match &self.body {
-            PageBody::Internal { keys, .. } => Some(keys),
+            PageBody::Internal { keys, .. } => Some(keys.iter()),
             _ => None,
         }
     }
 
-    pub fn children(&self) -> Option<&[PageId]> {
+    pub fn children(&self) -> Option<impl Iterator<Item = &PageId>> {
         match &self.body {
-            PageBody::Internal { children, .. } => Some(children),
+            PageBody::Internal { children, .. } => Some(children.iter()),
             _ => None,
         }
     }
@@ -1210,7 +1375,7 @@ mod tests {
         };
 
         let mut page = fill_leaf(child(1), payload_sizes);
-        let count = page.records().unwrap().len() as i64;
+        let count = page.records().unwrap().count() as i64;
         let new_id = page.page_id.wrapping_add(1);
 
         // split the page! (the new one will have a duplicate page id, but that's fine for the test)
@@ -1313,12 +1478,18 @@ mod tests {
         }
 
         let expected_keys: Vec<Key> = expected.keys().cloned().collect();
-        assert_eq!(page.keys().unwrap(), expected_keys.as_slice());
+        assert_eq!(
+            page.keys().unwrap().cloned().collect::<Vec<_>>(),
+            expected_keys
+        );
         // children: the untouched leftmost child, then each key's right child in key order
         let expected_children: Vec<PageId> = std::iter::once(leftmost)
             .chain(expected.values().copied())
             .collect();
-        assert_eq!(page.children().unwrap(), expected_children.as_slice());
+        assert_eq!(
+            page.children().unwrap().cloned().collect::<Vec<_>>(),
+            expected_children
+        );
 
         TestResult::passed()
     }
@@ -1351,7 +1522,7 @@ mod tests {
                 expected.insert(key, row.clone());
             }
         }
-        let actual_records = page.records().unwrap();
+        let actual_records: Vec<Row> = page.records().unwrap().cloned().collect();
         let expected_records: Vec<Row> = expected.into_values().collect();
         assert_eq!(expected_records, actual_records);
         TestResult::passed()
@@ -1379,7 +1550,7 @@ mod tests {
             PageBody::Internal { keys, .. } => {
                 assert!(!keys.is_empty());
                 assert!(keys.iter().all(|k| k < &split_key));
-                let new_keys = new_page.keys().unwrap();
+                let new_keys: Vec<Key> = new_page.keys().unwrap().cloned().collect();
                 assert!(!new_keys.is_empty());
                 assert!(new_keys.iter().all(|k| k > &split_key));
             }
@@ -1390,7 +1561,7 @@ mod tests {
                         .iter()
                         .all(|r| r.cmp_key(&split_key) == Ordering::Less)
                 );
-                let new_records = new_page.records().unwrap();
+                let new_records: Vec<Row> = new_page.records().unwrap().cloned().collect();
                 assert!(!new_records.is_empty());
                 assert!(
                     new_records
@@ -1461,8 +1632,8 @@ mod tests {
                 keys: new_keys,
                 children: new_children,
             } => {
-                let old_keys = page.keys().unwrap().to_vec();
-                let old_children = page.children().unwrap().to_vec();
+                let old_keys: Vec<Key> = page.keys().unwrap().cloned().collect();
+                let old_children: Vec<PageId> = page.children().unwrap().cloned().collect();
                 let combined_keys: Vec<Key> =
                     old_keys.into_iter().chain(new_keys.into_iter()).collect();
                 let combined_children: Vec<PageId> = old_children
@@ -1727,9 +1898,9 @@ mod tests {
 
     /// Linear scan to find appropriate child entry. First index where separator <= key
     fn expected_child(page: &Page, key: &Key) -> PageId {
-        let keys = page.keys().unwrap();
+        let keys: Vec<_> = page.keys().unwrap().cloned().collect();
         let idx = keys.iter().filter(|k| *k <= key).count();
-        page.children().unwrap()[idx]
+        page.children().unwrap().nth(idx).copied().unwrap()
     }
 
     #[quickcheck]
@@ -1749,8 +1920,8 @@ mod tests {
 
     #[quickcheck]
     fn find_child_boundaries(InternalPage(page): InternalPage) -> TestResult {
-        let keys = page.keys().unwrap();
-        let children = page.children().unwrap();
+        let keys: Vec<Key> = page.keys().unwrap().cloned().collect();
+        let children: Vec<PageId> = page.children().unwrap().cloned().collect();
 
         // check that we have at least one key
         let (Some(first), Some(last)) = (keys.first(), keys.last()) else {
@@ -1800,12 +1971,12 @@ mod tests {
 
     #[quickcheck]
     fn remove_then_insert_leaf_stays_same(LeafPage(mut page): LeafPage, target: u8) -> TestResult {
-        if page.records().unwrap().is_empty() {
+        if page.records().unwrap().next().is_none() {
             return TestResult::discard();
         }
         let snapshot = page.clone();
-        let target = target as usize % page.records().unwrap().len();
-        let target_row = page.records().unwrap().get(target).cloned().unwrap();
+        let target = target as usize % page.records().unwrap().count();
+        let target_row = page.records().unwrap().nth(target).cloned().unwrap();
         let target_key = Key::try_from(&target_row.fields[0]).unwrap();
 
         // remove the target key
@@ -1847,14 +2018,14 @@ mod tests {
         InternalPage(mut page): InternalPage,
         target: u8,
     ) -> TestResult {
-        if page.keys().unwrap().is_empty() || page.children().unwrap().is_empty() {
+        if page.keys().unwrap().next().is_none() || page.children().unwrap().next().is_none() {
             return TestResult::discard();
         }
         let snapshot = page.clone();
 
-        let target = target as usize % page.keys().unwrap().len();
-        let target_key = page.keys().unwrap().get(target).cloned().unwrap();
-        let target_child = page.children().unwrap().get(target + 1).cloned().unwrap();
+        let target = target as usize % page.keys().unwrap().count();
+        let target_key = page.keys().unwrap().nth(target).cloned().unwrap();
+        let target_child = page.children().unwrap().nth(target + 1).cloned().unwrap();
 
         // try to remove the key
         let (returned_key, returned_child) = page
@@ -1893,13 +2064,13 @@ mod tests {
         LeafPage(mut page): LeafPage,
         target: u8,
     ) -> TestResult {
-        if page.records().unwrap().is_empty() {
+        if page.records().unwrap().next().is_none() {
             return TestResult::discard();
         }
 
         // find a key in the page
-        let target = target as usize % page.records().unwrap().len();
-        let target_row = page.records().unwrap().get(target).cloned().unwrap();
+        let target = target as usize % page.records().unwrap().count();
+        let target_row = page.records().unwrap().nth(target).cloned().unwrap();
         let target_key = ValidatedRow::from_row(target_row).primary_key();
 
         // remove it
@@ -1939,13 +2110,13 @@ mod tests {
         InternalPage(mut page): InternalPage,
         target: u8,
     ) -> TestResult {
-        if page.keys().unwrap().is_empty() {
+        if page.keys().unwrap().next().is_none() {
             return TestResult::discard();
         }
 
         // find a key in the page
-        let target = target as usize % page.keys().unwrap().len();
-        let target_key = page.keys().unwrap().get(target).cloned().unwrap();
+        let target = target as usize % page.keys().unwrap().count();
+        let target_key = page.keys().unwrap().nth(target).cloned().unwrap();
 
         // remove it
         page.internal_remove(&target_key)
@@ -1983,9 +2154,9 @@ mod tests {
         LeafPage(mut leaf): LeafPage,
         InternalPage(mut internal): InternalPage,
     ) -> TestResult {
-        let internal_key = internal.keys().unwrap().first().cloned().unwrap();
+        let internal_key = internal.keys().unwrap().next().cloned().unwrap();
         let leaf_key =
-            ValidatedRow::from_row(leaf.records().unwrap().first().cloned().unwrap()).primary_key();
+            ValidatedRow::from_row(leaf.records().unwrap().next().cloned().unwrap()).primary_key();
 
         let res1 = internal.leaf_remove(&internal_key);
         let res2 = leaf.internal_remove(&leaf_key);
@@ -2002,8 +2173,8 @@ mod tests {
         target: u8,
         probes: Vec<Key>,
     ) -> TestResult {
-        let old_keys = page.keys().unwrap().to_vec();
-        let old_children = page.children().unwrap().to_vec();
+        let old_keys: Vec<Key> = page.keys().unwrap().cloned().collect();
+        let old_children: Vec<PageId> = page.children().unwrap().cloned().collect();
         if old_keys.is_empty() {
             return TestResult::discard();
         }
@@ -2034,6 +2205,39 @@ mod tests {
                 "routing {probe:?} after removing keys[{i}]"
             );
         }
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn borrow_and_borrow_back_leaf_remains_same(LeafPage(mut left): LeafPage) -> TestResult {
+        let left_page_id = left.page_id;
+        let Some((separator, mut right)) = try_split(&mut left, left_page_id.wrapping_add(1))
+        else {
+            return TestResult::discard();
+        };
+        let (left_before, right_before) = (left.clone(), right.clone());
+
+        // borrow the right page's first row into the left page
+        let key1 = match left.leaf_borrow_from_right(&mut right) {
+            Ok(k) => k,
+            Err(PageError::PageFull | PageError::InvalidBorrow(_)) => return TestResult::discard(),
+            Err(e) => panic!("unexpected borrow error: {e:?}"),
+        };
+        // the new separator is the right page's new first key
+        let right_first = right.records().unwrap().next().unwrap();
+        assert_eq!(right_first.cmp_key(&key1), Ordering::Equal);
+
+        // borrow it straight back
+        let key2 = right
+            .leaf_borrow_from_left(&mut left)
+            .expect("borrow back must succeed");
+        assert_eq!(
+            key2, separator,
+            "borrow-back must restore the original separator"
+        );
+
+        assert_unchanged(&left_before, &left);
+        assert_unchanged(&right_before, &right);
         TestResult::passed()
     }
 }
