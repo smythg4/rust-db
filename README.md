@@ -51,13 +51,19 @@ QUICKCHECK_TESTS=10000 cargo test
     - [x] `remove` followed by `insert` from the return results in the same `Page`
     - [x] Confirm proper `find_child` routing after a `Key` removal.
     - [ ] `borrow` returns error on empty `Pages` (currently leaves only)
-    - [ ] `borrow` returns `Err(NotLeaf)` or `Err(NotInternal)` if the `Page` type is wrong (currently leaves only)
+    - [x] `borrow` returns `Err(NotLeaf)` or `Err(NotInternal)` if the `Page` type is wrong (currently leaves only)
     - [x] `borrow` returns the correct `Key` to insert in the parent `Page`
     - [x] `borrow` then `borrow_back` results in the original same `Page`
     - [ ] `borrow` results in no loss between the two `Page`s (just like `no_loss_on_split`)
     - [ ] Every failed `borrow` leaves both `Page`s unchanged.
   - [x] Check for overlapping `SlotEntries` on deserialize
   - [x] Write a `check_invariants` method ala SQLite that's called as a `debug_assert` on all `Page` modifications.
+  - [ ] Write `internal_replace_key(&mut self, old_key: &Key, new_key: Key)` for parents to use after a borrow, keeping children in place.
+  - [x] Write `leaf_get(&self, key: &Key) -> Result<Option<&Row>, PageError>`
+  - [ ] Write `leaf_records_scan(&self, start_key: &Key, end_key: &Key) -> impl Iterator<Item = &Row>` that begins at the first row >= `start_key` and fetches records until row >= `end_key`.
+  - [ ] Add a `PageBody::Meta` variant for meta data (table's page 0). Should include: `root_id`, `page_count`, and `free_list`. Need a new type tag too.
+  - [ ] Add a `PageBody::Free` variant to mark pages as free and available for repurposing. Need a new type tag too.
+  - [x] Add a `can_insert_separator(&self, key: &Key) -> bool` for internal pages to do the same duty as `can_insert` for leaf pages.
 
 
 ### Phase 0 — Types

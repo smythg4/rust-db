@@ -1,6 +1,6 @@
 use crate::commontypes::{Key, PageId, TableId};
 use crate::page::{MAX_INTERNAL_ENTRY_SIZE, MAX_LEAF_ENTRY_SIZE, Page, PageBody, PageError};
-use crate::schema::{Column, ColumnType, Row, RowValue, Schema, ValidatedRow};
+use crate::schema::{Column, ColumnType, MAX_NUM_FIELDS, Row, RowValue, Schema, ValidatedRow};
 use crate::traits::Serializable;
 use quickcheck::{Arbitrary, Gen};
 use std::io::Cursor;
@@ -21,14 +21,19 @@ macro_rules! assert_matches {
   }
 pub(crate) use assert_matches;
 
+/// A length in `0..=max`, scaled by quickcheck's size parameter (`QUICKCHECK_GENERATOR_SIZE`,
+/// default 100) so every generator grows and shrinks together.
+pub(crate) fn gen_len(g: &mut Gen, max: usize) -> usize {
+    usize::arbitrary(g) % (max.min(g.size()) + 1)
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct SchemaWithRows(pub(crate) Schema, pub(crate) Vec<Row>);
 
 impl Arbitrary for SchemaWithRows {
     fn arbitrary(g: &mut Gen) -> Self {
         let schema = Schema::arbitrary(g);
-        let n = usize::arbitrary(g) % 25;
-        let rows: Vec<Row> = (0..n)
+        let rows: Vec<Row> = (0..gen_len(g, MAX_NUM_FIELDS - 1) % 25)
             .map(|_| valid_row_from_schema(&schema, g).into())
             .collect();
         SchemaWithRows(schema, rows)
@@ -71,7 +76,11 @@ pub(crate) fn padded_key(index: usize, total_len: usize) -> Key {
 
 /// Two-column schema (integer key + string payload) and the largest payload that still validates.
 pub(crate) fn leaf_schema() -> (Schema, usize) {
-    let schema = Schema::try_from(vec![Column::integer(), Column::string()]).unwrap();
+    let schema = Schema::try_from(vec![
+        Column::integer("int column".into()),
+        Column::string("string column".into()),
+    ])
+    .unwrap();
     let row_with = |key: i64, len: usize| Row {
         fields: vec![RowValue::Integer(key), RowValue::String("p".repeat(len))],
     };

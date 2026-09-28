@@ -1,21 +1,29 @@
 use crate::commontypes::{
-    Key, KeyError, LsnError, PAGE_ID_SIZE, PageId, PageLsn, SLOT_ENTRY_SIZE, SlotEntry,
+    Key, KeyError, Lsn, LsnError, PAGE_ID_SIZE, PageId, PageLsn, SLOT_ENTRY_SIZE, SlotEntry,
 };
-use crate::page::BorrowFailReason::PointerMismatch;
-use crate::schema::{Row, RowValue, RowValueError, ValidatedRow};
+
+use crate::schema::{Row, RowValue, RowValueError, SchemaError, ValidatedRow};
 use crate::traits::Serializable;
 use crc32_light::Crc32Stream;
 use std::cmp::Ordering;
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
-use std::iter::Iterator;
 use std::ops::Range;
 use thiserror::Error;
 
+/// The page size for the entire application
 pub const PAGE_SIZE: usize = 4096;
+
+/// Tag codes for page serialization
 pub const LEAF_TAG: u8 = 1;
 pub const INTERNAL_TAG: u8 = 2;
+pub const META_TAG: u8 = 3;
+pub const FREE_TAG: u8 = 4;
+
+/// Largest possible encoding of headers for pages
 pub const MAX_LEAF_HEADER_SIZE: usize = 41;
 pub const MAX_INTERNAL_HEADER_SIZE: usize = 23;
+
+/// The offset where the checksum value lives (it's a u32, so 4 bytes long)
 pub const CHECKSUM_OFFSET: usize = 17;
 
 /// The maximum size for an entry into a leaf, decided to ensure that upon a Page split
@@ -34,6 +42,20 @@ const MIN_ROW_ENCODED_SIZE: usize = 1 + MIN_KEY_ENCODED_SIZE;
 /// Leaf header with both sibling pointers `None`.
 const MIN_LEAF_HEADER_SIZE: usize = MAX_LEAF_HEADER_SIZE - 2 * PAGE_ID_SIZE;
 
+/// Useable space available in a `Page` for data storage
+const LEAF_USABLE: usize = PAGE_SIZE - MAX_LEAF_HEADER_SIZE;
+const INTERNAL_USABLE: usize = PAGE_SIZE - MAX_INTERNAL_HEADER_SIZE - PAGE_ID_SIZE;
+
+/// A leaf is underfull below this many bytes of entries: two such leaves always fit in one.
+pub const LEAF_UNDERFULL_BYTES: usize = LEAF_USABLE / 2;
+/// An internal page is underfull below this many bytes of entries: two such pages
+/// plus the largest possible separator always fit in one.
+pub const INTERNAL_UNDERFULL_BYTES: usize = (INTERNAL_USABLE - MAX_INTERNAL_ENTRY_SIZE) / 2;
+
+/// Assertions make sure that `.is_underfull` will always allow merging of another underfull `Page`
+const _: () = assert!(2 * LEAF_UNDERFULL_BYTES <= LEAF_USABLE);
+const _: () = assert!(2 * INTERNAL_UNDERFULL_BYTES + MAX_INTERNAL_ENTRY_SIZE <= INTERNAL_USABLE);
+
 /// Upper bound on records in a leaf: every entry at its smallest possible size.
 pub const MAX_LEAF_ITEMS: usize =
     (PAGE_SIZE - MIN_LEAF_HEADER_SIZE) / (SLOT_ENTRY_SIZE + MIN_ROW_ENCODED_SIZE);
@@ -43,6 +65,7 @@ pub const MAX_LEAF_ITEMS: usize =
 pub const MAX_INTERNAL_ITEMS: usize = (PAGE_SIZE - MAX_INTERNAL_HEADER_SIZE - PAGE_ID_SIZE)
     / (SLOT_ENTRY_SIZE + PAGE_ID_SIZE + MIN_KEY_ENCODED_SIZE);
 
+/// Assertions make sure that constants governing component limits can never exceed the declared PAGE_SIZE
 const _: () = assert!(MIN_LEAF_HEADER_SIZE + MAX_LEAF_ITEMS * SLOT_ENTRY_SIZE <= PAGE_SIZE);
 const _: () = assert!(
     MAX_INTERNAL_HEADER_SIZE
@@ -61,8 +84,8 @@ pub enum PageError {
     Value(#[from] RowValueError),
     #[error(transparent)]
     Key(#[from] KeyError),
-    #[error("Page got overfull before serialization")]
-    PageOverFlow,
+    #[error(transparent)]
+    Schema(#[from] SchemaError),
     #[error("Page too small to split: {0}")]
     TooSmallToSplit(PageId),
     #[error("Page too full to fit row -- need to split")]
@@ -84,6 +107,8 @@ pub enum PageError {
     InvalidMerge(MergeFailReason),
     #[error("Borrow Invalid: {0}")]
     InvalidBorrow(BorrowFailReason),
+    #[error("Stale Lsn. Old {old}, New {new}")]
+    StaleLsnUpdate { old: Lsn, new: Lsn },
 }
 
 #[derive(Error, Debug, Clone, PartialEq)]
@@ -92,15 +117,22 @@ pub enum BorrowFailReason {
     EmptyBorrow(PageId),
     #[error("Inserting Key outside page bounds: {0:?}")]
     KeysOutOfOrder(Key),
-    #[error("Right neighbor is {0:?} but provided {1:?}")]
-    PointerMismatch(Option<PageId>, Option<PageId>),
+    #[error("Requested Neighbor is {expected:?} but got {got:?}")]
+    PointerMismatch {
+        expected: Option<PageId>,
+        got: Option<PageId>,
+    },
 }
+
 #[derive(Error, Debug, Clone, PartialEq)]
 pub enum MergeFailReason {
     #[error("Unable to merge Leaf pages with Internal pages")]
     MismatchMerge,
-    #[error("Right neighbor is {0:?} but provided {1:?}")]
-    PointerMismatch(Option<PageId>, Option<PageId>),
+    #[error("Right neighbor is {expected:?} but got {got:?}")]
+    PointerMismatch {
+        expected: Option<PageId>,
+        got: Option<PageId>,
+    },
     #[error("Keys aren't sorted or duplicate key found")]
     Keys,
 }
@@ -120,6 +152,8 @@ pub enum CorruptionKind {
     OverlappingSlots { first: usize, second: usize },
     TrailingBytes { slot: usize },
     TooManyItems(usize),
+    RowTooLarge { slot: usize },
+    KeyTooLarge { slot: usize },
 }
 
 pub type RawPage = [u8; PAGE_SIZE];
@@ -142,9 +176,36 @@ pub enum PageBody {
         keys: Vec<Key>,
         children: Vec<PageId>,
     },
+    Meta {
+        root_id: PageId,
+        page_count: u32,
+        free_list: Vec<PageId>,
+    },
+    Free {
+        next: Option<PageId>, // pointer to the next free page
+    },
 }
 
 impl Page {
+    pub fn page_id(&self) -> PageId {
+        self.page_id
+    }
+
+    pub fn lsn(&self) -> Option<Lsn> {
+        self.last_update.0
+    }
+
+    pub fn set_lsn(&mut self, new_lsn: Lsn) -> Result<(), PageError> {
+        if self.last_update.0.is_some_and(|l| l > new_lsn) {
+            return Err(PageError::StaleLsnUpdate {
+                old: self.last_update.0.unwrap(),
+                new: new_lsn,
+            });
+        }
+        self.last_update.0 = Some(new_lsn);
+        Ok(())
+    }
+
     pub fn empty_leaf(page_id: PageId) -> Self {
         let body = PageBody::Leaf {
             records: Vec::new(),
@@ -152,6 +213,22 @@ impl Page {
             prev: None,
         };
         Self::empty_page(page_id, body)
+    }
+
+    pub fn is_leaf(&self) -> bool {
+        matches!(self.body, PageBody::Leaf { .. })
+    }
+
+    pub fn is_internal(&self) -> bool {
+        matches!(self.body, PageBody::Internal { .. })
+    }
+
+    pub fn is_meta(&self) -> bool {
+        matches!(self.body, PageBody::Meta { .. })
+    }
+
+    pub fn is_free(&self) -> bool {
+        matches!(self.body, PageBody::Free { .. })
     }
 
     pub(crate) fn empty_page(page_id: PageId, body: PageBody) -> Self {
@@ -162,8 +239,8 @@ impl Page {
         }
     }
 
-    #[allow(dead_code)]
-    fn new_root(page_id: PageId, left: PageId, separator: Key, right: PageId) -> Self {
+    #[allow(dead_code)] // remove this once we have external callers
+    pub(crate) fn new_root(page_id: PageId, left: PageId, separator: Key, right: PageId) -> Self {
         let body = PageBody::Internal {
             keys: vec![separator],
             children: vec![left, right],
@@ -181,6 +258,8 @@ impl Page {
         match self.body {
             PageBody::Internal { .. } => INTERNAL_TAG,
             PageBody::Leaf { .. } => LEAF_TAG,
+            PageBody::Meta { .. } => META_TAG,
+            PageBody::Free { .. } => FREE_TAG,
         }
     }
 
@@ -189,6 +268,7 @@ impl Page {
         match &self.body {
             PageBody::Leaf { records, .. } => records.len(),
             PageBody::Internal { keys, .. } => keys.len(),
+            PageBody::Free { .. } | PageBody::Meta { .. } => 0,
         }
     }
 
@@ -199,6 +279,7 @@ impl Page {
         let header_len = match self.body {
             PageBody::Internal { .. } => MAX_INTERNAL_HEADER_SIZE,
             PageBody::Leaf { .. } => MAX_LEAF_HEADER_SIZE,
+            _ => todo!(),
         };
         let used_size = header_len
             + match &self.body {
@@ -209,6 +290,7 @@ impl Page {
                 PageBody::Leaf { records, .. } => {
                     records.iter().map(Self::leaf_entry_size).sum::<usize>()
                 }
+                _ => todo!(),
             };
         PAGE_SIZE.checked_sub(used_size)
     }
@@ -228,6 +310,7 @@ impl Page {
                 prev.serialize(writer)?;
             }
             PageBody::Internal { .. } => {}
+            _ => todo!(),
         };
 
         // note the number of items stored on the page
@@ -302,6 +385,7 @@ impl Page {
                 }
                 Ok((slot_offset, data_offset))
             }
+            _ => todo!(),
         }
     }
 
@@ -309,9 +393,10 @@ impl Page {
     /// Will error if write to internal `Cursor` fails or if the `Page` would overflow
     /// a `RawPage`.
     pub fn as_raw_page(&self) -> Result<RawPage, PageError> {
-        if self.free_space().is_none() {
-            return Err(PageError::PageOverFlow);
-        }
+        self.check_invariants().map_err(|kind| PageError::Corrupt {
+            page_id: Some(self.page_id),
+            kind,
+        })?;
         let mut cursor = Cursor::new([0u8; PAGE_SIZE]);
 
         self.write_header(&mut cursor)?;
@@ -339,21 +424,39 @@ impl Page {
     /// Returns `true` if `row` can fit in the `Page` without overflowing
     /// a `RawPage` when converted to raw bytes.
     pub fn can_insert(&self, row: &Row) -> bool {
+        if !self.is_leaf() {
+            return false;
+        }
         // immediately return `false` if the page is already overfull
         let free_space = match self.free_space() {
             None => return false,
             Some(s) => s,
         };
-        // new row will be encoded and a corresponding slot index is allocated, both
-        // parts need to fit
+        // new row will be encoded and a corresponding slot index is allocated, both parts need to fit
         Self::leaf_entry_size(row) <= free_space
     }
 
-    /// Returns `true` if the `Page` is underfull and should be merged with another
+    /// Returns `true` if `key` can fit in the `Page` without overflowing
+    /// a `RawPage` when converted to raw bytes.
+    pub fn can_insert_separator(&self, key: &Key) -> bool {
+        if !self.is_internal() {
+            return false;
+        }
+        // immediately return `false` if the page is already overfull
+        let free_space = match self.free_space() {
+            None => return false,
+            Some(s) => s,
+        };
+        // new key will be encoded, child index and a corresponding slot index is allocated, all parts need to fit
+        Self::internal_entry_size(key) <= free_space
+    }
+
+    /// Returns `true` if the `Page` is underfull and can be merged with any other underfull `Page`
     pub fn is_underfull(&self) -> bool {
-        match self.free_space() {
-            Some(fs) => fs > PAGE_SIZE / 2,
-            None => false,
+        match &self.body {
+            PageBody::Leaf { .. } => self.entries_size() < LEAF_UNDERFULL_BYTES,
+            PageBody::Internal { .. } => self.entries_size() < INTERNAL_UNDERFULL_BYTES,
+            _ => false,
         }
     }
 
@@ -365,6 +468,11 @@ impl Page {
         separator: Key,
         right_child: PageId,
     ) -> Result<(), PageError> {
+        if Self::internal_entry_size(&separator) > MAX_INTERNAL_ENTRY_SIZE {
+            return Err(PageError::Schema(SchemaError::KeyTooLong(
+                Self::internal_entry_size(&separator),
+            )));
+        }
         let can_insert = matches!(self.free_space(), Some(free_space) if free_space >= Self::internal_entry_size(&separator));
 
         let PageBody::Internal { keys, children } = &mut self.body else {
@@ -395,8 +503,7 @@ impl Page {
             return Err(PageError::NotLeaf);
         };
         let new_key = validated_row.primary_key();
-        let row: Row = validated_row.into();
-        let can_insert = self.can_insert(&row);
+        let can_insert = self.can_insert(validated_row.as_ref());
         let PageBody::Leaf { records, .. } = &mut self.body else {
             unreachable!();
         };
@@ -409,7 +516,7 @@ impl Page {
         if !can_insert {
             return Err(PageError::PageFull);
         }
-        records.insert(insert_pos, row);
+        records.insert(insert_pos, validated_row.into());
         self.debug_check_invariants("leaf_insert");
         Ok(())
     }
@@ -523,6 +630,7 @@ impl Page {
                 new_page.debug_check_invariants("split_leaf");
                 Ok((split_key, new_page))
             }
+            _ => unreachable!("Cannot split meta or free pages"),
         }
     }
 
@@ -565,10 +673,10 @@ impl Page {
                         // no need to check the right page since it's drained and now ready for re-issue
                         Ok(right_id)
                     }
-                    _ => Err(PageError::InvalidMerge(MergeFailReason::PointerMismatch(
-                        *next,
-                        Some(right_id),
-                    ))),
+                    _ => Err(PageError::InvalidMerge(MergeFailReason::PointerMismatch {
+                        expected: *next,
+                        got: Some(right_id),
+                    })),
                 }
             }
             _ => Err(PageError::InvalidMerge(MergeFailReason::MismatchMerge)),
@@ -638,10 +746,12 @@ impl Page {
         match self.next()? {
             Some(np) if np == right_page_id => {}
             other => {
-                return Err(PageError::InvalidBorrow(PointerMismatch(
-                    other,
-                    Some(right_page_id),
-                )));
+                return Err(PageError::InvalidBorrow(
+                    BorrowFailReason::PointerMismatch {
+                        expected: other,
+                        got: Some(right_page_id),
+                    },
+                ));
             }
         };
 
@@ -715,10 +825,12 @@ impl Page {
         match self.prev()? {
             Some(pp) if pp == left_page_id => {}
             other => {
-                return Err(PageError::InvalidBorrow(PointerMismatch(
-                    Some(left_page_id),
-                    other,
-                )));
+                return Err(PageError::InvalidBorrow(
+                    BorrowFailReason::PointerMismatch {
+                        expected: other,
+                        got: Some(left_page_id),
+                    },
+                ));
             }
         };
 
@@ -939,6 +1051,7 @@ impl Page {
             PageBody::Leaf { records, .. } => {
                 records.iter().map(Self::leaf_entry_size).sum::<usize>()
             }
+            _ => unreachable!("no entries on free or meta pages"),
         }
     }
 
@@ -1021,7 +1134,7 @@ impl Page {
     pub(crate) fn prev(&self) -> Result<Option<PageId>, PageError> {
         match self.body {
             PageBody::Leaf { prev, .. } => Ok(prev),
-            _ => Err(PageError::NotInternal),
+            _ => Err(PageError::NotLeaf),
         }
     }
 
@@ -1032,7 +1145,7 @@ impl Page {
                 *prev = new;
                 Ok(())
             }
-            _ => Err(PageError::NotInternal),
+            _ => Err(PageError::NotLeaf),
         }
     }
 
@@ -1108,12 +1221,19 @@ impl Page {
             PageBody::Leaf { records, .. } => {
                 let mut prev: Option<Key> = None;
                 for (i, record) in records.iter().enumerate() {
+                    if Self::leaf_entry_size(record) > MAX_LEAF_ENTRY_SIZE {
+                        return Err(CorruptionKind::RowTooLarge { slot: i });
+                    }
                     let first = record.fields.first().ok_or(CorruptionKind::MissingKey)?;
                     let key = Key::try_from(first)
                         .map_err(|_| CorruptionKind::InvalidKey(first.clone()))?;
+                    if Self::internal_entry_size(&key) > MAX_INTERNAL_ENTRY_SIZE {
+                        return Err(CorruptionKind::KeyTooLarge { slot: i });
+                    }
                     if prev.as_ref().is_some_and(|p| p >= &key) {
                         return Err(CorruptionKind::UnsortedKeys { at: i });
                     }
+
                     prev = Some(key);
                 }
             }
@@ -1124,10 +1244,17 @@ impl Page {
                         children: children.len(),
                     });
                 }
+                if let Some(slot) = keys
+                    .iter()
+                    .position(|k| Self::internal_entry_size(k) > MAX_INTERNAL_ENTRY_SIZE)
+                {
+                    return Err(CorruptionKind::KeyTooLarge { slot });
+                }
                 if let Some(i) = keys.windows(2).position(|w| w[0] >= w[1]) {
                     return Err(CorruptionKind::UnsortedKeys { at: i + 1 });
                 }
             }
+            _ => todo!(),
         }
         if self.free_space().is_none() {
             return Err(CorruptionKind::ExceedsCapacity);
@@ -1145,6 +1272,58 @@ impl Page {
         }
         #[cfg(not(debug_assertions))]
         let _ = op;
+    }
+
+    pub fn find_child(&self, search_key: &Key) -> Option<PageId> {
+        self.find_child_index(search_key).map(|(_, id)| id)
+    }
+
+    pub(crate) fn find_child_index(&self, search_key: &Key) -> Option<(ChildIndex, PageId)> {
+        let PageBody::Internal { keys, children } = &self.body else {
+            return None;
+        };
+        let i = match keys.binary_search(search_key) {
+            Ok(i) => i + 1, // equal to a separator: route right
+            Err(i) => i,    // between separators
+        };
+        Some((ChildIndex(i), children[i]))
+    }
+
+    #[allow(dead_code)] // I'll need it for BTrees
+    pub(crate) fn child_at(&self, idx: ChildIndex) -> Option<PageId> {
+        let PageBody::Internal { children, .. } = &self.body else {
+            return None;
+        };
+        children.get(idx.0).copied()
+    }
+
+    #[allow(dead_code)] // I'll need it for BTrees
+    pub(crate) fn key_at(&self, idx: KeyIndex) -> Option<&Key> {
+        let PageBody::Internal { keys, .. } = &self.body else {
+            return None;
+        };
+        keys.get(idx.0)
+    }
+
+    /// Finds a record in a leaf given a key to search. Returns `None` if the
+    /// key isn't in the `Page`
+    pub fn leaf_get(&self, key: &Key) -> Result<Option<&Row>, PageError> {
+        let PageBody::Leaf { records, .. } = &self.body else {
+            return Err(PageError::NotLeaf);
+        };
+        Ok(records
+            .binary_search_by(|r| r.cmp_key(key))
+            .ok()
+            .map(|i| &records[i]))
+    }
+
+    /// Returns all records in a leaf that are >= `start_key`
+    pub fn leaf_records_from(&self, start_key: &Key) -> Result<&[Row], PageError> {
+        let PageBody::Leaf { records, .. } = &self.body else {
+            return Err(PageError::NotLeaf);
+        };
+        let start = records.partition_point(|r| r.cmp_key(start_key) == Ordering::Less);
+        Ok(&records[start..])
     }
 }
 
@@ -1280,18 +1459,34 @@ impl Serializable for Page {
     }
 }
 
-impl PageBody {
-    pub fn find_child(&self, search_key: &Key) -> Option<PageId> {
-        match self {
-            PageBody::Internal { keys, children } => {
-                // binary search of the sorted keys
-                let idx = keys.partition_point(|k| k <= search_key);
-                children.get(idx).copied()
-            }
-            PageBody::Leaf { .. } => None,
-        }
+/// Position of a child pointer in an internal page (0..=keys.len()).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ChildIndex(usize);
+
+impl ChildIndex {
+    #[allow(dead_code)] // I'll need it for BTrees
+    /// The separator between this child and the next one.
+    pub(crate) fn right_separator(self) -> KeyIndex {
+        KeyIndex(self.0)
+    }
+    #[allow(dead_code)] // I'll need it for BTrees
+    /// The separator between the previous child and this one (`None` for the first child).
+    pub(crate) fn left_separator(self) -> Option<KeyIndex> {
+        self.0.checked_sub(1).map(KeyIndex)
+    }
+    #[allow(dead_code)] // I'll need it for BTrees
+    pub(crate) fn right_sibling(self) -> ChildIndex {
+        ChildIndex(self.0 + 1)
+    }
+    #[allow(dead_code)] // I'll need it for BTrees
+    pub(crate) fn left_sibling(self) -> Option<ChildIndex> {
+        self.0.checked_sub(1).map(ChildIndex)
     }
 }
+
+/// Position of a separator key in an internal page (0..keys.len()).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct KeyIndex(usize);
 
 #[cfg(test)]
 mod tests {
@@ -1305,58 +1500,62 @@ mod tests {
     use crate::schema::RowValue;
     use crate::test_support::*;
 
-    impl Arbitrary for PageBody {
+    impl Arbitrary for Page {
         fn arbitrary(g: &mut Gen) -> Self {
-            let coin_flip = bool::arbitrary(g);
-            match coin_flip {
-                true => {
-                    let coin_flip = bool::arbitrary(g);
-                    let mut keys: Vec<Key> = if coin_flip {
-                        (0..10).map(|_| Key::String(String::arbitrary(g))).collect()
-                    } else {
-                        (0..10).map(|_| Key::Integer(i64::arbitrary(g))).collect()
-                    };
-                    keys.sort();
-                    keys.dedup();
-                    let children: Vec<PageId> = (0..keys.len() + 1)
-                        .map(|_| PageId::new(TableId::new(u32::arbitrary(g)), u32::arbitrary(g)))
-                        .collect();
-                    PageBody::Internal { keys, children }
-                }
-                false => {
-                    let mut records: Vec<Row> = (0..10).map(|_| Row::arbitrary(g)).collect();
-                    records.sort_by_key(|r| Key::try_from(&r.fields[0]).unwrap());
-                    records.dedup_by_key(|r| Key::try_from(&r.fields[0]).unwrap());
-
-                    let next = Option::<PageId>::arbitrary(g);
-                    let prev = Option::<PageId>::arbitrary(g);
-
-                    PageBody::Leaf {
-                        records,
-                        next,
-                        prev,
-                    }
-                }
+            if bool::arbitrary(g) {
+                arbitrary_leaf(g)
+            } else {
+                arbitrary_internal(g)
             }
         }
     }
 
-    impl Arbitrary for Page {
-        fn arbitrary(g: &mut Gen) -> Self {
-            let page_id = PageId::arbitrary(g);
-            let last_update = PageLsn(Option::<Lsn>::arbitrary(g));
-
-            let body = PageBody::arbitrary(g);
-            let mut page = Page {
-                page_id,
-                last_update,
-                body,
-            };
-            while page.free_space().is_none() {
-                page.body = PageBody::arbitrary(g);
+    /// A leaf built through the real API: random rows inserted until a generated target
+    /// count is reached or the page fills up. Every generated leaf is one `leaf_insert` can
+    /// actually produce: sorted, unique keys, within size limits, from empty to full.
+    fn arbitrary_leaf(g: &mut Gen) -> Page {
+        let mut page = Page::empty_leaf(PageId::arbitrary(g));
+        page.last_update = PageLsn(Option::<Lsn>::arbitrary(g));
+        page.set_next(Option::<PageId>::arbitrary(g)).unwrap();
+        page.set_prev(Option::<PageId>::arbitrary(g)).unwrap();
+        for _ in 0..gen_len(g, MAX_LEAF_ITEMS) {
+            match page.leaf_insert(ValidatedRow::from_row(Row::arbitrary(g))) {
+                Ok(()) | Err(PageError::DuplicateKey) => {}
+                Err(PageError::PageFull) => break,
+                Err(e) => panic!("unexpected error building a leaf: {e:?}"),
             }
-            page
         }
+        page
+    }
+
+    /// An internal page built through the real API: random key/child pairs inserted until a
+    /// generated target count is reached or the page fills up. Every generated page is one
+    /// `internal_insert` can actually produce: sorted, unique keys, within size limits,
+    /// from empty to full.
+    fn arbitrary_internal(g: &mut Gen) -> Page {
+        let mut page = Page::empty_page(
+            PageId::arbitrary(g),
+            PageBody::Internal {
+                keys: Vec::new(),
+                children: vec![PageId::arbitrary(g)],
+            },
+        );
+        page.last_update = PageLsn(Option::<Lsn>::arbitrary(g));
+        let all_int_keys = bool::arbitrary(g);
+        for _ in 0..gen_len(g, MAX_INTERNAL_ITEMS) {
+            let key = if all_int_keys {
+                Key::Integer(i64::arbitrary(g))
+            } else {
+                Key::String(String::arbitrary(g))
+            };
+            let child_id = PageId::arbitrary(g);
+            match page.internal_insert(key, child_id) {
+                Ok(()) | Err(PageError::DuplicateKey) => {}
+                Err(PageError::PageFull) => break,
+                Err(e) => panic!("unexpected error building an internal page: {e:?}"),
+            }
+        }
+        page
     }
 
     #[derive(Debug, Clone)]
@@ -1367,21 +1566,39 @@ mod tests {
 
     impl Arbitrary for LeafPage {
         fn arbitrary(g: &mut Gen) -> Self {
-            let mut page = Page::arbitrary(g);
-            while page.records().is_none() {
-                page = Page::arbitrary(g);
-            }
-            LeafPage(page)
+            LeafPage(arbitrary_leaf(g))
+        }
+
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            let page = self.0.clone();
+            let keys: Vec<Key> = page
+                .records()
+                .unwrap()
+                .map(|r| Key::try_from(&r.fields[0]).unwrap())
+                .collect();
+
+            Box::new(keys.into_iter().map(move |key| {
+                let mut smaller = page.clone();
+                smaller.leaf_remove(&key).unwrap();
+                LeafPage(smaller)
+            }))
         }
     }
 
     impl Arbitrary for InternalPage {
         fn arbitrary(g: &mut Gen) -> Self {
-            let mut page = Page::arbitrary(g);
-            while page.children().is_none() {
-                page = Page::arbitrary(g);
-            }
-            InternalPage(page)
+            InternalPage(arbitrary_internal(g))
+        }
+
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            let page = self.0.clone();
+            let keys: Vec<Key> = page.keys().unwrap().cloned().collect();
+
+            Box::new(keys.into_iter().map(move |key| {
+                let mut smaller = page.clone();
+                smaller.internal_remove(&key).unwrap();
+                InternalPage(smaller)
+            }))
         }
     }
 
@@ -1397,6 +1614,7 @@ mod tests {
         let freed_id = match &page.body {
             PageBody::Internal { .. } => page.internal_merge_from_right(&mut new_page, separator),
             PageBody::Leaf { .. } => page.leaf_merge_from_right(&mut new_page),
+            _ => unreachable!(),
         }
         .unwrap();
 
@@ -1435,10 +1653,10 @@ mod tests {
 
         assert_matches!(
             result,
-            Err(PageError::InvalidMerge(MergeFailReason::PointerMismatch(
-                None,
-                _
-            )))
+            Err(PageError::InvalidMerge(MergeFailReason::PointerMismatch {
+                expected: None,
+                got: _,
+            }))
         );
         assert_unchanged(&page, &snapshot1);
         assert_unchanged(&new_page, &snapshot2);
@@ -1450,10 +1668,10 @@ mod tests {
 
         assert_matches!(
             result,
-            Err(PageError::InvalidMerge(MergeFailReason::PointerMismatch(
-                Some(_),
-                Some(_)
-            )))
+            Err(PageError::InvalidMerge(MergeFailReason::PointerMismatch {
+                expected: Some(_),
+                got: _,
+            }))
         );
         assert_unchanged(&page, &snapshot1);
         assert_unchanged(&new_page, &snapshot2);
@@ -1476,6 +1694,10 @@ mod tests {
         if !page.is_underfull() {
             return TestResult::discard();
         }
+        // make sure there's something in there
+        if page.num_items() == 0 {
+            return TestResult::discard();
+        }
 
         let mut page2 = page.clone();
         // make up a key to serve as the separator
@@ -1494,6 +1716,7 @@ mod tests {
                 page.leaf_merge_from_right(&mut page2)
             }
             PageBody::Internal { .. } => page.internal_merge_from_right(&mut page2, dummy_key),
+            _ => unreachable!(),
         };
 
         assert_matches!(result, Err(PageError::InvalidMerge(MergeFailReason::Keys)));
@@ -1575,6 +1798,7 @@ mod tests {
                 page.leaf_merge_from_right(&mut page2)
             }
             PageBody::Internal { .. } => page.internal_merge_from_right(&mut page2, dummy_key),
+            _ => unreachable!(),
         };
 
         assert_matches!(result, Err(PageError::PageFull));
@@ -1696,7 +1920,7 @@ mod tests {
         );
 
         // the new child sits immediately right of the new key
-        assert_eq!(half.body.find_child(&big_key), Some(new_child));
+        assert_eq!(half.find_child(&big_key), Some(new_child));
 
         TestResult::passed()
     }
@@ -1734,7 +1958,7 @@ mod tests {
                 assert!(result.is_ok(), "{result:?}");
                 expected.insert(key.clone(), right_child);
                 // routing the new key must land on the child inserted with it
-                assert_eq!(page.body.find_child(&key), Some(right_child));
+                assert_eq!(page.find_child(&key), Some(right_child));
             }
         }
 
@@ -1764,14 +1988,13 @@ mod tests {
         for row in rows {
             let validated_row = schema.validate_row(row).unwrap();
             let key = validated_row.primary_key();
-            let row: Row = validated_row.clone().into();
 
             let is_duplicate = expected.contains_key(&key);
-            let is_full = !page.can_insert(&row);
+            let is_full = !page.can_insert(validated_row.as_ref());
 
             let page_clone = page.clone();
 
-            let result = page.leaf_insert(validated_row);
+            let result = page.leaf_insert(validated_row.clone());
             if is_duplicate {
                 assert_matches!(result, Err(PageError::DuplicateKey));
                 assert_unchanged(&page_clone, &page);
@@ -1780,7 +2003,7 @@ mod tests {
                 assert_unchanged(&page_clone, &page);
             } else {
                 assert!(result.is_ok());
-                expected.insert(key, row.clone());
+                expected.insert(key, Row::from(validated_row));
             }
         }
         let actual_records: Vec<Row> = page.records().unwrap().cloned().collect();
@@ -1830,6 +2053,7 @@ mod tests {
                         .all(|r| r.cmp_key(&split_key) != Ordering::Less)
                 );
             }
+            _ => unreachable!(),
         };
         TestResult::passed()
     }
@@ -1864,6 +2088,7 @@ mod tests {
                     "new page next pointer doesn't point to original page's original next"
                 );
             }
+            _ => unreachable!(),
         };
         TestResult::passed()
     }
@@ -1882,6 +2107,7 @@ mod tests {
             PageBody::Leaf { records, .. } => {
                 original_records = records.clone();
             }
+            _ => unreachable!(),
         };
         let new_id = page.page_id.wrapping_add(1);
 
@@ -1927,6 +2153,7 @@ mod tests {
                     .collect();
                 assert_eq!(original_records, combined_records);
             }
+            _ => unreachable!(),
         }
 
         TestResult::passed()
@@ -1943,11 +2170,12 @@ mod tests {
             prev: None,
         };
 
+        let mut vr = schema.validate_row(row.clone()).unwrap();
         // fill the page up entries
-        while page.can_insert(&row) {
-            let vr = schema.validate_row(row.clone()).unwrap();
+        while page.can_insert(vr.as_ref()) {
             page.leaf_insert(vr).unwrap();
             row = increment_key_on_row(&row);
+            vr = schema.validate_row(row.clone()).unwrap();
         }
         let snapshot = page.clone();
 
@@ -2048,10 +2276,10 @@ mod tests {
         LeafPage(mut page): LeafPage,
         SchemaRowPair(schema, row): SchemaRowPair,
     ) -> TestResult {
-        if !page.can_insert(&row) {
+        let validated_row = schema.validate_row(row).unwrap();
+        if !page.can_insert(validated_row.as_ref()) {
             return TestResult::discard();
         }
-        let validated_row = schema.validate_row(row).unwrap();
         let _ = page.leaf_insert(validated_row.clone()); // this might error if the key already exists, but we're guaranteed to have it in there after calling it
         let result = page.leaf_insert(validated_row); // this is the check that matters
 
@@ -2078,6 +2306,7 @@ mod tests {
                     MAX_LEAF_HEADER_SIZE as u64
                 )
             }
+            _ => unreachable!(),
         };
         TestResult::passed()
     }
@@ -2146,6 +2375,7 @@ mod tests {
         let max_header = match page.body {
             PageBody::Internal { .. } => MAX_INTERNAL_HEADER_SIZE,
             PageBody::Leaf { .. } => MAX_LEAF_HEADER_SIZE,
+            _ => unreachable!(),
         };
         assert_eq!(free_space + (max_header - header_end), actual_free_space);
         TestResult::passed()
@@ -2166,16 +2396,13 @@ mod tests {
 
     #[quickcheck]
     fn find_child_matches_linear_scan(InternalPage(page): InternalPage, key: Key) -> TestResult {
-        assert_eq!(
-            page.body.find_child(&key),
-            Some(expected_child(&page, &key))
-        );
+        assert_eq!(page.find_child(&key), Some(expected_child(&page, &key)));
         TestResult::passed()
     }
 
     #[quickcheck]
     fn find_child_on_leaf_is_none(LeafPage(page): LeafPage, key: Key) -> TestResult {
-        assert_eq!(page.body.find_child(&key), None);
+        assert_eq!(page.find_child(&key), None);
         TestResult::passed()
     }
 
@@ -2193,13 +2420,13 @@ mod tests {
         // (Integer(i64::MIN) is the smallest possible Key; skip if it's already a separator)
         let below = Key::Integer(i64::MIN);
         if &below < first {
-            assert_eq!(page.body.find_child(&below), Some(children[0]), "below all");
+            assert_eq!(page.find_child(&below), Some(children[0]), "below all");
         }
 
         // exactly equal to a separator -> the child to its right
         for (i, k) in keys.iter().enumerate() {
             assert_eq!(
-                page.body.find_child(k),
+                page.find_child(k),
                 Some(children[i + 1]),
                 "equal to keys[{i}]"
             );
@@ -2211,7 +2438,7 @@ mod tests {
                 && let Some(m) = n.checked_sub(1)
             {
                 assert_eq!(
-                    page.body.find_child(&Key::Integer(m)),
+                    page.find_child(&Key::Integer(m)),
                     Some(children[i]),
                     "just below keys[{i}]"
                 );
@@ -2222,7 +2449,7 @@ mod tests {
         // (any String sorts after every Integer; a longer string sorts after its prefix)
         let above = higher_key(last);
         assert_eq!(
-            page.body.find_child(&above),
+            page.find_child(&above),
             children.last().copied(),
             "above all"
         );
@@ -2325,41 +2552,49 @@ mod tests {
         LeafPage(mut page): LeafPage,
         target: u8,
     ) -> TestResult {
-        if page.records().unwrap().next().is_none() {
+        let Some(last_row) = page.records().unwrap().last().cloned() else {
             return TestResult::discard();
-        }
+        };
 
-        // find a key in the page
-        let target = target as usize % page.records().unwrap().count();
-        let target_row = page.records().unwrap().nth(target).cloned().unwrap();
-        let target_key = ValidatedRow::from_row(target_row).primary_key();
-
-        // remove it
-        page.leaf_remove(&target_key)
-            .unwrap()
-            .expect("key is on the page");
+        // we took the last row, which should have the highest key in the page, then derive a higher
+        // key that shouldn't be in the page
+        let non_existant_key = higher_key(&ValidatedRow::from_row(last_row).primary_key());
 
         // take a snapshot
         let snapshot = page.clone();
 
-        // try again - should return `Ok(None)`
+        // try to remove a key that can't be there
         let result = page
-            .leaf_remove(&target_key)
+            .leaf_remove(&non_existant_key)
             .expect("leaf_remove shouldn't fail");
 
         assert_eq!(result, None);
         assert_unchanged(&snapshot, &page);
 
-        // find a key outside the range
-        let last_key =
-            ValidatedRow::from_row(page.records().unwrap().last().cloned().unwrap()).primary_key();
+        // if we had more than one record, let's remove one at random
+        if page.records().is_some_and(|r| r.count() < 2) {
+            return TestResult::passed();
+        }
 
-        let out_of_bounds_key = higher_key(&last_key);
+        let target_row = page
+            .records()
+            .unwrap()
+            .nth(target as usize % page.num_items())
+            .unwrap()
+            .clone();
+        let target_key = ValidatedRow::from_row(target_row.clone()).primary_key();
 
         let result = page
-            .leaf_remove(&out_of_bounds_key)
+            .leaf_remove(&target_key)
             .expect("leaf_remove shouldn't fail");
 
+        assert_eq!(result, Some(target_row));
+        // take a snapshot
+        let snapshot = page.clone();
+        // now it's gone, let's try again
+        let result = page
+            .leaf_remove(&target_key)
+            .expect("leaf_remove shouldn't fail");
         assert_eq!(result, None);
         assert_unchanged(&snapshot, &page);
 
@@ -2371,39 +2606,50 @@ mod tests {
         InternalPage(mut page): InternalPage,
         target: u8,
     ) -> TestResult {
-        if page.keys().unwrap().next().is_none() {
+        let Some(last_key) = page.keys().unwrap().last().cloned() else {
             return TestResult::discard();
-        }
+        };
 
-        // find a key in the page
-        let target = target as usize % page.keys().unwrap().count();
-        let target_key = page.keys().unwrap().nth(target).cloned().unwrap();
-
-        // remove it
-        page.internal_remove(&target_key)
-            .unwrap()
-            .expect("key is on the page");
+        // we took the last key, which should have the highest key in the page, then derive a higher
+        // key that shouldn't be in the page
+        let non_existant_key = higher_key(&last_key);
 
         // take a snapshot
         let snapshot = page.clone();
 
-        // try again - should return `Ok(None)`
+        // try to remove a key that can't be there
         let result = page
-            .internal_remove(&target_key)
+            .internal_remove(&non_existant_key)
             .expect("internal_remove shouldn't fail");
 
         assert_eq!(result, None);
         assert_unchanged(&snapshot, &page);
 
-        // find a key outside the range
-        let last_key = page.keys().unwrap().last().cloned().unwrap();
+        // if we had more than one record, let's remove one at random
+        if page.keys().is_some_and(|k| k.count() < 2) {
+            return TestResult::passed();
+        }
 
-        let out_of_bounds_key = higher_key(&last_key);
+        let target_key = page
+            .keys()
+            .unwrap()
+            .nth(target as usize % page.num_items())
+            .unwrap()
+            .clone();
 
         let result = page
-            .internal_remove(&out_of_bounds_key)
+            .internal_remove(&target_key)
             .expect("internal_remove shouldn't fail");
 
+        assert_eq!(result.unwrap().0, target_key);
+
+        // take a snapshot
+        let snapshot = page.clone();
+
+        // now it's gone, let's try again
+        let result = page
+            .internal_remove(&target_key)
+            .expect("internal_remove shouldn't fail");
         assert_eq!(result, None);
         assert_unchanged(&snapshot, &page);
 
@@ -2415,12 +2661,11 @@ mod tests {
         LeafPage(mut leaf): LeafPage,
         InternalPage(mut internal): InternalPage,
     ) -> TestResult {
-        let internal_key = internal.keys().unwrap().next().cloned().unwrap();
-        let leaf_key =
-            ValidatedRow::from_row(leaf.records().unwrap().next().cloned().unwrap()).primary_key();
+        // Wrong page type is most senior error type, so an invalid key doesn't matter to this test
+        let dummy_key = Key::Integer(0);
 
-        let res1 = internal.leaf_remove(&internal_key);
-        let res2 = leaf.internal_remove(&leaf_key);
+        let res1 = internal.leaf_remove(&dummy_key);
+        let res2 = leaf.internal_remove(&dummy_key);
 
         assert_matches!(res1, Err(PageError::NotLeaf));
         assert_matches!(res2, Err(PageError::NotInternal));
@@ -2461,7 +2706,7 @@ mod tests {
             .chain([higher_key(old_keys.last().unwrap())]);
         for probe in probes.into_iter().chain(boundary_probes) {
             assert_eq!(
-                page.body.find_child(&probe),
+                page.find_child(&probe),
                 Some(expected_after_remove(&probe)),
                 "routing {probe:?} after removing keys[{i}]"
             );
@@ -2543,7 +2788,7 @@ mod tests {
     }
 
     #[quickcheck]
-    fn leaf_borrows_fail_with_wrong_page_type(
+    fn borrows_fail_with_wrong_page_type(
         LeafPage(mut leaf): LeafPage,
         InternalPage(mut internal): InternalPage,
     ) -> TestResult {
@@ -2557,6 +2802,18 @@ mod tests {
         assert_matches!(res2, Err(PageError::NotLeaf));
         assert_matches!(res3, Err(PageError::NotLeaf));
         assert_matches!(res4, Err(PageError::NotLeaf));
+
+        let sep = Key::Integer(0);
+
+        let res1 = internal.internal_borrow_from_left(&mut leaf, sep.clone());
+        let res2 = internal.internal_borrow_from_right(&mut leaf, sep.clone());
+        let res3 = leaf.internal_borrow_from_left(&mut internal, sep.clone());
+        let res4 = leaf.internal_borrow_from_right(&mut internal, sep);
+
+        assert_matches!(res1, Err(PageError::NotInternal));
+        assert_matches!(res2, Err(PageError::NotInternal));
+        assert_matches!(res3, Err(PageError::NotInternal));
+        assert_matches!(res4, Err(PageError::NotInternal));
 
         TestResult::passed()
     }
@@ -2583,7 +2840,7 @@ mod tests {
         // and always sort before the separator: the only thing wrong is the size.
         let (schema, _) = leaf_schema();
         let mut key = -1i64;
-        while left.can_insert(&right_first) {
+        while left.can_insert(ValidatedRow::from_row(right_first.clone()).as_ref()) {
             let filler = Row {
                 fields: vec![RowValue::Integer(key), RowValue::String(String::new())],
             };

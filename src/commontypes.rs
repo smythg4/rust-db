@@ -51,27 +51,6 @@ impl Serializable for PageId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RecordId(PageId, SlotIndex);
-
-impl RecordId {
-    pub const fn new(page_id: PageId, slot_index: SlotIndex) -> Self {
-        Self(page_id, slot_index)
-    }
-    pub const fn get_page_id(self) -> PageId {
-        self.0
-    }
-    pub const fn get_slot_index(self) -> SlotIndex {
-        self.1
-    }
-}
-
-impl std::fmt::Display for RecordId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}:{}", self.0, self.1) // PageId:SlotIndex, composes once PageId has Display
-    }
-}
-
 #[derive(Error, Debug)]
 pub enum LsnError {
     #[error(transparent)]

@@ -13,7 +13,7 @@ const STRING_FLAG: u8 = 3;
 const BOOL_FLAG: u8 = 4;
 
 const MAX_FIELD_LEN: usize = MAX_LEAF_ENTRY_SIZE;
-const MAX_NUM_FIELDS: usize = 255;
+pub(crate) const MAX_NUM_FIELDS: usize = 255;
 
 #[derive(Error, Debug)]
 pub enum RowValueError {
@@ -41,16 +41,6 @@ pub enum RowValue {
 }
 
 impl RowValue {
-    pub fn get_tag(&self) -> u8 {
-        match self {
-            Self::Integer(_) => INT_FLAG,
-            Self::Float(_) => FLOAT_FLAG,
-            Self::String(_) => STRING_FLAG,
-            Self::Boolean(_) => BOOL_FLAG,
-            Self::Null => NULL_FLAG,
-        }
-    }
-
     pub fn column_type(&self) -> Option<ColumnType> {
         match self {
             Self::Float(_) => Some(ColumnType::Float),
@@ -111,13 +101,11 @@ impl Serializable for RowValue {
                 w.write_all(&f.to_be_bytes())?;
             }
             RowValue::String(s) => {
-                w.write_all(&STRING_FLAG.to_be_bytes())?;
-                let length = self.encoded_size();
-                if length > MAX_FIELD_LEN {
-                    return Err(RowValueError::FieldTooLong(length));
+                if s.len() > MAX_FIELD_LEN {
+                    return Err(RowValueError::FieldTooLong(s.len()));
                 }
-                let varlen = s.len().encode_var_vec();
-                w.write_all(&varlen)?;
+                w.write_all(&STRING_FLAG.to_be_bytes())?;
+                w.write_all(&s.len().encode_var_vec())?;
                 w.write_all(s.as_bytes())?;
             }
             RowValue::Boolean(b) => {
@@ -255,6 +243,7 @@ impl ColumnType {
 /// and whether or not the field is nullable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Column {
+    pub(crate) name: String,
     pub(crate) col_type: ColumnType,
     pub(crate) nullable: bool,
 }
@@ -263,11 +252,17 @@ macro_rules! column_constructors {
     ($($variant:ident => $non_null:ident, $nullable:ident);* $(;)?) => {
         impl Column {
             $(
-                pub const fn $non_null() -> Self {
-                    Self { col_type: ColumnType::$variant, nullable: false }
+                pub const fn $non_null(name: String) -> Self {
+                    if name.is_empty() {
+                        panic!("name can't be empty. change this to an error type");
+                    }
+                    Self { name, col_type: ColumnType::$variant, nullable: false }
                 }
-                pub const fn $nullable() -> Self {
-                    Self { col_type: ColumnType::$variant, nullable: true }
+                pub const fn $nullable(name: String) -> Self {
+                    if name.is_empty() {
+                        panic!("name can't be empty. change this to an error type");
+                    }
+                    Self { name, col_type: ColumnType::$variant, nullable: true }
                 }
             )*
         }
@@ -275,10 +270,10 @@ macro_rules! column_constructors {
 }
 
 column_constructors! {
-    Integer => integer, nullable_integer;
-    Float => float, nullable_float;
-    String => string, nullable_string;
-    Bool => bool, nullable_bool;
+Integer => integer, nullable_integer;
+Float => float, nullable_float;
+String => string, nullable_string;
+     Bool => bool, nullable_bool;
 }
 
 #[derive(Error, Debug)]
@@ -325,6 +320,12 @@ impl ValidatedRow {
     #[cfg(test)]
     pub(crate) fn from_row(row: Row) -> Self {
         ValidatedRow(row)
+    }
+}
+
+impl AsRef<Row> for ValidatedRow {
+    fn as_ref(&self) -> &Row {
+        &self.0
     }
 }
 
@@ -385,8 +386,10 @@ impl Schema {
         for (i, (col, value)) in cols.iter().zip(values.iter()).enumerate() {
             match value.column_type() {
                 Some(c) if c == col.col_type => {
-                    if value.encoded_size() > MAX_FIELD_LEN {
-                        return Err(SchemaError::FieldTooLong(value.encoded_size()));
+                    if let RowValue::String(s) = value
+                        && s.len() > MAX_FIELD_LEN
+                    {
+                        return Err(SchemaError::FieldTooLong(s.len()));
                     }
                 }
                 None if col.nullable => {}
@@ -408,30 +411,33 @@ mod tests {
     use quickcheck_macros::quickcheck;
     use std::io::Cursor;
 
+    fn non_nan_f64(g: &mut Gen) -> f64 {
+        let mut f = f64::arbitrary(g);
+        while f.is_nan() {
+            f = f64::arbitrary(g);
+        }
+        f
+    }
+
     impl Arbitrary for ColumnType {
         fn arbitrary(g: &mut Gen) -> Self {
-            let n = g.choose(&[0, 1, 2, 3]).unwrap();
-            match n {
-                0 => ColumnType::String,
-                1 => ColumnType::Bool,
-                2 => ColumnType::Float,
-                3 => ColumnType::Integer,
-                _ => unreachable!(),
-            }
+            g.choose(&[
+                ColumnType::String,
+                ColumnType::Bool,
+                ColumnType::Float,
+                ColumnType::Integer,
+            ])
+            .cloned()
+            .unwrap()
         }
     }
 
     impl Arbitrary for Column {
         fn arbitrary(g: &mut Gen) -> Self {
-            let n = g.choose(&[0, 1]).unwrap();
-            let nullable = match n {
-                0 => false,
-                1 => true,
-                _ => unreachable!(),
-            };
             Column {
+                name: String::arbitrary(g),
                 col_type: ColumnType::arbitrary(g),
-                nullable,
+                nullable: bool::arbitrary(g),
             }
         }
     }
@@ -445,7 +451,7 @@ mod tests {
             Schema {
                 columns: [first_entry]
                     .into_iter()
-                    .chain((0..10).map(|_| Column::arbitrary(g)))
+                    .chain((0..gen_len(g, MAX_NUM_FIELDS - 1) % 25).map(|_| Column::arbitrary(g)))
                     .collect(),
             }
         }
@@ -453,47 +459,41 @@ mod tests {
 
     impl Arbitrary for RowValue {
         fn arbitrary(g: &mut Gen) -> Self {
-            let num = g.choose(&[0, 1, 2, 3, 4]).unwrap();
-            match num {
-                0 => RowValue::Integer(i64::arbitrary(g)),
-                1 => {
-                    let mut f = f64::arbitrary(g);
-                    while f.is_nan() {
-                        f = f64::arbitrary(g);
-                    }
-                    RowValue::Float(f)
-                }
-                2 => RowValue::String(String::arbitrary(g)),
-                3 => RowValue::Null,
-                4 => RowValue::Boolean(bool::arbitrary(g)),
-                _ => unreachable!(),
-            }
+            // RowValue: a table of generator functions
+            let gens: &[fn(&mut Gen) -> RowValue] = &[
+                |g| RowValue::Integer(i64::arbitrary(g)),
+                |g| RowValue::Float(non_nan_f64(g)),
+                |g| RowValue::String(String::arbitrary(g)),
+                |g| RowValue::Boolean(bool::arbitrary(g)),
+                |_| RowValue::Null,
+            ];
+            g.choose(gens).unwrap()(g)
         }
     }
 
     /// TODO: Figure out how to cap g.size() in Arbitrary instead of these contrived
     /// caps I put in the implementation
     impl Arbitrary for Row {
+        /// Builds a row within the real limits by construction: the first, then extra
+        /// fields until either the generated count or the row's byte budget runs out.
         fn arbitrary(g: &mut Gen) -> Self {
-            let count = usize::arbitrary(g).min(10);
-            let mut first_entry = RowValue::arbitrary(g);
-            while !matches!(first_entry, RowValue::Integer(_) | RowValue::String(_))
-                || first_entry.encoded_size() > 25
-            {
-                first_entry = RowValue::arbitrary(g);
+            let key = loop {
+                let k = Key::arbitrary(g);
+                if Page::internal_entry_size(&k) <= MAX_INTERNAL_ENTRY_SIZE {
+                    break k;
+                }
+            };
+            let mut row = Row {
+                fields: vec![key.into()],
+            };
+            for _ in 0..gen_len(g, MAX_NUM_FIELDS - 1) {
+                row.fields.push(RowValue::arbitrary(g));
+                if Page::leaf_entry_size(&row) > MAX_LEAF_ENTRY_SIZE {
+                    row.fields.pop();
+                    break;
+                }
             }
-            Row {
-                fields: [first_entry]
-                    .into_iter()
-                    .chain((0..count).map(|_| {
-                        let mut entry = RowValue::arbitrary(g);
-                        while entry.encoded_size() > 255 {
-                            entry = RowValue::arbitrary(g);
-                        }
-                        entry
-                    }))
-                    .collect(),
-            }
+            row
         }
     }
 
@@ -523,7 +523,11 @@ mod tests {
 
     #[test]
     fn too_big_row_triggers_error_on_validation() {
-        let schema = Schema::try_from(vec![Column::string(), Column::nullable_string()]).unwrap();
+        let schema = Schema::try_from(vec![
+            Column::string("string column".into()),
+            Column::nullable_string("nullable string column".into()),
+        ])
+        .unwrap();
         let row = Row::try_from(vec![
             RowValue::String("a".repeat(MAX_LEAF_ENTRY_SIZE)),
             RowValue::Null,
@@ -539,7 +543,11 @@ mod tests {
         // this should be the largest value that is valid
         let test_boundary = MAX_INTERNAL_ENTRY_SIZE - PAGE_ID_SIZE - SLOT_ENTRY_SIZE - 1 - 2;
 
-        let schema = Schema::try_from(vec![Column::string(), Column::nullable_string()]).unwrap();
+        let schema = Schema::try_from(vec![
+            Column::string("string column".into()),
+            Column::nullable_string("nullable string column".into()),
+        ])
+        .unwrap();
         let row = Row::try_from(vec![
             RowValue::String("a".repeat(test_boundary + 1)),
             RowValue::Null,
@@ -637,10 +645,10 @@ mod tests {
     fn valid_rows_pass_validation() {
         let schema = Schema {
             columns: vec![
-                Column::integer(),
-                Column::nullable_string(),
-                Column::nullable_float(),
-                Column::bool(),
+                Column::integer("dummy".into()),
+                Column::nullable_string("dummy".into()),
+                Column::nullable_float("dummy".into()),
+                Column::bool("dummy".into()),
             ],
         };
 
@@ -669,7 +677,11 @@ mod tests {
     #[test]
     fn invalid_rows_fail_validation() {
         let schema = Schema {
-            columns: vec![Column::integer(), Column::nullable_string(), Column::bool()],
+            columns: vec![
+                Column::integer("dummy".into()),
+                Column::nullable_string("dummy".into()),
+                Column::bool("dummy".into()),
+            ],
         };
 
         let wrong_type = Row {
@@ -717,9 +729,9 @@ mod tests {
     #[test]
     fn schemas_cant_have_nullable_primary_keys() {
         let schema_result = Schema::try_from(vec![
-            Column::nullable_integer(),
-            Column::string(),
-            Column::nullable_float(),
+            Column::nullable_integer("dummy".into()),
+            Column::string("dummy".into()),
+            Column::nullable_float("dummy".into()),
         ]);
         assert_matches!(schema_result, Err(SchemaError::NullablePrimaryKey));
     }
@@ -728,24 +740,26 @@ mod tests {
     fn schemas_cant_have_invalidkey_primary_keys() {
         // Floats can't be primary keys
         let schema_result = Schema::try_from(vec![
-            Column::float(),
-            Column::string(),
-            Column::nullable_float(),
+            Column::float("dummy".into()),
+            Column::string("dummy".into()),
+            Column::nullable_float("dummy".into()),
         ]);
         assert_matches!(schema_result, Err(SchemaError::NonOrdPrimaryKey));
 
         // Bools can't be primary keys
         let schema_result = Schema::try_from(vec![
-            Column::bool(),
-            Column::string(),
-            Column::nullable_float(),
+            Column::bool("dummy".into()),
+            Column::string("dummy".into()),
+            Column::nullable_float("dummy".into()),
         ]);
         assert_matches!(schema_result, Err(SchemaError::NonOrdPrimaryKey));
     }
 
     #[test]
     fn schemas_fail_with_too_many_columns() {
-        let cols: Vec<Column> = (0..MAX_NUM_FIELDS + 1).map(|_| Column::integer()).collect();
+        let cols: Vec<Column> = (0..MAX_NUM_FIELDS + 1)
+            .map(|_| Column::integer("dummy".into()))
+            .collect();
         let schema_result = Schema::try_from(cols);
         assert_matches!(schema_result, Err(SchemaError::TooManyColumns));
     }
