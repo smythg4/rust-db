@@ -31,9 +31,9 @@ old key missing (`MissingKey` returns `new`), larger key on a full page (`PageFu
 - [x] `internal_insert`: oversized key → `KeyTooLong`
 
 #### Borrow rejections
-- [ ] internal borrows, both directions: donor with 0 keys → `EmptyBorrow`; donor with 1 key → succeeds
-- [ ] internal borrows: `self`'s edge key on the wrong side of the separator → `KeysOutOfOrder`
-- [ ] internal borrows: donor's edge key on the wrong side of the separator → `KeysOutOfOrder`
+- [x] internal borrows, both directions: donor with 0 keys → `EmptyBorrow`; donor with 1 key → succeeds
+- [x] internal borrows: `self`'s edge key on the wrong side of the separator → `KeysOutOfOrder`
+- [x] internal borrows: donor's edge key on the wrong side of the separator → `KeysOutOfOrder`
 - [ ] internal borrows: separator too big for `self` → `PageFull`
 - [ ] leaf borrows, both directions: wrong neighbor → `PointerMismatch` (check expected/actual order)
 - [ ] leaf borrows: overlapping ranges incl. an equal key → `KeysOutOfOrder`
@@ -47,21 +47,19 @@ old key missing (`MissingKey` returns `new`), larger key on a full page (`PageFu
 
 #### Accessors and small functions
 - [x] `set_lsn`: smaller → `StaleLsnUpdate` (unchanged), equal and larger accepted; LSN survives a round trip
-- [ ] `page_id()` after construction, split (new page), and round trip
 - [ ] `can_insert_separator`: exact fit → true, one byte over → false, leaf → false
 - [ ] `is_underfull`: exactly at each threshold, both page types
-- [ ] `next`/`set_next`/`prev`/`set_prev` on an internal page → `NotLeaf`, page unchanged
+- [x] `next`/`set_next`/`prev`/`set_prev` on an internal page → `NotLeaf`, page unchanged
 - [ ] `split_page`: 0 or 1 rows, or fewer than 3 keys → `TooSmallToSplit`
 
 #### Routing and indexes
-- [ ] `find_child_index`: index matches the linear-scan reference and `child_at(index)` equals the returned ID
+- [x] `find_child_index`: index matches the linear-scan reference and `child_at(index)` equals the returned ID
 - [ ] `child_at` / `key_at`: out of range → `None`; on a leaf → `None`
 - [ ] `ChildIndex` navigation: index 0 has no left sibling/separator; for every child, keys routed to it lie between `key_at(left_separator)` and `key_at(right_separator)`
 
 #### Invariants and size limits
 - [ ] `check_invariants` returns each kind: `RowTooLarge`, `KeyTooLarge` (leaf and internal), `ChildCountMismatch`, `UnsortedKeys { at }` (check `at`), `ExceedsCapacity` — build pages from `empty_page`
 - [ ] `as_raw_page` refuses a page that fails `check_invariants`
-- [ ] property: `as_raw_page` succeeds ⇒ `deserialize` returns the same page
 - [ ] string of exactly `MAX_FIELD_LEN` bytes round-trips; one more → `FieldTooLong` with nothing written
 - [ ] crafted string length prefix over `MAX_FIELD_LEN` → `FieldTooLong` on read
 - [ ] `validate_row`: string field at the limit accepted, one byte over → `FieldTooLong`

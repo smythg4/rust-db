@@ -92,10 +92,8 @@ pub enum PageError {
     PageFull,
     #[error("Attempt to insert a duplicate key")]
     DuplicateKey,
-    #[error("Attempt to insert a row into a non-leaf page")]
-    NotLeaf,
-    #[error("Attempt to insert a separator into a non-internal page")]
-    NotInternal,
+    #[error("Attempt to complete operation on page type that doesn't support it")]
+    WrongPageType,
     #[error("invariant violated")]
     InvariantViolated,
     #[error("Corrupt data found on page: {page_id:?}. {kind:?}")]
@@ -158,6 +156,7 @@ pub enum CorruptionKind {
     TooManyItems(usize),
     RowTooLarge { slot: usize },
     KeyTooLarge { slot: usize },
+    PageNumOutOfRange(usize), // that page number that exceeds the meta data's stored page_count
 }
 
 pub type RawPage = [u8; PAGE_SIZE];
@@ -183,7 +182,7 @@ pub enum PageBody {
     Meta {
         root_id: PageId,
         page_count: u32,
-        free_list: Vec<PageId>,
+        free_list_head: Option<PageId>,
     },
     Free {
         next: Option<PageId>, // pointer to the next free page
@@ -208,6 +207,29 @@ impl Page {
         }
         self.last_update.0 = Some(new_lsn);
         Ok(())
+    }
+
+    /// Used to update the free_list on a `Meta` `Page`.
+    pub fn free_list_push(&mut self, freed: &mut Page) -> Result<(), PageError> {
+        if !self.is_meta() || !freed.is_free() {
+            return Err(PageError::WrongPageType);
+        }
+        let PageBody::Meta { free_list_head, .. } = &mut self.body else {
+            unreachable!()
+        };
+        let PageBody::Free { next } = &mut freed.body else {
+            unreachable!()
+        };
+        *next = *free_list_head;
+
+        *free_list_head = Some(freed.page_id);
+
+        Ok(())
+    }
+
+    /// Converts `Page` of any type into a free `Page`
+    pub fn make_free(&mut self) {
+        self.body = PageBody::Free { next: None };
     }
 
     pub fn empty_leaf(page_id: PageId) -> Self {
@@ -280,10 +302,9 @@ impl Page {
     /// on the `Option` variant, we always reserve the maximum space required (e.g. assuming we have two siblings in the `Leaf`
     /// case). Returns `None` if the `Page` won't fit into a [u8; PAGE_SIZE] space, which means somewhere data overflowed.
     pub fn free_space(&self) -> Option<usize> {
-        let header_len = match self.body {
-            PageBody::Internal { .. } => MAX_INTERNAL_HEADER_SIZE,
+        let header_len = match &self.body {
             PageBody::Leaf { .. } => MAX_LEAF_HEADER_SIZE,
-            _ => todo!(),
+            _ => MAX_INTERNAL_HEADER_SIZE,
         };
         let used_size = header_len
             + match &self.body {
@@ -294,7 +315,8 @@ impl Page {
                 PageBody::Leaf { records, .. } => {
                     records.iter().map(Self::leaf_entry_size).sum::<usize>()
                 }
-                _ => todo!(),
+                PageBody::Free { .. } => 1 + PAGE_ID_SIZE,
+                PageBody::Meta { .. } => 1 + PAGE_ID_SIZE,
             };
         PAGE_SIZE.checked_sub(used_size)
     }
@@ -313,8 +335,7 @@ impl Page {
                 next.serialize(writer)?;
                 prev.serialize(writer)?;
             }
-            PageBody::Internal { .. } => {}
-            _ => todo!(),
+            PageBody::Internal { .. } | PageBody::Free { .. } | PageBody::Meta { .. } => {}
         };
 
         // note the number of items stored on the page
@@ -389,7 +410,22 @@ impl Page {
                 }
                 Ok((slot_offset, data_offset))
             }
-            _ => todo!(),
+            PageBody::Free { next } => {
+                // Free pages are just the next pointer, simple enough!
+                next.serialize(writer)?;
+                Ok((0, 0))
+            }
+            PageBody::Meta {
+                root_id,
+                page_count,
+                free_list_head,
+            } => {
+                // write the data straight out in order
+                root_id.serialize(writer)?;
+                writer.write_all(&page_count.to_be_bytes())?;
+                free_list_head.serialize(writer)?;
+                Ok((0, 0))
+            }
         }
     }
 
@@ -480,7 +516,7 @@ impl Page {
         let can_insert = matches!(self.free_space(), Some(free_space) if free_space >= Self::internal_entry_size(&separator));
 
         let PageBody::Internal { keys, children } = &mut self.body else {
-            return Err(PageError::NotInternal);
+            return Err(PageError::WrongPageType);
         };
 
         let insert_pos = match keys.binary_search(&separator) {
@@ -504,7 +540,7 @@ impl Page {
     /// or the `Page` can't fit it.
     pub fn leaf_insert(&mut self, validated_row: ValidatedRow) -> Result<(), PageError> {
         let PageBody::Leaf { .. } = &mut self.body else {
-            return Err(PageError::NotLeaf);
+            return Err(PageError::WrongPageType);
         };
         let new_key = validated_row.primary_key();
         let can_insert = self.can_insert(validated_row.as_ref());
@@ -640,7 +676,8 @@ impl Page {
 
     /// If the merge is legal, this will drain the right `Page` of any entries and merge them into
     /// this one. Right `Page` won't be affected in the event of failure. Returns the `PageId` of the
-    /// merged `Page` that can be recycled to a free list.
+    /// merged `Page` that can be recycled to a free list. `right` is converted into a free page
+    /// upon success
     pub fn leaf_merge_from_right(&mut self, right: &mut Page) -> Result<PageId, PageError> {
         if !self
             .free_space()
@@ -675,6 +712,7 @@ impl Page {
                         *next = *right_next;
                         self.debug_check_invariants("leaf_merge_from_right");
                         // no need to check the right page since it's drained and now ready for re-issue
+                        right.make_free();
                         Ok(right_id)
                     }
                     _ => Err(PageError::InvalidMerge(MergeFailReason::PointerMismatch {
@@ -690,7 +728,8 @@ impl Page {
     /// If the merge is legal, this will drain the right `Page` of any entries and merge them into
     /// this one. Right `Page` won't be affected in the event of failure. `separator` will be installed
     /// at the right point in the newly merged `Page`. Returns the `PageId` of the
-    /// merged `Page` that can be recycled to a free list.
+    /// merged `Page` that can be recycled to a free list. `right` is converted into a free page
+    /// upon success
     pub fn internal_merge_from_right(
         &mut self,
         right: &mut Page,
@@ -731,6 +770,7 @@ impl Page {
                 children.extend(right_children);
                 self.debug_check_invariants("internal_merge_from_right");
                 // don't check invariants on the right page since it's drained.
+                right.make_free();
                 Ok(right_id)
             }
             _ => Err(PageError::InvalidMerge(MergeFailReason::MismatchMerge)),
@@ -742,7 +782,7 @@ impl Page {
         if matches!(self.body, PageBody::Internal { .. })
             || matches!(right_page.body, PageBody::Internal { .. })
         {
-            return Err(PageError::NotLeaf);
+            return Err(PageError::WrongPageType);
         }
 
         // make sure the right page is actually THIS page's right page
@@ -821,7 +861,7 @@ impl Page {
         if matches!(self.body, PageBody::Internal { .. })
             || matches!(left_page.body, PageBody::Internal { .. })
         {
-            return Err(PageError::NotLeaf);
+            return Err(PageError::WrongPageType);
         }
 
         // make sure the left page is actually THIS page's left page
@@ -907,7 +947,7 @@ impl Page {
         if matches!(self.body, PageBody::Leaf { .. })
             || matches!(right_page.body, PageBody::Leaf { .. })
         {
-            return Err(PageError::NotInternal);
+            return Err(PageError::WrongPageType);
         }
 
         // Note: No way to ensure these are actually siblings apart from the separator check below.
@@ -983,7 +1023,7 @@ impl Page {
         if matches!(self.body, PageBody::Leaf { .. })
             || matches!(left_page.body, PageBody::Leaf { .. })
         {
-            return Err(PageError::NotInternal);
+            return Err(PageError::WrongPageType);
         }
 
         // Note: No way to ensure these are actually siblings apart from the separator check below.
@@ -1055,7 +1095,7 @@ impl Page {
             PageBody::Leaf { records, .. } => {
                 records.iter().map(Self::leaf_entry_size).sum::<usize>()
             }
-            _ => unreachable!("no entries on free or meta pages"),
+            _ => 0,
         }
     }
 
@@ -1086,7 +1126,7 @@ impl Page {
     #[allow(dead_code)]
     pub(crate) fn leaf_remove(&mut self, key: &Key) -> Result<Option<Row>, PageError> {
         let PageBody::Leaf { records, .. } = &mut self.body else {
-            return Err(PageError::NotLeaf);
+            return Err(PageError::WrongPageType);
         };
         let removed = match records.binary_search_by(|r| r.cmp_key(key)) {
             Ok(i) => Some(records.remove(i)),
@@ -1105,7 +1145,7 @@ impl Page {
         self.debug_check_invariants("internal_remove");
 
         let PageBody::Internal { keys, children } = &mut self.body else {
-            return Err(PageError::NotInternal);
+            return Err(PageError::WrongPageType);
         };
         let removed = match keys.binary_search(key) {
             Ok(i) => Some((keys.remove(i), children.remove(i + 1))),
@@ -1119,7 +1159,7 @@ impl Page {
     pub(crate) fn next(&self) -> Result<Option<PageId>, PageError> {
         match self.body {
             PageBody::Leaf { next, .. } => Ok(next),
-            _ => Err(PageError::NotLeaf),
+            _ => Err(PageError::WrongPageType),
         }
     }
 
@@ -1130,7 +1170,7 @@ impl Page {
                 *next = new;
                 Ok(())
             }
-            _ => Err(PageError::NotLeaf),
+            _ => Err(PageError::WrongPageType),
         }
     }
 
@@ -1138,7 +1178,7 @@ impl Page {
     pub(crate) fn prev(&self) -> Result<Option<PageId>, PageError> {
         match self.body {
             PageBody::Leaf { prev, .. } => Ok(prev),
-            _ => Err(PageError::NotLeaf),
+            _ => Err(PageError::WrongPageType),
         }
     }
 
@@ -1149,7 +1189,7 @@ impl Page {
                 *prev = new;
                 Ok(())
             }
-            _ => Err(PageError::NotLeaf),
+            _ => Err(PageError::WrongPageType),
         }
     }
 
@@ -1261,7 +1301,20 @@ impl Page {
                     return Err(CorruptionKind::UnsortedKeys { at: i + 1 });
                 }
             }
-            _ => todo!(),
+            PageBody::Meta {
+                page_count,
+                free_list_head,
+                ..
+            } => {
+                if let Some(flh) = free_list_head
+                    && flh.get_page_num() > *page_count
+                {
+                    return Err(CorruptionKind::PageNumOutOfRange(
+                        flh.get_page_num() as usize
+                    ));
+                }
+            }
+            PageBody::Free { .. } => {} // nothing to check in this arm
         }
         Ok(())
     }
@@ -1313,7 +1366,7 @@ impl Page {
     /// key isn't in the `Page`
     pub fn leaf_get(&self, key: &Key) -> Result<Option<&Row>, PageError> {
         let PageBody::Leaf { records, .. } = &self.body else {
-            return Err(PageError::NotLeaf);
+            return Err(PageError::WrongPageType);
         };
         Ok(records
             .binary_search_by(|r| r.cmp_key(key))
@@ -1327,7 +1380,7 @@ impl Page {
         start_key: &Key,
     ) -> Result<impl Iterator<Item = &'a Row> + use<'a>, PageError> {
         let PageBody::Leaf { records, .. } = &self.body else {
-            return Err(PageError::NotLeaf);
+            return Err(PageError::WrongPageType);
         };
         let start = records.partition_point(|r| r.cmp_key(start_key) == Ordering::Less);
         Ok(records[start..].iter())
@@ -1340,7 +1393,7 @@ impl Page {
             free + Self::internal_entry_size(old) >= Self::internal_entry_size(&new)
         });
         let PageBody::Internal { keys, .. } = &mut self.body else {
-            return Err(PageError::NotInternal);
+            return Err(PageError::WrongPageType);
         };
         let idx = keys.binary_search(old).map_err(|_| PageError::MissingKey {
             search_key: old.clone(),
@@ -1391,16 +1444,6 @@ impl Serializable for Page {
         let mut buf_one = [0u8; 1];
         cursor.read_exact(&mut buf_one)?;
         let tag = buf_one[0];
-        let is_leaf = match tag {
-            INTERNAL_TAG => false,
-            LEAF_TAG => true,
-            _ => {
-                return Err(PageError::Corrupt {
-                    page_id: None,
-                    kind: CorruptionKind::InvalidTag(tag),
-                });
-            }
-        };
 
         let page_id = PageId::deserialize(&mut cursor)?;
         let last_update = PageLsn::deserialize(&mut cursor)?;
@@ -1414,7 +1457,7 @@ impl Serializable for Page {
         // skip the crc32 portion
         cursor.set_position(CHECKSUM_OFFSET as u64 + 4);
 
-        let (next_page, prev_page) = if is_leaf {
+        let (next_page, prev_page) = if tag == LEAF_TAG {
             let np = Option::<PageId>::deserialize(&mut cursor)
                 .map_err(|_| corrupt(CorruptionKind::InvalidPointerTag))?;
             let pp = Option::<PageId>::deserialize(&mut cursor)
@@ -1428,53 +1471,83 @@ impl Serializable for Page {
         cursor.read_exact(&mut buf_two)?;
         let num_items = u16::from_be_bytes(buf_two) as usize;
 
-        let max_items = if is_leaf {
-            MAX_LEAF_ITEMS
-        } else {
-            MAX_INTERNAL_ITEMS
+        let max_items = match tag {
+            META_TAG => 0,
+            FREE_TAG => 0,
+            INTERNAL_TAG => MAX_INTERNAL_ITEMS,
+            LEAF_TAG => MAX_LEAF_ITEMS,
+            _ => {
+                return Err(PageError::Corrupt {
+                    page_id: None,
+                    kind: CorruptionKind::InvalidTag(tag),
+                });
+            }
         };
         if num_items > max_items {
             return Err(corrupt(CorruptionKind::TooManyItems(num_items)));
         }
 
-        let body = if is_leaf {
-            let ranges = Self::read_slot_ranges(&mut cursor, num_items).map_err(corrupt)?;
-            let records = ranges
-                .into_iter()
-                .enumerate()
-                .map(|(slot, range)| {
-                    Self::decode_slot(&buf[range], slot, |slot| CorruptionKind::CorruptRow {
-                        slot,
+        let body = match tag {
+            LEAF_TAG => {
+                let ranges = Self::read_slot_ranges(&mut cursor, num_items).map_err(corrupt)?;
+                let records = ranges
+                    .into_iter()
+                    .enumerate()
+                    .map(|(slot, range)| {
+                        Self::decode_slot(&buf[range], slot, |slot| CorruptionKind::CorruptRow {
+                            slot,
+                        })
+                        .map_err(corrupt)
                     })
-                    .map_err(corrupt)
-                })
-                .collect::<Result<Vec<Row>, PageError>>()?;
+                    .collect::<Result<Vec<Row>, PageError>>()?;
 
-            PageBody::Leaf {
-                next: next_page,
-                prev: prev_page,
-                records,
+                PageBody::Leaf {
+                    next: next_page,
+                    prev: prev_page,
+                    records,
+                }
             }
-        } else {
-            let mut children = Vec::with_capacity(num_items + 1);
-            for _ in 0..num_items + 1 {
-                children.push(
-                    PageId::deserialize(&mut cursor)
-                        .expect("slot array fits: num_items is bounded"),
-                );
-            }
-            let ranges = Self::read_slot_ranges(&mut cursor, num_items).map_err(corrupt)?;
-            let keys = ranges
-                .into_iter()
-                .enumerate()
-                .map(|(slot, range)| {
-                    Self::decode_slot(&buf[range], slot, |slot| CorruptionKind::CorruptKey {
-                        slot,
+            INTERNAL_TAG => {
+                let mut children = Vec::with_capacity(num_items + 1);
+                for _ in 0..num_items + 1 {
+                    children.push(
+                        PageId::deserialize(&mut cursor)
+                            .expect("slot array fits: num_items is bounded"),
+                    );
+                }
+                let ranges = Self::read_slot_ranges(&mut cursor, num_items).map_err(corrupt)?;
+                let keys = ranges
+                    .into_iter()
+                    .enumerate()
+                    .map(|(slot, range)| {
+                        Self::decode_slot(&buf[range], slot, |slot| CorruptionKind::CorruptKey {
+                            slot,
+                        })
+                        .map_err(corrupt)
                     })
-                    .map_err(corrupt)
-                })
-                .collect::<Result<Vec<Key>, PageError>>()?;
-            PageBody::Internal { keys, children }
+                    .collect::<Result<Vec<Key>, PageError>>()?;
+                PageBody::Internal { keys, children }
+            }
+            FREE_TAG => {
+                let next = Option::<PageId>::deserialize(&mut cursor)
+                    .map_err(|_| corrupt(CorruptionKind::InvalidPointerTag))?;
+                PageBody::Free { next }
+            }
+            META_TAG => {
+                let root_id = PageId::deserialize(&mut cursor)
+                    .map_err(|_| corrupt(CorruptionKind::InvalidPointerTag))?;
+                let mut buf_four = [0u8; 4];
+                cursor.read_exact(&mut buf_four)?;
+                let page_count = u32::from_be_bytes(buf_four);
+                let free_list_head = Option::<PageId>::deserialize(&mut cursor)
+                    .map_err(|_| corrupt(CorruptionKind::InvalidPointerTag))?;
+                PageBody::Meta {
+                    root_id,
+                    page_count,
+                    free_list_head,
+                }
+            }
+            _ => unreachable!(),
         };
 
         let page = Page {
@@ -1637,8 +1710,47 @@ mod tests {
         }
     }
 
+    /// A two-row leaf (both pointers `None`) and the byte offset of its slot array.
+    fn two_row_leaf() -> (RawPage, usize) {
+        let (schema, _) = leaf_schema();
+        let mut page = Page::empty_leaf(child(1));
+        for key in [1, 2] {
+            let row = Row {
+                fields: vec![RowValue::Integer(key), RowValue::String("abc".into())],
+            };
+            page.leaf_insert(schema.validate_row(row).unwrap()).unwrap();
+        }
+        // header with both sibling pointers None: MAX_LEAF_HEADER_SIZE minus 8 bytes each
+        (
+            page.as_raw_page().unwrap(),
+            MAX_LEAF_HEADER_SIZE - 2 * PAGE_ID_SIZE,
+        )
+    }
+
+    fn get_slot(bytes: &RawPage, slot_array: usize, slot: usize) -> (u16, u16) {
+        let at = slot_array + slot * SLOT_ENTRY_SIZE;
+        (
+            u16::from_be_bytes([bytes[at], bytes[at + 1]]),
+            u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]),
+        )
+    }
+
+    fn set_slot(bytes: &mut RawPage, slot_array: usize, slot: usize, offset: u16, length: u16) {
+        let at = slot_array + slot * SLOT_ENTRY_SIZE;
+        bytes[at..at + 2].copy_from_slice(&offset.to_be_bytes());
+        bytes[at + 2..at + 4].copy_from_slice(&length.to_be_bytes());
+    }
+
+    fn fix_checksum(bytes: &mut RawPage) {
+        let crc = Page::page_checksum(bytes);
+        bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+    }
+
     #[quickcheck]
     fn split_then_merge_roundtrip(mut page: Page) -> TestResult {
+        if !page.is_leaf() && !page.is_internal() {
+            return TestResult::discard();
+        }
         let snapshot = page.clone();
         let new_id = page.page_id.wrapping_add(1);
 
@@ -2798,8 +2910,8 @@ mod tests {
         let res1 = internal.leaf_remove(&dummy_key);
         let res2 = leaf.internal_remove(&dummy_key);
 
-        assert_matches!(res1, Err(PageError::NotLeaf));
-        assert_matches!(res2, Err(PageError::NotInternal));
+        assert_matches!(res1, Err(PageError::WrongPageType));
+        assert_matches!(res2, Err(PageError::WrongPageType));
 
         TestResult::passed()
     }
@@ -2929,10 +3041,10 @@ mod tests {
         let res3 = leaf.leaf_borrow_from_left(&mut internal);
         let res4 = leaf.leaf_borrow_from_right(&mut internal);
 
-        assert_matches!(res1, Err(PageError::NotLeaf));
-        assert_matches!(res2, Err(PageError::NotLeaf));
-        assert_matches!(res3, Err(PageError::NotLeaf));
-        assert_matches!(res4, Err(PageError::NotLeaf));
+        assert_matches!(res1, Err(PageError::WrongPageType));
+        assert_matches!(res2, Err(PageError::WrongPageType));
+        assert_matches!(res3, Err(PageError::WrongPageType));
+        assert_matches!(res4, Err(PageError::WrongPageType));
 
         let sep = Key::Integer(0);
 
@@ -2941,10 +3053,10 @@ mod tests {
         let res3 = leaf.internal_borrow_from_left(&mut internal, sep.clone());
         let res4 = leaf.internal_borrow_from_right(&mut internal, sep);
 
-        assert_matches!(res1, Err(PageError::NotInternal));
-        assert_matches!(res2, Err(PageError::NotInternal));
-        assert_matches!(res3, Err(PageError::NotInternal));
-        assert_matches!(res4, Err(PageError::NotInternal));
+        assert_matches!(res1, Err(PageError::WrongPageType));
+        assert_matches!(res2, Err(PageError::WrongPageType));
+        assert_matches!(res3, Err(PageError::WrongPageType));
+        assert_matches!(res4, Err(PageError::WrongPageType));
 
         TestResult::passed()
     }
@@ -3062,40 +3174,53 @@ mod tests {
         TestResult::passed()
     }
 
-    /// A two-row leaf (both pointers `None`) and the byte offset of its slot array.
-    fn two_row_leaf() -> (RawPage, usize) {
-        let (schema, _) = leaf_schema();
-        let mut page = Page::empty_leaf(child(1));
-        for key in [1, 2] {
-            let row = Row {
-                fields: vec![RowValue::Integer(key), RowValue::String("abc".into())],
-            };
-            page.leaf_insert(schema.validate_row(row).unwrap()).unwrap();
-        }
-        // header with both sibling pointers None: MAX_LEAF_HEADER_SIZE minus 8 bytes each
-        (
-            page.as_raw_page().unwrap(),
-            MAX_LEAF_HEADER_SIZE - 2 * PAGE_ID_SIZE,
-        )
+    #[quickcheck]
+    fn internal_borrow_returns_error_with_empty_donor(
+        InternalPage(mut left): InternalPage,
+    ) -> TestResult {
+        let mut right = internal_with_one_child(999);
+        let sep = Key::Integer(0);
+
+        let (before_left, before_right) = (left.clone(), right.clone());
+
+        let result = left.internal_borrow_from_right(&mut right, sep.clone());
+
+        assert_matches!(
+            result,
+            Err(PageError::InvalidBorrow(BorrowFailReason::EmptyBorrow(_)))
+        );
+        assert_unchanged(&before_left, &left);
+        assert_unchanged(&before_right, &right);
+
+        // now switch sides
+        let result = left.internal_borrow_from_left(&mut right, sep.clone());
+        assert_matches!(
+            result,
+            Err(PageError::InvalidBorrow(BorrowFailReason::EmptyBorrow(_)))
+        );
+        assert_unchanged(&before_left, &left);
+        assert_unchanged(&before_right, &right);
+
+        TestResult::passed()
     }
 
-    fn get_slot(bytes: &RawPage, slot_array: usize, slot: usize) -> (u16, u16) {
-        let at = slot_array + slot * SLOT_ENTRY_SIZE;
-        (
-            u16::from_be_bytes([bytes[at], bytes[at + 1]]),
-            u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]),
-        )
-    }
+    #[quickcheck]
+    fn internal_borrow_fails_when_separator_out_of_order(
+        InternalPage(mut left): InternalPage,
+    ) -> TestResult {
+        let Some((_separator, mut right)) = try_split(&mut left, child(2)) else {
+            return TestResult::discard();
+        };
 
-    fn set_slot(bytes: &mut RawPage, slot_array: usize, slot: usize, offset: u16, length: u16) {
-        let at = slot_array + slot * SLOT_ENTRY_SIZE;
-        bytes[at..at + 2].copy_from_slice(&offset.to_be_bytes());
-        bytes[at + 2..at + 4].copy_from_slice(&length.to_be_bytes());
-    }
+        let right_borrow_key = left.keys().unwrap().last().cloned().unwrap();
+        let result = left.internal_borrow_from_right(&mut right, right_borrow_key.clone());
+        assert_matches!(result, Err(PageError::InvalidBorrow(BorrowFailReason::KeysOutOfOrder(k))) if k == right_borrow_key);
 
-    fn fix_checksum(bytes: &mut RawPage) {
-        let crc = Page::page_checksum(bytes);
-        bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+        let left_borrow_key = right.keys().unwrap().next().cloned().unwrap();
+        let result = right.internal_borrow_from_left(&mut left, left_borrow_key.clone());
+        assert_matches!(result, Err(PageError::InvalidBorrow(BorrowFailReason::KeysOutOfOrder(k))) if k == left_borrow_key);
+
+        TestResult::passed()
     }
 
     #[test]
@@ -3354,7 +3479,7 @@ mod tests {
     ) -> TestResult {
         // first we check the internal page faults properly
         let result = internal.leaf_get(&Key::Integer(0));
-        assert_matches!(result, Err(PageError::NotLeaf));
+        assert_matches!(result, Err(PageError::WrongPageType));
 
         let size = page.num_items();
         if size == 0 {
@@ -3572,6 +3697,50 @@ mod tests {
         }
 
         assert_roundtrip(page);
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn find_child_index_round_trip(InternalPage(page): InternalPage) -> TestResult {
+        let PageBody::Internal { keys, .. } = &page.body else {
+            unreachable!()
+        };
+        let all_keys: Vec<&Key> = keys.iter().collect();
+
+        for key in all_keys {
+            let Some((child_idx, child_id)) = page.find_child_index(key) else {
+                unreachable!()
+            };
+            let found = page.child_at(child_idx);
+            assert_eq!(found, Some(child_id));
+        }
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn next_prev_getters_setters_only_work_on_leaves_and_leave_original_intact(
+        mut page: Page,
+    ) -> TestResult {
+        if page.is_leaf() {
+            return TestResult::discard();
+        }
+        let before = page.clone();
+
+        let next = page.next();
+        assert_matches!(next, Err(PageError::WrongPageType));
+        assert_unchanged(&before, &page);
+
+        let set_next = page.set_next(None);
+        assert_matches!(set_next, Err(PageError::WrongPageType));
+        assert_unchanged(&before, &page);
+
+        let prev = page.prev();
+        assert_matches!(prev, Err(PageError::WrongPageType));
+        assert_unchanged(&before, &page);
+
+        let set_prev = page.set_prev(None);
+        assert_matches!(set_prev, Err(PageError::WrongPageType));
+        assert_unchanged(&before, &page);
         TestResult::passed()
     }
 }

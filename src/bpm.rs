@@ -49,9 +49,11 @@ impl BufferPoolManagerBuilder {
     }
 }
 
-pub(crate) struct BufferPoolManager<Dm: DiskManager> {
+pub struct BufferPoolManager<Dm: DiskManager> {
     persistant_layer: Dm,
     eviction_policy: EvictionPolicy,
     wal: Option<Wal>,
     frames: [RwLock<Option<Box<PageFrame>>>; BUFFER_SIZE],
 }
+
+pub struct DiskManager<T: AsyncRead + AsyncWrite>;
