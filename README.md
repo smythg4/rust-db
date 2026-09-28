@@ -17,74 +17,72 @@ QUICKCHECK_TESTS=10000 cargo test
 ```
 
 ### Immediate To-Do
-  #### New code with no tests yet
-    - [ ] `leaf_get`: key present → that row; absent → `Ok(None)`; empty leaf → `Ok(None)`; internal page →
-  `NotLeaf`.
-    Add present and absent checks to `insertion_order_on_leaves` after every step
-    - [ ] `leaf_records_from` vs `BTreeMap::range(start..)`: start below all keys, equal to a key (included),
-    between keys, above all keys, empty page; internal page → `NotLeaf`
-    - [ ] `leaf_records_from`: iterator still usable after the key is dropped (guards `use<'a>`)
-    - [ ] `internal_replace_key`: borrow between children of a `new_root` parent, replace the separator →
-    `find_child` routes every key to the page that holds it
-    - [ ] `internal_replace_key` rejections (page unchanged): new ≤ left neighbor, new ≥ right neighbor,
-    old key missing (`MissingKey` returns `new`), larger key on a full page (`PageFull`), leaf page
-  (`NotInternal`)
-    - [ ] `internal_insert`: oversized key → `KeyTooLong`
+#### New code with no tests yet
+- [ ] `leaf_get`: key present → that row; absent → `Ok(None)`; empty leaf → `Ok(None)`; internal page →
+`NotLeaf`.
+Add present and absent checks to `insertion_order_on_leaves` after every step
+- [ ] `leaf_records_from` vs `BTreeMap::range(start..)`: start below all keys, equal to a key (included),
+between keys, above all keys, empty page; internal page → `NotLeaf`
+- [ ] `leaf_records_from`: iterator still usable after the key is dropped (guards `use<'a>`)
+- [ ] `internal_replace_key`: borrow between children of a `new_root` parent, replace the separator →
+`find_child` routes every key to the page that holds it
+- [ ] `internal_replace_key` rejections (page unchanged): new ≤ left neighbor, new ≥ right neighbor,
+old key missing (`MissingKey` returns `new`), larger key on a full page (`PageFull`), leaf page
+(`NotInternal`)
+- [ ] `internal_insert`: oversized key → `KeyTooLong`
 
-  #### Borrow rejections
-    - [ ] internal borrows, both directions: donor with 0 keys → `EmptyBorrow`; donor with 1 key → succeeds
-    - [ ] internal borrows: `self`'s edge key on the wrong side of the separator → `KeysOutOfOrder`
-    - [ ] internal borrows: donor's edge key on the wrong side of the separator → `KeysOutOfOrder`
-    - [ ] internal borrows: separator too big for `self` → `PageFull`
-    - [ ] leaf borrows, both directions: wrong neighbor → `PointerMismatch` (check expected/actual order)
-    - [ ] leaf borrows: overlapping ranges incl. an equal key → `KeysOutOfOrder`
-    - [ ] leaf borrow from left: destination full → `PageFull`; donor with 1 row → `EmptyBorrow`
-    - [ ] conservation test for `internal_borrow_from_left` (the right-hand version exists)
+#### Borrow rejections
+- [ ] internal borrows, both directions: donor with 0 keys → `EmptyBorrow`; donor with 1 key → succeeds
+- [ ] internal borrows: `self`'s edge key on the wrong side of the separator → `KeysOutOfOrder`
+- [ ] internal borrows: donor's edge key on the wrong side of the separator → `KeysOutOfOrder`
+- [ ] internal borrows: separator too big for `self` → `PageFull`
+- [ ] leaf borrows, both directions: wrong neighbor → `PointerMismatch` (check expected/actual order)
+- [ ] leaf borrows: overlapping ranges incl. an equal key → `KeysOutOfOrder`
+- [ ] leaf borrow from left: destination full → `PageFull`; donor with 1 row → `EmptyBorrow`
+- [ ] conservation test for `internal_borrow_from_left` (the right-hand version exists)
 
-  #### Merges
-    - [ ] underfull guarantee: two leaves just under `LEAF_UNDERFULL_BYTES` merge successfully
-    - [ ] underfull guarantee: two internal pages just under `INTERNAL_UNDERFULL_BYTES` + a max-size separator
-  merge successfully
-    - [ ] internal merge with an empty side (0 keys, 1 child) → 1 key, 2 children
+#### Merges
+- [ ] underfull guarantee: two leaves just under `LEAF_UNDERFULL_BYTES` merge successfully
+- [ ] underfull guarantee: two internal pages just under `INTERNAL_UNDERFULL_BYTES` + a max-size separator merge successfully
+- [ ] internal merge with an empty side (0 keys, 1 child) → 1 key, 2 children
 
-  #### Accessors and small functions
-    - [ ] `set_lsn`: smaller → `StaleLsnUpdate` (unchanged), equal and larger accepted; LSN survives a round trip
-    - [ ] `page_id()` after construction, split (new page), and round trip
-    - [ ] `can_insert_separator`: exact fit → true, one byte over → false, leaf → false
-    - [ ] `is_underfull`: exactly at each threshold, both page types
-    - [ ] `next`/`set_next`/`prev`/`set_prev` on an internal page → `NotLeaf`, page unchanged
-    - [ ] `split_page`: 0 or 1 rows, or fewer than 3 keys → `TooSmallToSplit`
+#### Accessors and small functions
+- [ ] `set_lsn`: smaller → `StaleLsnUpdate` (unchanged), equal and larger accepted; LSN survives a round trip
+- [ ] `page_id()` after construction, split (new page), and round trip
+- [ ] `can_insert_separator`: exact fit → true, one byte over → false, leaf → false
+- [ ] `is_underfull`: exactly at each threshold, both page types
+- [ ] `next`/`set_next`/`prev`/`set_prev` on an internal page → `NotLeaf`, page unchanged
+- [ ] `split_page`: 0 or 1 rows, or fewer than 3 keys → `TooSmallToSplit`
 
-  #### Routing and indexes
-    - [ ] `find_child_index`: index matches the linear-scan reference and `child_at(index)` equals the returned ID
-    - [ ] `child_at` / `key_at`: out of range → `None`; on a leaf → `None`
-    - [ ] `ChildIndex` navigation: index 0 has no left sibling/separator; for every child, keys routed to it lie
-    between `key_at(left_separator)` and `key_at(right_separator)`
+#### Routing and indexes
+- [ ] `find_child_index`: index matches the linear-scan reference and `child_at(index)` equals the returned ID
+- [ ] `child_at` / `key_at`: out of range → `None`; on a leaf → `None`
+- [ ] `ChildIndex` navigation: index 0 has no left sibling/separator; for every child, keys routed to it lie between `key_at(left_separator)` and `key_at(right_separator)`
 
-  #### Invariants and size limits
-    - [ ] `check_invariants` returns each kind: `RowTooLarge`, `KeyTooLarge` (leaf and internal), `ChildCountMismatch`, `UnsortedKeys { at }` (check `at`), `ExceedsCapacity` — build pages from `empty_page`
-    - [ ] `as_raw_page` refuses a page that fails `check_invariants`
-    - [ ] property: `as_raw_page` succeeds ⇒ `deserialize` returns the same page
-    - [ ] string of exactly `MAX_FIELD_LEN` bytes round-trips; one more → `FieldTooLong` with nothing written
-    - [ ] crafted string length prefix over `MAX_FIELD_LEN` → `FieldTooLong` on read
-    - [ ] `validate_row`: string field at the limit accepted, one byte over → `FieldTooLong`
-    - [ ] `Row::deserialize`: field count over `MAX_NUM_FIELDS` → `TooManyFields`
+#### Invariants and size limits
+- [ ] `check_invariants` returns each kind: `RowTooLarge`, `KeyTooLarge` (leaf and internal), `ChildCountMismatch`, `UnsortedKeys { at }` (check `at`), `ExceedsCapacity` — build pages from `empty_page`
+- [ ] `as_raw_page` refuses a page that fails `check_invariants`
+- [ ] property: `as_raw_page` succeeds ⇒ `deserialize` returns the same page
+- [ ] string of exactly `MAX_FIELD_LEN` bytes round-trips; one more → `FieldTooLong` with nothing written
+- [ ] crafted string length prefix over `MAX_FIELD_LEN` → `FieldTooLong` on read
+- [ ] `validate_row`: string field at the limit accepted, one byte over → `FieldTooLong`
+- [ ] `Row::deserialize`: field count over `MAX_NUM_FIELDS` → `TooManyFields`
 
-  #### Corruption kinds without a targeted test
-    - [ ] `InvalidTag`, `InvalidPointerTag`, `CorruptRow`, `MissingKey`, `InvalidKey`, `UnsortedKeys` (via slot swap), `ExceedsCapacity`, `RowTooLarge` / `KeyTooLarge` from `deserialize`
+#### Corruption kinds without a targeted test
+- [ ] `InvalidTag`, `InvalidPointerTag`, `CorruptRow`, `MissingKey`, `InvalidKey`, `UnsortedKeys` (via slot swap), `ExceedsCapacity`, `RowTooLarge` / `KeyTooLarge` from `deserialize`
 
-  #### Generators and helpers
-    - [ ] every `RowValue` and `ColumnType` variant is generated
-    - [ ] `higher_key(k) > k`
-    - [ ] `MAX_*_ITEMS` never too low (smallest distinct entries never exceed it)
-    - [ ] every shrink candidate passes `check_invariants`
+#### Generators and helpers
+- [ ] every `RowValue` and `ColumnType` variant is generated
+- [ ] `higher_key(k) > k`
+- [ ] `MAX_*_ITEMS` never too low (smallest distinct entries never exceed it)
+- [ ] every shrink candidate passes `check_invariants`
 
-  #### Durability
-    - [ ] Torn write: old/new page spliced at any offset decodes to old, new, or `Corrupt` — never a third page
+#### Durability
+- [ ] Torn write: old/new page spliced at any offset decodes to old, new, or `Corrupt` — never a third page
 
-  #### Before tests can cover them
-    - [ ] `Meta` / `Free`: finish or remove — `todo!()` / `unreachable!()` in `free_space`, `write_header`,
-    `write_body`, `check_invariants`, `split_page`, `entries_size`; then add round-trip and corruption tests
+#### Before tests can cover them
+- [ ] `Meta` / `Free`: finish or remove — `todo!()` / `unreachable!()` in `free_space`, `write_header`,
+`write_body`, `check_invariants`, `split_page`, `entries_size`; then add round-trip and corruption tests
 
 
 ### Phase 0 — Types
