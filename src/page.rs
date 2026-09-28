@@ -1221,6 +1221,9 @@ impl Page {
     /// Returns the first violation found. `deserialize` maps it to `PageError::Corrupt`;
     /// page operations call `debug_check_invariants` to catch bugs in this module.
     pub(crate) fn check_invariants(&self) -> Result<(), CorruptionKind> {
+        if self.free_space().is_none() {
+            return Err(CorruptionKind::ExceedsCapacity);
+        }
         match &self.body {
             PageBody::Leaf { records, .. } => {
                 let mut prev: Option<Key> = None;
@@ -1259,9 +1262,6 @@ impl Page {
                 }
             }
             _ => todo!(),
-        }
-        if self.free_space().is_none() {
-            return Err(CorruptionKind::ExceedsCapacity);
         }
         Ok(())
     }
@@ -2003,7 +2003,8 @@ mod tests {
             expected_keys
         );
         // children: the untouched leftmost child, then each key's right child in key order
-        let expected_children: Vec<PageId> = std::iter::once(leftmost)
+        let expected_children: Vec<PageId> = [leftmost]
+            .into_iter()
             .chain(expected.values().copied())
             .collect();
         assert_eq!(
@@ -2233,11 +2234,36 @@ mod tests {
             return TestResult::discard();
         };
 
+        // borrow from the right
         let new_separator = match left.internal_borrow_from_right(&mut right, separator) {
             Ok(sep) => sep,
             Err(PageError::InvalidBorrow(BorrowFailReason::EmptyBorrow(_))) => {
                 return TestResult::discard();
             }
+            Err(e) => panic!("unexpected borrow error: {e:?}"),
+        };
+
+        // left keys + the separator now in the parent + right keys == the original keys
+        let keys_after: Vec<Key> = left
+            .keys()
+            .unwrap()
+            .cloned()
+            .chain([new_separator.clone()])
+            .chain(right.keys().unwrap().cloned())
+            .collect();
+        let children_after: Vec<PageId> = left
+            .children()
+            .unwrap()
+            .chain(right.children().unwrap())
+            .copied()
+            .collect();
+
+        assert_eq!(original_keys, keys_after);
+        assert_eq!(original_children, children_after);
+
+        // now borrow from the left
+        let new_separator = match right.internal_borrow_from_left(&mut left, new_separator) {
+            Ok(sep) => sep,
             Err(e) => panic!("unexpected borrow error: {e:?}"),
         };
 
@@ -2924,7 +2950,7 @@ mod tests {
     }
 
     #[quickcheck]
-    fn leaf_borrows_fails_when_dest_full(payload_sizes: Vec<u16>) -> TestResult {
+    fn leaf_borrows_from_right_fails_when_dest_full(payload_sizes: Vec<u16>) -> TestResult {
         if payload_sizes.is_empty() {
             return TestResult::discard();
         }
@@ -2956,6 +2982,47 @@ mod tests {
 
         let (left_before, right_before) = (left.clone(), right.clone());
         let result = left.leaf_borrow_from_right(&mut right);
+
+        assert_matches!(result, Err(PageError::PageFull));
+        assert_unchanged(&left_before, &left);
+        assert_unchanged(&right_before, &right);
+
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn leaf_borrows_from_left_fails_when_dest_full(payload_sizes: Vec<u16>) -> TestResult {
+        if payload_sizes.is_empty() {
+            return TestResult::discard();
+        }
+        // Two valid, adjacent leaves: fill one page, then split it.
+        // fill_leaf uses keys 0, 10, 20, ... so every key on the left page is >= 0.
+        let mut left = fill_leaf(child(1), payload_sizes);
+        let Some((_separator, mut right)) = try_split(&mut left, child(2)) else {
+            return TestResult::discard();
+        };
+        // the donor must have a row to spare, or the borrow is rejected for that reason instead
+        if left.records().unwrap().count() < 2 {
+            return TestResult::discard();
+        }
+        let left_last = left.records().unwrap().last().cloned().unwrap();
+
+        // Refill the right page with the smallest possible rows until the left page's last
+        // row no longer fits. Keys should all be higher than anything in left or right.
+        let (schema, _) = leaf_schema();
+        let mut key = i64::MAX;
+        while right.can_insert(ValidatedRow::from_row(left_last.clone()).as_ref()) {
+            let filler = Row {
+                fields: vec![RowValue::Integer(key), RowValue::String(String::new())],
+            };
+            right
+                .leaf_insert(schema.validate_row(filler).unwrap())
+                .unwrap();
+            key -= 1;
+        }
+
+        let (left_before, right_before) = (left.clone(), right.clone());
+        let result = right.leaf_borrow_from_left(&mut left);
 
         assert_matches!(result, Err(PageError::PageFull));
         assert_unchanged(&left_before, &left);
@@ -3112,5 +3179,399 @@ mod tests {
             Page::deserialize(&mut &bytes[..]),
             Err(PageError::Corrupt { kind, .. }) if !matches!(kind, CorruptionKind::TooManyItems(_))
         );
+    }
+
+    #[quickcheck]
+    fn internal_unsorted_keys_triggers_corrupt(
+        InternalPage(mut page): InternalPage,
+        i: u8,
+    ) -> TestResult {
+        if page.num_items() < 2 {
+            return TestResult::discard();
+        }
+        let i = i as usize % (page.num_items() - 1);
+        let j = i + 1;
+
+        let PageBody::Internal { keys, .. } = &mut page.body else {
+            unreachable!()
+        };
+        // swap two adjacent keys
+        keys.swap(i, j);
+
+        let result = page.serialize(&mut Vec::new());
+
+        assert_matches!(result, Err(PageError::Corrupt { page_id: Some(pid), kind: CorruptionKind::UnsortedKeys { at } }) if pid == page.page_id() && at == j);
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn too_many_entries_triggers_exceed_capacity(mut page: Page) -> TestResult {
+        // we want something that's at least half full
+        if page.is_underfull() {
+            return TestResult::discard();
+        }
+
+        // double the number of entries until we're overfull
+        while page.free_space().is_some() {
+            if page.is_leaf() {
+                let PageBody::Leaf { records, .. } = &mut page.body else {
+                    unreachable!()
+                };
+                let rec_clone = records.clone();
+                records.extend(rec_clone.into_iter().cycle().take(5));
+            } else {
+                let PageBody::Internal { keys, children } = &mut page.body else {
+                    unreachable!()
+                };
+                let key_clone = keys.clone();
+                let num_keys = key_clone.len();
+                let child_clone = children.clone();
+                keys.extend(key_clone.clone().into_iter());
+                children.extend(child_clone.clone().into_iter().take(num_keys));
+            }
+        }
+        assert_eq!(page.free_space(), None);
+        let result = page.as_raw_page();
+
+        assert_matches!(
+            result,
+            Err(PageError::Corrupt {
+                kind: CorruptionKind::ExceedsCapacity,
+                ..
+            })
+        );
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn internal_invalid_key_triggers_corruption(
+        InternalPage(page): InternalPage,
+        idx: u8,
+        bool_val: bool,
+        float_val: f64,
+    ) -> TestResult {
+        let size = page.num_items();
+        if size == 0 {
+            return TestResult::discard();
+        }
+        let idx = idx as usize % size;
+        let original = page.as_raw_page().expect("page should serialize");
+
+        // the slot array follows the header and the (size + 1) children
+        let slot_array = MAX_INTERNAL_HEADER_SIZE + (size + 1) * PAGE_ID_SIZE;
+        let (offset, length) = get_slot(&original, slot_array, idx);
+
+        let not_keys = [
+            RowValue::Null,
+            RowValue::Boolean(bool_val),
+            RowValue::Float(float_val),
+        ];
+
+        for value in not_keys {
+            let mut encoded = Vec::new();
+            value.serialize(&mut encoded).unwrap();
+            // write it at the start of the key's slot and shrink the slot to match;
+            // skip values larger than the key they replace (e.g. a float over a 2-byte key)
+            if encoded.len() > length as usize {
+                continue;
+            }
+            let mut bytes = original;
+            let start = offset as usize;
+            bytes[start..start + encoded.len()].copy_from_slice(&encoded);
+            set_slot(&mut bytes, slot_array, idx, offset, encoded.len() as u16);
+            fix_checksum(&mut bytes);
+
+            assert_matches!(
+                Page::deserialize(&mut &bytes[..]),
+                Err(PageError::Corrupt { kind: CorruptionKind::CorruptKey { slot }, .. }) if slot == idx
+            );
+        }
+
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn leaf_invalid_key_triggers_corruption(
+        LeafPage(page): LeafPage,
+        idx: u8,
+        bool_val: bool,
+        float_val: f64,
+    ) -> TestResult {
+        let size = page.num_items();
+        if size == 0 {
+            return TestResult::discard();
+        }
+        let idx = idx as usize % size;
+        let original = page.as_raw_page().expect("page should serialize");
+
+        // the slot array follows the header (account for `None` pointers)
+        let none_pointers = [page.next().unwrap(), page.prev().unwrap()]
+            .iter()
+            .filter(|p| p.is_none())
+            .count();
+        let slot_array = MAX_LEAF_HEADER_SIZE - none_pointers * PAGE_ID_SIZE;
+        let (offset, length) = get_slot(&original, slot_array, idx);
+
+        let not_keys = [
+            RowValue::Null,
+            RowValue::Boolean(bool_val),
+            RowValue::Float(float_val),
+        ];
+
+        for value in not_keys {
+            let mut encoded = Vec::new();
+            Row {
+                fields: vec![value],
+            }
+            .serialize(&mut encoded)
+            .unwrap();
+            if encoded.len() > length as usize {
+                continue;
+            }
+            let mut bytes = original;
+            let start = offset as usize;
+            bytes[start..start + encoded.len()].copy_from_slice(&encoded);
+            set_slot(&mut bytes, slot_array, idx, offset, encoded.len() as u16);
+            fix_checksum(&mut bytes);
+
+            assert_matches!(
+                Page::deserialize(&mut &bytes[..]),
+                Err(PageError::Corrupt {
+                    kind: CorruptionKind::InvalidKey(_),
+                    ..
+                }),
+            );
+        }
+
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn leaf_get_works(
+        LeafPage(mut page): LeafPage,
+        idx: u8,
+        InternalPage(internal): InternalPage,
+    ) -> TestResult {
+        // first we check the internal page faults properly
+        let result = internal.leaf_get(&Key::Integer(0));
+        assert_matches!(result, Err(PageError::NotLeaf));
+
+        let size = page.num_items();
+        if size == 0 {
+            // this leaf's empty, so we'll do the empty check here and return early
+            let result = page.leaf_get(&Key::Integer(0));
+            assert_matches!(result, Ok(None));
+            return TestResult::passed();
+        }
+
+        // Now make a dummy empty leaf to check
+        let empty = Page::empty_leaf(child(0));
+        let result = empty.leaf_get(&Key::Integer(0));
+        assert_matches!(result, Ok(None));
+
+        // Now find a row that actually exists
+        let idx = idx as usize % size;
+        let expected = page.records().unwrap().nth(idx).cloned().unwrap();
+        let key = Key::try_from(&expected.fields[0]).expect("key should be valid");
+
+        let result = page.leaf_get(&key);
+        assert_matches!(result, Ok(Some(got)) if got == &expected);
+
+        // Now find create a key that's out of bounds
+        let last_row = page.records().unwrap().last().cloned().unwrap();
+        let last_key = Key::try_from(&last_row.fields[0]).expect("last key should be valid");
+
+        let result = page.leaf_get(&higher_key(&last_key));
+        assert_matches!(result, Ok(None));
+
+        // Now we'll remove a random key and then try to find it
+        let expected = page.records().unwrap().nth(idx).cloned().unwrap();
+        let key = Key::try_from(&expected.fields[0]).expect("key should be valid");
+
+        page.leaf_remove(&key).expect("remove should succeed");
+
+        let result = page.leaf_get(&key);
+        assert_matches!(result, Ok(None));
+
+        // put it back and we should find it
+        let valid = ValidatedRow::from_row(expected.clone());
+        page.leaf_insert(valid).expect("insert should work");
+
+        let result = page.leaf_get(&key);
+        assert_matches!(result, Ok(Some(got)) if got == &expected);
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn leaf_records_from_works(LeafPage(page): LeafPage, start_key: Key, pick: u8) -> TestResult {
+        use std::collections::BTreeMap;
+
+        // reference: the page's rows keyed by primary key
+        let model: BTreeMap<Key, Row> = page
+            .records()
+            .unwrap()
+            .map(|r| (Key::try_from(&r.fields[0]).unwrap(), r.clone()))
+            .collect();
+
+        // start keys to try: a random key (usually not on the page), an existing key,
+        // and one just above an existing key
+        let mut starts = vec![start_key];
+        if !model.is_empty() {
+            let existing = model
+                .keys()
+                .nth(pick as usize % model.len())
+                .unwrap()
+                .clone();
+            starts.push(higher_key(&existing));
+            starts.push(existing);
+        }
+        for start in &starts {
+            let expected: Vec<&Row> = model.range(start..).map(|(_, row)| row).collect();
+            let actual: Vec<&Row> = page.leaf_records_from(start).expect("leaf scan").collect();
+            assert_eq!(expected, actual, "scan from {start:?}");
+        }
+        TestResult::passed()
+    }
+
+    #[test]
+    fn leaf_records_from_iterator_works_after_dropping_key() {
+        let page = fill_leaf(child(1), vec![1]);
+
+        // grab the first key in the leaf
+        let first_key =
+            ValidatedRow::from_row(page.records().unwrap().next().cloned().unwrap()).primary_key();
+
+        // build our row iterator from the first entry
+        let mut iterator = page
+            .leaf_records_from(&first_key)
+            .expect("scan should succeed");
+
+        // drop the reference key
+        drop(first_key);
+
+        // make sure iterator is still alive
+        assert!(iterator.next().is_some());
+    }
+
+    #[quickcheck]
+    fn leaf_borrow_with_parent_update_keeps_routing_correct(
+        LeafPage(mut left): LeafPage,
+    ) -> TestResult {
+        // fix the page id
+        left.page_id = child(1);
+        // split into two pages
+        let Some((sep, mut right)) = try_split(&mut left, child(2)) else {
+            return TestResult::discard();
+        };
+
+        // make a new root that references both
+        let mut root = Page::new_root(child(3), left.page_id, sep.clone(), right.page_id);
+
+        let new_sep = if right.num_items() > 2 {
+            // borrow from right
+            left.leaf_borrow_from_right(&mut right)
+                .expect("borrow shouldn't fail")
+        } else if left.num_items() > 2 {
+            // borrow from left
+            right
+                .leaf_borrow_from_left(&mut left)
+                .expect("borrow shouldn't fail")
+        } else {
+            return TestResult::discard();
+        };
+
+        // update the root
+        root.internal_replace_key(&sep, new_sep.clone())
+            .expect("replace should work");
+        // make sure the keys are correct
+        assert_eq!(vec![&new_sep], root.keys().unwrap().collect::<Vec<&Key>>());
+
+        for (page, other) in [(&left, &right), (&right, &left)] {
+            for row in page.records().unwrap() {
+                let key = Key::try_from(&row.fields[0]).unwrap();
+                assert_eq!(
+                    root.find_child(&key),
+                    Some(page.page_id()),
+                    "{key:?} routed to the wrong leaf"
+                );
+                assert_matches!(page.leaf_get(&key), Ok(Some(_))); // finds key in the correct child
+                assert_matches!(other.leaf_get(&key), Ok(None)); // and it isn't also on the other page
+            }
+        }
+
+        TestResult::passed()
+    }
+
+    #[test]
+    fn internal_insert_too_long_key_works() {
+        let test_boundary = MAX_INTERNAL_ENTRY_SIZE - PAGE_ID_SIZE - SLOT_ENTRY_SIZE - 1 - 2;
+
+        let mut page = internal_with_one_child(1);
+
+        let row = Row::try_from(vec![RowValue::String("a".repeat(test_boundary + 1))]).unwrap();
+
+        let key = ValidatedRow::from_row(row).primary_key();
+
+        let result = page.internal_insert(key, child(999));
+
+        assert_matches!(result, Err(PageError::Schema(SchemaError::KeyTooLong(_))));
+
+        let row = Row::try_from(vec![RowValue::String("a".repeat(test_boundary))]).unwrap();
+
+        let key = ValidatedRow::from_row(row).primary_key();
+
+        let result = page.internal_insert(key, child(999));
+
+        assert_matches!(result, Ok(_));
+    }
+
+    #[test]
+    fn internal_merge_with_min_internal_counting() {
+        let sep = Key::Integer(1);
+        let mut left = internal_with_one_child(1);
+        let mut right = internal_with_one_child(2);
+
+        let foo = left
+            .internal_merge_from_right(&mut right, sep)
+            .expect("merge should succeed");
+        assert_eq!(foo, right.page_id);
+        assert_eq!(left.keys().unwrap().count(), 1);
+        assert_eq!(left.children().unwrap().count(), 2);
+    }
+
+    #[quickcheck]
+    fn lsn_sequence_enforced(mut page: Page, new_lsn: u64) -> TestResult {
+        if new_lsn == 0 {
+            return TestResult::discard();
+        }
+
+        // make sure stales are detected
+        match page.lsn() {
+            Some(lsn) if lsn.get() < 2 => return TestResult::discard(),
+            Some(lsn) => {
+                let old_lsn = lsn;
+                let new_lsn = Lsn::new(old_lsn.get().saturating_sub(1)).unwrap();
+                let result = page.set_lsn(new_lsn);
+                assert_matches!(result, Err(PageError::StaleLsnUpdate { old, new }) if old == old_lsn && new == new_lsn )
+            }
+            None => {}
+        }
+
+        // make sure updates are accepted
+        match page.lsn() {
+            Some(lsn) if lsn.get() == u64::MAX => return TestResult::discard(),
+            Some(lsn) => {
+                let old_lsn = lsn;
+                let new_lsn = Lsn::new(old_lsn.get().saturating_add(1)).unwrap();
+                page.set_lsn(new_lsn).expect("valid updates should take");
+            }
+            None => {
+                page.set_lsn(Lsn::new(new_lsn).unwrap())
+                    .expect("None overwrites should always succeed");
+            }
+        }
+
+        assert_roundtrip(page);
+        TestResult::passed()
     }
 }

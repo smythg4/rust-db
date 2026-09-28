@@ -413,7 +413,9 @@ mod tests {
     use crate::test_support::*;
     use quickcheck::{Arbitrary, Gen, TestResult};
     use quickcheck_macros::quickcheck;
+    use std::collections::HashSet;
     use std::io::Cursor;
+    use std::mem::discriminant;
 
     fn non_nan_f64(g: &mut Gen) -> f64 {
         let mut f = f64::arbitrary(g);
@@ -788,5 +790,47 @@ mod tests {
     fn cmp_key_equal_to_own_key(row: Row) -> bool {
         let row_key = Key::try_from(&row.fields[0]).unwrap();
         row.cmp_key(&row_key) == std::cmp::Ordering::Equal
+    }
+
+    #[test]
+    fn generator_produces_every_row_value_variant() {
+        let mut g = Gen::new(100);
+        let seen: HashSet<_> = (0..1_000)
+            .map(|_| discriminant(&RowValue::arbitrary(&mut g)))
+            .collect();
+
+        let all = [
+            RowValue::Null,
+            RowValue::Boolean(false),
+            RowValue::Float(0.0),
+            RowValue::Integer(0),
+            RowValue::String("s".into()),
+        ];
+        for ty in all {
+            assert!(
+                seen.contains(&discriminant(&ty)),
+                "generator never produced {ty:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generator_produces_every_column_type() {
+        let mut g = Gen::new(100);
+        let seen: HashSet<_> = (0..1_000)
+            .map(|_| discriminant(&ColumnType::arbitrary(&mut g)))
+            .collect();
+
+        for ty in [
+            ColumnType::Integer,
+            ColumnType::Float,
+            ColumnType::String,
+            ColumnType::Bool,
+        ] {
+            assert!(
+                seen.contains(&discriminant(&ty)),
+                "generator never produced {ty:?}"
+            );
+        }
     }
 }

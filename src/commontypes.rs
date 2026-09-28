@@ -418,4 +418,12 @@ mod tests {
         assert_roundtrip(page_lsn);
         TestResult::passed()
     }
+
+    #[quickcheck]
+    fn higher_key_helper_works(k: Key) -> TestResult {
+        let hk = higher_key(&k);
+
+        assert!(hk > k);
+        TestResult::passed()
+    }
 }
