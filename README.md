@@ -17,53 +17,74 @@ QUICKCHECK_TESTS=10000 cargo test
 ```
 
 ### Immediate To-Do
-  - [x] Write `insert` for internal pages - will make current tests much nicer.
-  - [x] `Option` deserialize: return an `InvalidData` io error instead of panicking on bad tags
-  - [x] Replace `expect`s in `Page::deserialize` with `PageError::Corrupt`; validate invariants on read (valid key
-  in field 0, strictly sorted keys, children = keys + 1)
-  - [x] Corrupt-input tests: random/mutated page bytes never panic; truncated values return `Err`
-  - [x] Cap total row size (vs. usable leaf space) and key size (vs. internal node space) in `validate_row`; unify
-  raw vs. encoded length limits
-  - [x] Split leaves by bytes, not count, so a post-split retry always fits
-  - [x] Split tests: discard only `TooSmallToSplit`; strict leaf sortedness `debug_assert`
-  - [x] Generators: integer keys in internal nodes, random `None` pointers (loosen `free_space_works`
-  accordingly), fuller pages
-  - [x] Round-trip + size tests for `PageLsn`, `Lsn`, `PageId`, `SlotEntry`, `Option<T>`
-  - [x] Rewrite `page_insert_returns_page_full_when_full`; tidy `validate_row`, `Row::try_from`,
-  `PageLsn::deserialize`
-  - [x] `find_child` tests: boundaries + split-then-route
-  - [x] Handle primitive type errors as `PageError::Corrupt { kind }` in `Page::deserialize` where appropriate.
-  - [x] Add a `merge_page` method for use when deletions reduce page size to half full
-  - [x] Write test cases for `merge_page`
-    - [x] Test for `PageFull` errors
-    - [x] Test for `InvalidMerge` errors (duplicate keys, unsorted keys, bad pointers, page type mismatch)
-    - [x] Test for original page preservation after merge failure
-    - [x] Test for `Page` split, then remerge. Should always succeed and be byte-for-byte of original. Ensure the new page id is provided as the "Freed page"
-  - [x] Move common test helpers into a test_support.rs module. Build some more helpers to remove redundancy inside tests.
-  - [x] Add `internal_remove` method to remove a key from an internal page. Returns (`Key`, `PageId`) for separator `Key` and child `PageId`
-  - [x] Add `leaf_remove` to remove a record from a leaf page. Returns `Row` removed.
-  - [x] Add `internal_borrow` and `leaf_borrow` to move a single entry from one page to another. Should return a new separator `Key` to insert into the parent. Will need both `left` and `right` varieties and needs a `Key` from the parent `Page` to insert into one of the `Page`s for `internal` variants.
-    - [x] `leaf_borrow` needs to make sure the `other` `Page` is the proper neighbor.
-    - [x] Both `borrow`s needs to check that the donor `Page` isn't empty and that the new entries actually fits in the current `Page`
-  - [ ] Add tests for `internal_remove`, `leaf_remove`, `internal_borrow`, and `leaf_borrow`.
-    - [x] `remove` returns `Ok(None)` for non-existent entries or `Key` not in range.
-    - [x] `remove` returns `Err(NotLeaf)` or `Err(NotInternal)` if the `Page` type is wrong.
-    - [x] `remove` followed by `insert` from the return results in the same `Page`
-    - [x] Confirm proper `find_child` routing after a `Key` removal.
-    - [ ] `borrow` returns error on empty `Pages` (currently leaves only)
-    - [x] `borrow` returns `Err(NotLeaf)` or `Err(NotInternal)` if the `Page` type is wrong (currently leaves only)
-    - [x] `borrow` returns the correct `Key` to insert in the parent `Page`
-    - [x] `borrow` then `borrow_back` results in the original same `Page`
-    - [ ] `borrow` results in no loss between the two `Page`s (just like `no_loss_on_split`)
-    - [ ] Every failed `borrow` leaves both `Page`s unchanged.
-  - [x] Check for overlapping `SlotEntries` on deserialize
-  - [x] Write a `check_invariants` method ala SQLite that's called as a `debug_assert` on all `Page` modifications.
-  - [ ] Write `internal_replace_key(&mut self, old_key: &Key, new_key: Key)` for parents to use after a borrow, keeping children in place.
-  - [x] Write `leaf_get(&self, key: &Key) -> Result<Option<&Row>, PageError>`
-  - [ ] Write `leaf_records_scan(&self, start_key: &Key, end_key: &Key) -> impl Iterator<Item = &Row>` that begins at the first row >= `start_key` and fetches records until row >= `end_key`.
-  - [ ] Add a `PageBody::Meta` variant for meta data (table's page 0). Should include: `root_id`, `page_count`, and `free_list`. Need a new type tag too.
-  - [ ] Add a `PageBody::Free` variant to mark pages as free and available for repurposing. Need a new type tag too.
-  - [x] Add a `can_insert_separator(&self, key: &Key) -> bool` for internal pages to do the same duty as `can_insert` for leaf pages.
+  #### New code with no tests yet
+    - [ ] `leaf_get`: key present → that row; absent → `Ok(None)`; empty leaf → `Ok(None)`; internal page →
+  `NotLeaf`.
+    Add present and absent checks to `insertion_order_on_leaves` after every step
+    - [ ] `leaf_records_from` vs `BTreeMap::range(start..)`: start below all keys, equal to a key (included),
+    between keys, above all keys, empty page; internal page → `NotLeaf`
+    - [ ] `leaf_records_from`: iterator still usable after the key is dropped (guards `use<'a>`)
+    - [ ] `internal_replace_key`: borrow between children of a `new_root` parent, replace the separator →
+    `find_child` routes every key to the page that holds it
+    - [ ] `internal_replace_key` rejections (page unchanged): new ≤ left neighbor, new ≥ right neighbor,
+    old key missing (`MissingKey` returns `new`), larger key on a full page (`PageFull`), leaf page
+  (`NotInternal`)
+    - [ ] `internal_insert`: oversized key → `KeyTooLong`
+
+  #### Borrow rejections
+    - [ ] internal borrows, both directions: donor with 0 keys → `EmptyBorrow`; donor with 1 key → succeeds
+    - [ ] internal borrows: `self`'s edge key on the wrong side of the separator → `KeysOutOfOrder`
+    - [ ] internal borrows: donor's edge key on the wrong side of the separator → `KeysOutOfOrder`
+    - [ ] internal borrows: separator too big for `self` → `PageFull`
+    - [ ] leaf borrows, both directions: wrong neighbor → `PointerMismatch` (check expected/actual order)
+    - [ ] leaf borrows: overlapping ranges incl. an equal key → `KeysOutOfOrder`
+    - [ ] leaf borrow from left: destination full → `PageFull`; donor with 1 row → `EmptyBorrow`
+    - [ ] conservation test for `internal_borrow_from_left` (the right-hand version exists)
+
+  #### Merges
+    - [ ] underfull guarantee: two leaves just under `LEAF_UNDERFULL_BYTES` merge successfully
+    - [ ] underfull guarantee: two internal pages just under `INTERNAL_UNDERFULL_BYTES` + a max-size separator
+  merge successfully
+    - [ ] internal merge with an empty side (0 keys, 1 child) → 1 key, 2 children
+
+  #### Accessors and small functions
+    - [ ] `set_lsn`: smaller → `StaleLsnUpdate` (unchanged), equal and larger accepted; LSN survives a round trip
+    - [ ] `page_id()` after construction, split (new page), and round trip
+    - [ ] `can_insert_separator`: exact fit → true, one byte over → false, leaf → false
+    - [ ] `is_underfull`: exactly at each threshold, both page types
+    - [ ] `next`/`set_next`/`prev`/`set_prev` on an internal page → `NotLeaf`, page unchanged
+    - [ ] `split_page`: 0 or 1 rows, or fewer than 3 keys → `TooSmallToSplit`
+
+  #### Routing and indexes
+    - [ ] `find_child_index`: index matches the linear-scan reference and `child_at(index)` equals the returned ID
+    - [ ] `child_at` / `key_at`: out of range → `None`; on a leaf → `None`
+    - [ ] `ChildIndex` navigation: index 0 has no left sibling/separator; for every child, keys routed to it lie
+    between `key_at(left_separator)` and `key_at(right_separator)`
+
+  #### Invariants and size limits
+    - [ ] `check_invariants` returns each kind: `RowTooLarge`, `KeyTooLarge` (leaf and internal), `ChildCountMismatch`, `UnsortedKeys { at }` (check `at`), `ExceedsCapacity` — build pages from `empty_page`
+    - [ ] `as_raw_page` refuses a page that fails `check_invariants`
+    - [ ] property: `as_raw_page` succeeds ⇒ `deserialize` returns the same page
+    - [ ] string of exactly `MAX_FIELD_LEN` bytes round-trips; one more → `FieldTooLong` with nothing written
+    - [ ] crafted string length prefix over `MAX_FIELD_LEN` → `FieldTooLong` on read
+    - [ ] `validate_row`: string field at the limit accepted, one byte over → `FieldTooLong`
+    - [ ] `Row::deserialize`: field count over `MAX_NUM_FIELDS` → `TooManyFields`
+
+  #### Corruption kinds without a targeted test
+    - [ ] `InvalidTag`, `InvalidPointerTag`, `CorruptRow`, `MissingKey`, `InvalidKey`, `UnsortedKeys` (via slot swap), `ExceedsCapacity`, `RowTooLarge` / `KeyTooLarge` from `deserialize`
+
+  #### Generators and helpers
+    - [ ] every `RowValue` and `ColumnType` variant is generated
+    - [ ] `higher_key(k) > k`
+    - [ ] `MAX_*_ITEMS` never too low (smallest distinct entries never exceed it)
+    - [ ] every shrink candidate passes `check_invariants`
+
+  #### Durability
+    - [ ] Torn write: old/new page spliced at any offset decodes to old, new, or `Corrupt` — never a third page
+
+  #### Before tests can cover them
+    - [ ] `Meta` / `Free`: finish or remove — `todo!()` / `unreachable!()` in `free_space`, `write_header`,
+    `write_body`, `check_invariants`, `split_page`, `entries_size`; then add round-trip and corruption tests
 
 
 ### Phase 0 — Types

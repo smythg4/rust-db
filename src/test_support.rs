@@ -77,8 +77,8 @@ pub(crate) fn padded_key(index: usize, total_len: usize) -> Key {
 /// Two-column schema (integer key + string payload) and the largest payload that still validates.
 pub(crate) fn leaf_schema() -> (Schema, usize) {
     let schema = Schema::try_from(vec![
-        Column::integer("int column".into()),
-        Column::string("string column".into()),
+        Column::integer("int column").unwrap(),
+        Column::string("string column").unwrap(),
     ])
     .unwrap();
     let row_with = |key: i64, len: usize| Row {
@@ -127,17 +127,6 @@ pub(crate) fn valid_row_from_schema(schema: &Schema, g: &mut Gen) -> ValidatedRo
             break vr;
         }
     }
-}
-
-pub(crate) fn increment_key_on_row(row: &Row) -> Row {
-    let mut new_row = row.clone();
-    let new_key = match &row.fields[0] {
-        RowValue::Integer(n) => RowValue::Integer(n.wrapping_add(1)),
-        RowValue::String(s) => RowValue::String(format!("{s}1")),
-        _ => unreachable!(),
-    };
-    new_row.fields[0] = new_key;
-    new_row
 }
 
 pub(crate) fn assert_unchanged(before: &Page, after: &Page) {

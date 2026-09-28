@@ -109,6 +109,10 @@ pub enum PageError {
     InvalidBorrow(BorrowFailReason),
     #[error("Stale Lsn. Old {old}, New {new}")]
     StaleLsnUpdate { old: Lsn, new: Lsn },
+    #[error("Attempt to replace a `Key` that doesn't exist: {search_key:?} with {new_key:?}")]
+    MissingKey { search_key: Key, new_key: Key },
+    #[error("Attempt to insert a `Key` that's out of order with others: {0:?}")]
+    KeyNotInOrder(Key),
 }
 
 #[derive(Error, Debug, Clone, PartialEq)]
@@ -1317,13 +1321,44 @@ impl Page {
             .map(|i| &records[i]))
     }
 
-    /// Returns all records in a leaf that are >= `start_key`
-    pub fn leaf_records_from(&self, start_key: &Key) -> Result<&[Row], PageError> {
+    /// Returns an iterator of records in a leaf that are >= `start_key`
+    pub fn leaf_records_from<'a>(
+        &'a self,
+        start_key: &Key,
+    ) -> Result<impl Iterator<Item = &'a Row> + use<'a>, PageError> {
         let PageBody::Leaf { records, .. } = &self.body else {
             return Err(PageError::NotLeaf);
         };
         let start = records.partition_point(|r| r.cmp_key(start_key) == Ordering::Less);
-        Ok(&records[start..])
+        Ok(records[start..].iter())
+    }
+
+    /// Accepts a `Key` by value to replace a `&Key` in an internal `Page`
+    /// Used to replace a separator after a borrow, keeping its children in place
+    pub fn internal_replace_key(&mut self, old: &Key, new: Key) -> Result<(), PageError> {
+        let fits = self.free_space().is_some_and(|free| {
+            free + Self::internal_entry_size(old) >= Self::internal_entry_size(&new)
+        });
+        let PageBody::Internal { keys, .. } = &mut self.body else {
+            return Err(PageError::NotInternal);
+        };
+        let idx = keys.binary_search(old).map_err(|_| PageError::MissingKey {
+            search_key: old.clone(),
+            new_key: new.clone(),
+        })?;
+
+        let above_left = idx == 0 || keys[idx - 1] < new;
+        let below_right = idx + 1 == keys.len() || new < keys[idx + 1];
+        if !(above_left && below_right) {
+            return Err(PageError::KeyNotInOrder(new));
+        }
+        if !fits {
+            return Err(PageError::PageFull);
+        }
+
+        keys[idx] = new;
+        self.debug_check_invariants("internal_replace_key");
+        Ok(())
     }
 }
 
@@ -2094,98 +2129,168 @@ mod tests {
     }
 
     #[quickcheck]
-    fn no_rows_lost_in_split(mut page: Page) -> TestResult {
-        let mut original_keys: Vec<Key> = Vec::new();
-        let mut original_children: Vec<PageId> = Vec::new();
-        let mut original_records: Vec<Row> = Vec::new();
+    fn no_rows_lost_in_leaf_split(LeafPage(mut page): LeafPage) -> TestResult {
+        let original_records: Vec<Row> = page.records().unwrap().cloned().collect();
 
-        match &page.body {
-            PageBody::Internal { keys, children } => {
-                original_keys = keys.clone();
-                original_children = children.clone();
-            }
-            PageBody::Leaf { records, .. } => {
-                original_records = records.clone();
-            }
-            _ => unreachable!(),
+        let new_id = page.page_id.wrapping_add(1);
+
+        let Some((_split_key, new_page)) = try_split(&mut page, new_id) else {
+            return TestResult::discard();
         };
+
+        let combined_records: Vec<Row> = page
+            .records()
+            .unwrap()
+            .chain(new_page.records().unwrap())
+            .cloned()
+            .collect();
+
+        assert_eq!(original_records, combined_records);
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn no_keys_or_chidren_lost_in_internal_split(
+        InternalPage(mut page): InternalPage,
+    ) -> TestResult {
+        let original_keys: Vec<Key> = page.keys().unwrap().cloned().collect();
+        let original_children: Vec<PageId> = page.children().unwrap().cloned().collect();
+
         let new_id = page.page_id.wrapping_add(1);
 
         let Some((split_key, new_page)) = try_split(&mut page, new_id) else {
             return TestResult::discard();
         };
-        match new_page.body {
-            PageBody::Internal {
-                keys: new_keys,
-                children: new_children,
-            } => {
-                let old_keys: Vec<Key> = page.keys().unwrap().cloned().collect();
-                let old_children: Vec<PageId> = page.children().unwrap().cloned().collect();
-                let combined_keys: Vec<Key> =
-                    old_keys.into_iter().chain(new_keys.into_iter()).collect();
-                let combined_children: Vec<PageId> = old_children
-                    .into_iter()
-                    .chain(new_children.into_iter())
-                    .collect();
 
-                // remove the split key from the internal node original list of Keys
-                let remove_pos = original_keys.binary_search(&split_key).unwrap();
-                original_keys.remove(remove_pos);
+        let combined_keys: Vec<Key> = page
+            .keys()
+            .unwrap()
+            .chain(&[split_key])
+            .chain(new_page.keys().unwrap())
+            .cloned()
+            .collect();
 
-                assert_eq!(original_keys, combined_keys);
-                assert_eq!(original_children, combined_children);
+        let combined_children: Vec<PageId> = page
+            .children()
+            .unwrap()
+            .chain(new_page.children().unwrap())
+            .cloned()
+            .collect();
+
+        assert_eq!(original_keys, combined_keys);
+        assert_eq!(original_children, combined_children);
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn no_rows_lost_in_leaf_borrow(LeafPage(mut left): LeafPage) -> TestResult {
+        let original_records: Vec<Row> = left.records().unwrap().cloned().collect();
+
+        let right_id = left.page_id.wrapping_add(1);
+        let Some((_separator, mut right)) = try_split(&mut left, right_id) else {
+            return TestResult::discard();
+        };
+
+        // set the pointers
+        left.set_next(Some(right.page_id)).unwrap();
+        right.set_prev(Some(left.page_id)).unwrap();
+
+        // borrow from right - discard results with empty borrows
+        match left.leaf_borrow_from_right(&mut right) {
+            Ok(_) => {}
+            Err(PageError::InvalidBorrow(BorrowFailReason::EmptyBorrow(_))) => {
+                return TestResult::discard();
             }
-            PageBody::Leaf {
-                records: new_records,
-                ..
-            } => {
-                let PageBody::Leaf {
-                    records: old_records,
-                    ..
-                } = page.body.clone()
-                else {
-                    unreachable!()
-                };
-                let combined_records: Vec<Row> = old_records
-                    .clone()
-                    .into_iter()
-                    .chain(new_records.into_iter())
-                    .collect();
-                assert_eq!(original_records, combined_records);
-            }
-            _ => unreachable!(),
-        }
+            Err(e) => panic!("unexpected borrow error: {e:?}"),
+        };
+        // borrow from left - empty borrow should be impossible
+        match right.leaf_borrow_from_left(&mut left) {
+            Ok(_) => {}
+            Err(e) => panic!("unexpected borrow error: {e:?}"),
+        };
+
+        let new_records: Vec<Row> = left
+            .records()
+            .unwrap()
+            .chain(right.records().unwrap())
+            .cloned()
+            .collect();
+
+        assert_eq!(original_records, new_records);
 
         TestResult::passed()
     }
 
     #[quickcheck]
-    fn page_insert_returns_page_full_when_full(
-        mut page: Page,
-        SchemaRowPair(schema, mut row): SchemaRowPair,
+    fn no_keys_or_chidren_lost_in_internal_borrow(
+        InternalPage(mut left): InternalPage,
     ) -> TestResult {
-        page.body = PageBody::Leaf {
-            records: Vec::new(),
-            next: None,
-            prev: None,
+        let original_keys: Vec<Key> = left.keys().unwrap().cloned().collect();
+        let original_children: Vec<PageId> = left.children().unwrap().cloned().collect();
+
+        let right_id = left.page_id.wrapping_add(1);
+        let Some((separator, mut right)) = try_split(&mut left, right_id) else {
+            return TestResult::discard();
         };
 
-        let mut vr = schema.validate_row(row.clone()).unwrap();
-        // fill the page up entries
-        while page.can_insert(vr.as_ref()) {
-            page.leaf_insert(vr).unwrap();
-            row = increment_key_on_row(&row);
-            vr = schema.validate_row(row.clone()).unwrap();
+        let new_separator = match left.internal_borrow_from_right(&mut right, separator) {
+            Ok(sep) => sep,
+            Err(PageError::InvalidBorrow(BorrowFailReason::EmptyBorrow(_))) => {
+                return TestResult::discard();
+            }
+            Err(e) => panic!("unexpected borrow error: {e:?}"),
+        };
+
+        // left keys + the separator now in the parent + right keys == the original keys
+        let keys_after: Vec<Key> = left
+            .keys()
+            .unwrap()
+            .cloned()
+            .chain([new_separator])
+            .chain(right.keys().unwrap().cloned())
+            .collect();
+        let children_after: Vec<PageId> = left
+            .children()
+            .unwrap()
+            .chain(right.children().unwrap())
+            .copied()
+            .collect();
+
+        assert_eq!(original_keys, keys_after);
+        assert_eq!(original_children, children_after);
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn page_insert_returns_page_full_when_full(payload_len: u16) -> TestResult {
+        let (schema, max_payload) = leaf_schema();
+        let payload_len = payload_len as usize % (max_payload + 1);
+        let row_with_key = |key: i64| {
+            schema
+                .validate_row(Row {
+                    fields: vec![
+                        RowValue::Integer(key),
+                        RowValue::String("p".repeat(payload_len)),
+                    ],
+                })
+                .unwrap()
+        };
+
+        // fill with same-size rows and increasing keys until the next one doesn't fit
+        let mut page = Page::empty_leaf(child(1));
+        let mut key = 0;
+        while page.can_insert(row_with_key(key).as_ref()) {
+            page.leaf_insert(row_with_key(key)).unwrap();
+            key += 1;
         }
-        let snapshot = page.clone();
 
-        // one more insert should trigger page full
-        let vr = schema.validate_row(row.clone()).unwrap();
-        let result = page.leaf_insert(vr);
-        assert_matches!(result, Err(PageError::PageFull));
-
-        // make sure the failed insert didn't change the underlying page
-        assert_unchanged(&page, &snapshot);
+        // one more insert must be rejected, and must not change the page
+        let before = page.clone();
+        assert_matches!(
+            page.leaf_insert(row_with_key(key)),
+            Err(PageError::PageFull)
+        );
+        assert_unchanged(&before, &page);
         TestResult::passed()
     }
 

@@ -252,17 +252,19 @@ macro_rules! column_constructors {
     ($($variant:ident => $non_null:ident, $nullable:ident);* $(;)?) => {
         impl Column {
             $(
-                pub const fn $non_null(name: String) -> Self {
+                pub fn $non_null(name: impl Into<String>) -> Result<Self, SchemaError> {
+                    let name = name.into();
                     if name.is_empty() {
-                        panic!("name can't be empty. change this to an error type");
+                        return Err(SchemaError::EmptyColumnName);
                     }
-                    Self { name, col_type: ColumnType::$variant, nullable: false }
+                    Ok(Self { name, col_type: ColumnType::$variant, nullable: false })
                 }
-                pub const fn $nullable(name: String) -> Self {
+                pub fn $nullable(name: impl Into<String>) -> Result<Self, SchemaError> {
+                    let name = name.into();
                     if name.is_empty() {
-                        panic!("name can't be empty. change this to an error type");
+                        return Err(SchemaError::EmptyColumnName);
                     }
-                    Self { name, col_type: ColumnType::$variant, nullable: true }
+                    Ok(Self { name, col_type: ColumnType::$variant, nullable: true })
                 }
             )*
         }
@@ -300,6 +302,8 @@ pub enum SchemaError {
     FieldTooLong(usize),
     #[error("Invalid key value in first row")]
     InvalidKey,
+    #[error("Column names can't be empty strings")]
+    EmptyColumnName,
 }
 
 /// ValidatedRow is the only type accepted for `insert` operations on the B+Tree
@@ -434,8 +438,12 @@ mod tests {
 
     impl Arbitrary for Column {
         fn arbitrary(g: &mut Gen) -> Self {
+            let mut name = String::arbitrary(g);
+            while name.is_empty() {
+                name = String::arbitrary(g);
+            }
             Column {
-                name: String::arbitrary(g),
+                name,
                 col_type: ColumnType::arbitrary(g),
                 nullable: bool::arbitrary(g),
             }
@@ -524,8 +532,8 @@ mod tests {
     #[test]
     fn too_big_row_triggers_error_on_validation() {
         let schema = Schema::try_from(vec![
-            Column::string("string column".into()),
-            Column::nullable_string("nullable string column".into()),
+            Column::string("string column").unwrap(),
+            Column::nullable_string("nullable string column").unwrap(),
         ])
         .unwrap();
         let row = Row::try_from(vec![
@@ -544,8 +552,8 @@ mod tests {
         let test_boundary = MAX_INTERNAL_ENTRY_SIZE - PAGE_ID_SIZE - SLOT_ENTRY_SIZE - 1 - 2;
 
         let schema = Schema::try_from(vec![
-            Column::string("string column".into()),
-            Column::nullable_string("nullable string column".into()),
+            Column::string("string column").unwrap(),
+            Column::nullable_string("nullable string column").unwrap(),
         ])
         .unwrap();
         let row = Row::try_from(vec![
@@ -645,10 +653,10 @@ mod tests {
     fn valid_rows_pass_validation() {
         let schema = Schema {
             columns: vec![
-                Column::integer("dummy".into()),
-                Column::nullable_string("dummy".into()),
-                Column::nullable_float("dummy".into()),
-                Column::bool("dummy".into()),
+                Column::integer("dummy").unwrap(),
+                Column::nullable_string("dummy").unwrap(),
+                Column::nullable_float("dummy").unwrap(),
+                Column::bool("dummy").unwrap(),
             ],
         };
 
@@ -678,9 +686,9 @@ mod tests {
     fn invalid_rows_fail_validation() {
         let schema = Schema {
             columns: vec![
-                Column::integer("dummy".into()),
-                Column::nullable_string("dummy".into()),
-                Column::bool("dummy".into()),
+                Column::integer("dummy").unwrap(),
+                Column::nullable_string("dummy").unwrap(),
+                Column::bool("dummy").unwrap(),
             ],
         };
 
@@ -729,9 +737,9 @@ mod tests {
     #[test]
     fn schemas_cant_have_nullable_primary_keys() {
         let schema_result = Schema::try_from(vec![
-            Column::nullable_integer("dummy".into()),
-            Column::string("dummy".into()),
-            Column::nullable_float("dummy".into()),
+            Column::nullable_integer("dummy").unwrap(),
+            Column::string("dummy").unwrap(),
+            Column::nullable_float("dummy").unwrap(),
         ]);
         assert_matches!(schema_result, Err(SchemaError::NullablePrimaryKey));
     }
@@ -740,17 +748,17 @@ mod tests {
     fn schemas_cant_have_invalidkey_primary_keys() {
         // Floats can't be primary keys
         let schema_result = Schema::try_from(vec![
-            Column::float("dummy".into()),
-            Column::string("dummy".into()),
-            Column::nullable_float("dummy".into()),
+            Column::float("dummy").unwrap(),
+            Column::string("dummy").unwrap(),
+            Column::nullable_float("dummy").unwrap(),
         ]);
         assert_matches!(schema_result, Err(SchemaError::NonOrdPrimaryKey));
 
         // Bools can't be primary keys
         let schema_result = Schema::try_from(vec![
-            Column::bool("dummy".into()),
-            Column::string("dummy".into()),
-            Column::nullable_float("dummy".into()),
+            Column::bool("dummy").unwrap(),
+            Column::string("dummy").unwrap(),
+            Column::nullable_float("dummy").unwrap(),
         ]);
         assert_matches!(schema_result, Err(SchemaError::NonOrdPrimaryKey));
     }
@@ -758,7 +766,7 @@ mod tests {
     #[test]
     fn schemas_fail_with_too_many_columns() {
         let cols: Vec<Column> = (0..MAX_NUM_FIELDS + 1)
-            .map(|_| Column::integer("dummy".into()))
+            .map(|_| Column::integer("dummy").unwrap())
             .collect();
         let schema_result = Schema::try_from(cols);
         assert_matches!(schema_result, Err(SchemaError::TooManyColumns));
