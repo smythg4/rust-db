@@ -111,6 +111,8 @@ pub enum PageError {
     MissingKey { search_key: Key, new_key: Key },
     #[error("Attempt to insert a `Key` that's out of order with others: {0:?}")]
     KeyNotInOrder(Key),
+    #[error("Attempt to pop a page off the free list that wasn't the head")]
+    NotFreeListHead { head: Option<PageId>, got: PageId },
 }
 
 #[derive(Error, Debug, Clone, PartialEq)]
@@ -128,8 +130,6 @@ pub enum BorrowFailReason {
 
 #[derive(Error, Debug, Clone, PartialEq)]
 pub enum MergeFailReason {
-    #[error("Unable to merge Leaf pages with Internal pages")]
-    MismatchMerge,
     #[error("Right neighbor is {expected:?} but got {got:?}")]
     PointerMismatch {
         expected: Option<PageId>,
@@ -209,21 +209,81 @@ impl Page {
         Ok(())
     }
 
-    /// Used to update the free_list on a `Meta` `Page`.
-    pub fn free_list_push(&mut self, freed: &mut Page) -> Result<(), PageError> {
-        if !self.is_meta() || !freed.is_free() {
+    /// Used to `pop` the next free page off the list
+    pub fn free_list_pop(&mut self, page: &Page) -> Result<PageId, PageError> {
+        if !page.is_free() || !self.is_meta() {
             return Err(PageError::WrongPageType);
         }
         let PageBody::Meta { free_list_head, .. } = &mut self.body else {
             unreachable!()
         };
+        if *free_list_head != Some(page.page_id) {
+            return Err(PageError::NotFreeListHead {
+                head: *free_list_head,
+                got: page.page_id,
+            });
+        }
+
+        let PageBody::Free { next } = &page.body else {
+            unreachable!()
+        };
+
+        *free_list_head = *next;
+
+        self.debug_check_invariants("free_list_pop");
+        Ok(page.page_id)
+    }
+
+    /// Used to update the free_list on a `Meta` `Page`. `freed` must be part of the same `Table`,
+    /// must have a page_num that's less than the meta page's `num_pages`, and can't be page number
+    /// 0 since that's reserved for the `Meta` `Page`.
+    pub fn free_list_push(&mut self, freed: &mut Page) -> Result<(), PageError> {
+        if !self.is_meta() || !freed.is_free() {
+            return Err(PageError::WrongPageType);
+        }
+        let PageBody::Meta {
+            free_list_head,
+            root_id,
+            page_count,
+        } = &mut self.body
+        else {
+            unreachable!()
+        };
         let PageBody::Free { next } = &mut freed.body else {
             unreachable!()
         };
+
+        if *free_list_head == *next {
+            // head was the same, no-op
+            return Ok(());
+        }
+
+        match next {
+            None => return Ok(()), // another no-op
+            Some(free_id) => {
+                if free_id.get_table_id() != root_id.get_table_id() {
+                    // page in wrong table
+                    // TODO: This isn't the right error type, make a new one
+                    return Err(PageError::DuplicateKey);
+                }
+                if free_id.get_page_num() >= *page_count {
+                    // Page out of range
+                    // TODO: This isn't the right error type, make a new one
+                    return Err(PageError::DuplicateKey);
+                }
+                if free_id.get_page_num() == 0 {
+                    // reserved meta page
+                    // TODO: This isn't the right error type, make a new one
+                    return Err(PageError::DuplicateKey);
+                }
+            }
+        }
+
         *next = *free_list_head;
 
         *free_list_head = Some(freed.page_id);
 
+        self.debug_check_invariants("free_list_push");
         Ok(())
     }
 
@@ -670,7 +730,7 @@ impl Page {
                 new_page.debug_check_invariants("split_leaf");
                 Ok((split_key, new_page))
             }
-            _ => unreachable!("Cannot split meta or free pages"),
+            _ => Err(PageError::WrongPageType),
         }
     }
 
@@ -679,6 +739,9 @@ impl Page {
     /// merged `Page` that can be recycled to a free list. `right` is converted into a free page
     /// upon success
     pub fn leaf_merge_from_right(&mut self, right: &mut Page) -> Result<PageId, PageError> {
+        if !self.is_leaf() || !right.is_leaf() {
+            return Err(PageError::WrongPageType);
+        }
         if !self
             .free_space()
             .is_some_and(|free| free >= right.entries_size())
@@ -686,6 +749,7 @@ impl Page {
             return Err(PageError::PageFull);
         }
         let right_id = right.page_id;
+
         match (&mut self.body, &mut right.body) {
             (
                 PageBody::Leaf { records, next, .. },
@@ -721,7 +785,7 @@ impl Page {
                     })),
                 }
             }
-            _ => Err(PageError::InvalidMerge(MergeFailReason::MismatchMerge)),
+            _ => Err(PageError::WrongPageType),
         }
     }
 
@@ -773,15 +837,13 @@ impl Page {
                 right.make_free();
                 Ok(right_id)
             }
-            _ => Err(PageError::InvalidMerge(MergeFailReason::MismatchMerge)),
+            _ => Err(PageError::WrongPageType),
         }
     }
 
     /// Accepts a row from the right leaf neighbor. Returns the promoted Key to replace in the parent on success
     pub fn leaf_borrow_from_right(&mut self, right_page: &mut Page) -> Result<Key, PageError> {
-        if matches!(self.body, PageBody::Internal { .. })
-            || matches!(right_page.body, PageBody::Internal { .. })
-        {
+        if !self.is_leaf() || !right_page.is_leaf() {
             return Err(PageError::WrongPageType);
         }
 
@@ -858,9 +920,7 @@ impl Page {
 
     /// Accepts a row from the left leaf neighbor. Returns the promoted Key to replace in the parent on success
     pub fn leaf_borrow_from_left(&mut self, left_page: &mut Page) -> Result<Key, PageError> {
-        if matches!(self.body, PageBody::Internal { .. })
-            || matches!(left_page.body, PageBody::Internal { .. })
-        {
+        if !self.is_leaf() || !left_page.is_leaf() {
             return Err(PageError::WrongPageType);
         }
 
@@ -944,9 +1004,7 @@ impl Page {
         right_page: &mut Page,
         parent_sep: Key,
     ) -> Result<Key, PageError> {
-        if matches!(self.body, PageBody::Leaf { .. })
-            || matches!(right_page.body, PageBody::Leaf { .. })
-        {
+        if !self.is_internal() || !right_page.is_internal() {
             return Err(PageError::WrongPageType);
         }
 
@@ -1020,9 +1078,7 @@ impl Page {
         left_page: &mut Page,
         parent_sep: Key,
     ) -> Result<Key, PageError> {
-        if matches!(self.body, PageBody::Leaf { .. })
-            || matches!(left_page.body, PageBody::Leaf { .. })
-        {
+        if !self.is_internal() || !left_page.is_internal() {
             return Err(PageError::WrongPageType);
         }
 
@@ -1307,14 +1363,14 @@ impl Page {
                 ..
             } => {
                 if let Some(flh) = free_list_head
-                    && flh.get_page_num() > *page_count
+                    && flh.get_page_num() >= *page_count
                 {
                     return Err(CorruptionKind::PageNumOutOfRange(
                         flh.get_page_num() as usize
                     ));
                 }
             }
-            PageBody::Free { .. } => {} // nothing to check in this arm
+            PageBody::Free { .. } => {} // nothing to check within the page. BPM needs to make sure it's in the right table
         }
         Ok(())
     }
@@ -1968,20 +2024,14 @@ mod tests {
             (PageBody::Leaf { .. }, PageBody::Internal { .. }) => {
                 let result = page1.leaf_merge_from_right(&mut page2);
 
-                assert_matches!(
-                    result,
-                    Err(PageError::InvalidMerge(MergeFailReason::MismatchMerge))
-                );
+                assert_matches!(result, Err(PageError::WrongPageType));
                 assert_unchanged(&page1, &snapshot1);
                 assert_unchanged(&page2, &snapshot2);
                 TestResult::passed()
             }
             (PageBody::Internal { .. }, PageBody::Leaf { .. }) => {
                 let result = page1.internal_merge_from_right(&mut page2, dummy_key);
-                assert_matches!(
-                    result,
-                    Err(PageError::InvalidMerge(MergeFailReason::MismatchMerge))
-                );
+                assert_matches!(result, Err(PageError::WrongPageType));
                 assert_unchanged(&page1, &snapshot1);
                 assert_unchanged(&page2, &snapshot2);
                 TestResult::passed()
@@ -3742,5 +3792,84 @@ mod tests {
         assert_matches!(set_prev, Err(PageError::WrongPageType));
         assert_unchanged(&before, &page);
         TestResult::passed()
+    }
+
+    /// Runs a replacement that must fail, checks the page is byte-for-byte unchanged, returns the error.
+    fn rejected_replace(page: &mut Page, old: &Key, new: Key) -> PageError {
+        let before = page.clone();
+        let err = page
+            .internal_replace_key(old, new)
+            .expect_err("replacement should be rejected");
+        assert_unchanged(&before, page);
+        err
+    }
+
+    #[test]
+    fn internal_replace_key_rejections_leave_page_unchanged() {
+        let int = Key::Integer;
+
+        // keys [10, 20, 30]
+        let mut page = Page::new_root(child(1), child(2), int(10), child(3));
+        page.internal_insert(int(20), child(4)).unwrap();
+        page.internal_insert(int(30), child(5)).unwrap();
+
+        // new <= left neighbor
+        for new in [10, 5] {
+            assert_matches!(
+                rejected_replace(&mut page, &int(20), int(new)),
+                PageError::KeyNotInOrder(k) if k == int(new)
+            );
+        }
+
+        // new >= right neighbor
+        for new in [30, 35] {
+            assert_matches!(
+                rejected_replace(&mut page, &int(20), int(new)),
+                PageError::KeyNotInOrder(k) if k == int(new)
+            );
+        }
+
+        // edges: first key has no left neighbor, last key has no right neighbor
+        assert_matches!(
+            rejected_replace(&mut page, &int(10), int(20)),
+            PageError::KeyNotInOrder(_)
+        );
+        assert_matches!(
+            rejected_replace(&mut page, &int(30), int(20)),
+            PageError::KeyNotInOrder(_)
+        );
+
+        // old key missing: both keys come back to the caller
+        assert_matches!(
+            rejected_replace(&mut page, &int(25), int(26)),
+            PageError::MissingKey { search_key, new_key }
+                if search_key == int(25) && new_key == int(26)
+        );
+
+        // sanity check: the fixture accepts a legal replacement
+        page.internal_replace_key(&int(20), int(25))
+            .expect("key should have been accepted");
+
+        // larger key on a full page. Keys are padded_key(0), padded_key(2), ...,
+        // so padded_key(1, ..) sorts between the first two.
+        let mut full = fill_internal(child(100), vec![0]);
+        let first = full.keys().unwrap().next().unwrap().clone();
+        let bigger = padded_key(1, max_internal_len());
+        assert!(
+            full.free_space().unwrap() + Page::internal_entry_size(&first)
+                < Page::internal_entry_size(&bigger),
+            "fixture must be too full for the bigger key"
+        );
+        assert_matches!(
+            rejected_replace(&mut full, &first, bigger),
+            PageError::PageFull
+        );
+
+        // leaf page
+        let mut leaf = Page::empty_leaf(child(50));
+        assert_matches!(
+            rejected_replace(&mut leaf, &int(1), int(2)),
+            PageError::WrongPageType
+        );
     }
 }

@@ -25,7 +25,7 @@ Add present and absent checks to `insertion_order_on_leaves` after every step
 between keys, above all keys, empty page; internal page → `NotLeaf`
 - [x] `leaf_records_from`: iterator still usable after the key is dropped (guards `use<'a>`)
 - [x] `internal_replace_key`: borrow between children of a `new_root` parent, replace the separator →`find_child` routes every key to the page that holds it
-- [ ] `internal_replace_key` rejections (page unchanged): new ≤ left neighbor, new ≥ right neighbor,
+- [x] `internal_replace_key` rejections (page unchanged): new ≤ left neighbor, new ≥ right neighbor,
 old key missing (`MissingKey` returns `new`), larger key on a full page (`PageFull`), leaf page
 (`NotInternal`)
 - [x] `internal_insert`: oversized key → `KeyTooLong`
