@@ -1,7 +1,9 @@
+use crate::bpm::Frame;
 use crate::schema::{RowValue, RowValueError};
 use crate::traits::Serializable;
 use integer_encoding::*;
 use std::io::{Read, Write};
+use std::ops::Index;
 use thiserror::Error;
 
 pub const SLOT_ENTRY_SIZE: usize = 4; // two u16s
@@ -236,6 +238,14 @@ id_type_serializable!(TableId, u32);
 id_type!(FrameId, usize); // stays non-serializable
 id_type_serializable!(SlotIndex, u16);
 id_type_serializable!(TransactionId, u64);
+
+/// Allows us to index our bpm slices (Box<[Frame]>) using `FrameId`
+impl Index<FrameId> for [Frame] {
+    type Output = Frame;
+    fn index(&self, id: FrameId) -> &Self::Output {
+        &self[id.0]
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Key {

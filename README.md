@@ -2,9 +2,7 @@
 A learning project focused on learning more about databases.
 
 ### Current Status
-Wrapping up phase 1 with an easy to manipulate page structure. Right now the design leads me to read a 4KB chunk of memory, parse it into an in-memory version, perform all `Page` operations on that (`insert`, `split_page`, etc), then it can be serialized back into a `RawPage` of bytes to be flushed back to disk. This will cost a full 4KB read and parse any time a we page something into and out of the `BufferPoolManager`. It's a reasonable cost to pay for now to ensure correctness.
-
-Once done with phase 1, I need to decide if I want the `BufferPoolManager` to be `async` from the get-go. I'm thinking yes because I'd hate to have retrofit everything back after building up a `BTree`. This is where `Go` would be a little nicer...
+I still have a list of tests to write for the storage layout/layer, noted below. I started some ugly work on the `BufferPoolManager`. For now it will be dependent on a `big_dumb_lock` to protect BPM state throughout operations. I'm gonna chew on it a little bit before going too much further. My current challenge to solve is where/how to make a `Frame` as dirty. My gut says on `WriteGuard::drop` to check if the `Page` changed at all, then mark it dirty, but access patterns are a little ugly the way I initially laid it out.
 
 #### Testing
 Recent work has been primarily focused on good property based tests with the `quickcheck` crate. I was able to implement `Arbitrary` for all my base types and put operations through the wringer.
@@ -94,9 +92,11 @@ old key missing (`MissingKey` returns `new`), larger key on a full page (`PageFu
 ### Phase 1 — Storage Layout
 - In-table data is represented as a `RowValue`, which currently supports `Integer(i64)`, `String(String)`, `Boolean(bool)`, `Float(f64)`, and `Null`.
 - `Schemas` hold `Columns` that are made up of `ColumnType` and a `nullable` flag. Primary Keys are always stored in the first element of the underlying `Vec`. Primary Keys can only be non-nullable `String` or `Integer` right now and a new `Schema` will be rejected if the first entry doesn't meet these requirements.
-- The fundamental unit of storage `Page` holds core metadata like `page_id: PageId` and `Lsn` (not currently used, but will be important for WAL implementation), as well as a `PageBody` that is either a `Leaf` or `Internal`.
+- The fundamental unit of storage `Page` holds core metadata like `page_id: PageId` and `Lsn` (not currently used, but will be important for WAL implementation), as well as a `PageBody` that is either a `Leaf`, `Internal`, `Meta`, or `Free`.
   - `Internal` page bodies hold a list of keys and child `PageId`s. There should always be 1 more child than keys. This is enforced through `debug_assert!`s for operations on `Page`s and `PageError::Corrupt { kind }` for deserialization.
   - `Leaf` page bodies hold a list of `Rows` and sibling pointers (`next: Option<PageId>`, `prev: Option<PageId>`) to allow quicker sequential scans.
+  - `Meta` page bodies contain all the `Table` metadata including `root_page_id`, `num_pages`, and a `free_list_head` pointer.
+  - `Free` page bodies only contain a single value `next: Option<PageId>` and act as entries in a linked list of a `Page`s that have been freed through merge operations.
 ```
 #[derive(Debug, PartialEq, Clone)]
 pub struct Page {
@@ -116,6 +116,7 @@ pub enum PageBody {
         keys: Vec<Key>,
         children: Vec<PageId>,
     },
+    ...
 }
 ```
 - All numerical encoding is in Big Endian order.
@@ -170,10 +171,7 @@ pub enum PageBody {
 - Reads pages off disk, deserializes into a proper `Page` struct, serializes
   back to bytes only at the swap boundary (eviction or shutdown).
 - Need to design all BPM methods to be `&self` to enable concurrency in later stages
-- `RwLock`-guarded pages (`RwLock<Option<Box<PageFrame>>>` per frame).
-  - `RwLock` chosen deliberately for real cross-thread concurrency, not by
-    default — `RefCell` gets the same `&self`-based win far cheaper if this
-    stays single-threaded.
+- `RwLock`-guarded pages
 - Pin counting via RAII guard (increment on fetch, decrement on `Drop`) — a
   bookkeeping mechanism that informs the eviction policy if it's safe to evict.
 - Clock eviction policy: reference bit per frame, set on access, cleared as
@@ -190,12 +188,29 @@ pub enum PageBody {
 - `ReadGuard`s will need to implement `Deref` and `WriteGuard`s will need to implement `Deref` and `DerefMut` for `Page` so I can use them with `Page` operations.
 
 ```
-struct BufferPoolManager<Dm: DiskManager> {
-    persistant_layer: Dm,
+struct BpmState {
+    page_table: HashMap<PageId, FrameId>,
+    free_frames: Vec<FrameId>,
     eviction_policy: EvictionPolicy,
     wal: Option<Wal>,
-    frames: [RwLock<Option<Box<PageFrame>>>; BUFFER_SIZE],
-    ...
+}
+
+pub struct BufferPoolManager<Dm: DiskManager> {
+    frames: Box<[Frame]>,
+    persistant_layer: Dm,
+    // TODO: Replace this with refined concurrency control
+    big_dumb_lock: Arc<Mutex<BpmState>>,
+}
+
+pub(crate) struct Frame {
+    latch: RwLock<FrameData>, // guards the page contents
+    pin_count: AtomicU32,
+    dirty: AtomicBool,
+}
+
+struct FrameData {
+    page_id: Option<PageId>,
+    page: Option<Page>,
 }
 ```
 

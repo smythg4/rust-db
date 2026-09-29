@@ -1,5 +1,17 @@
+use crate::commontypes::PageId;
+use crate::page::RawPage;
 use std::io::ErrorKind;
 use std::io::{Read, Write};
+
+/// The layer that interacts directly with storage. Trait allows for testing implementations that
+/// simulate things like torn writes and reads as well as in-memory versions that will make tests
+/// easier to write.
+pub trait DiskManager: Send + Sync {
+    fn read_page(&self, id: PageId, buf: &mut RawPage) -> std::io::Result<()>;
+    fn write_page(&self, id: PageId, buf: &RawPage) -> std::io::Result<()>;
+    fn sync(&self) -> std::io::Result<()>;
+}
+
 pub trait Serializable
 where
     Self: Sized,

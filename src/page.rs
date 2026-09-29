@@ -160,6 +160,7 @@ pub enum CorruptionKind {
 }
 
 pub type RawPage = [u8; PAGE_SIZE];
+pub const EMPTY_RAW: RawPage = [0u8; PAGE_SIZE];
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct Page {
