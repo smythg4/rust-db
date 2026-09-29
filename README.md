@@ -203,14 +203,9 @@ pub struct BufferPoolManager<Dm: DiskManager> {
 }
 
 pub(crate) struct Frame {
-    latch: RwLock<FrameData>, // guards the page contents
+    latch: RwLock<Option<Page>>, // guards the page contents
     pin_count: AtomicU32,
     dirty: AtomicBool,
-}
-
-struct FrameData {
-    page_id: Option<PageId>,
-    page: Option<Page>,
 }
 ```
 
