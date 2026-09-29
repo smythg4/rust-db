@@ -1,7 +1,8 @@
 use crate::bpm::{BpmError, BufferPoolManager, PageWriteGuard};
+use crate::btree::{BTree, BTreeError};
 use crate::commontypes::{PageId, TableId};
-use crate::page::{Page, PageError};
-use crate::schema::{Schema, SchemaError};
+use crate::page::{Page, PageBody, PageError};
+use crate::schema::{Row, Schema, SchemaError};
 use crate::traits::{DiskManager, EvictionPolicy};
 use thiserror::Error;
 
@@ -13,12 +14,14 @@ pub enum TableError {
     Page(#[from] PageError),
     #[error(transparent)]
     Schema(#[from] SchemaError),
+    #[error(transparent)]
+    BTree(#[from] BTreeError),
     #[error("Table already exists: {0}")]
     AlreadyExists(TableId),
 }
 
 pub struct Table<'a, Dm: DiskManager, Ep: EvictionPolicy> {
-    bpm: &'a BufferPoolManager<Dm, Ep>,
+    pub(crate) bpm: &'a BufferPoolManager<Dm, Ep>,
     meta_id: PageId,
     #[allow(dead_code)]
     // only tests right now. maybe package this into always reading from the meta page? though caching is probably fine since it should never change
@@ -73,19 +76,19 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
         })
     }
 
-    pub fn allocate(
-        &self,
-        init: impl FnOnce(PageId) -> Page,
-    ) -> Result<PageWriteGuard<'_, Dm, Ep>, TableError> {
+    pub fn allocate(&self) -> Result<PageWriteGuard<'_, Dm, Ep>, TableError> {
         let mut meta_guard = self.bpm.fetch_write(self.meta_id)?;
+
         if let Some(free_list_head) = meta_guard.meta_get_free_list_head()? {
             let mut free_guard = self.bpm.fetch_write(free_list_head)?;
             meta_guard.free_list_pop(&free_guard)?;
-            *free_guard = init(free_list_head);
+            *free_guard = Page::empty_page(free_guard.page_id(), PageBody::Free { next: None });
             Ok(free_guard)
         } else {
             let new_free_id = meta_guard.meta_bump_page_count()?;
-            Ok(self.bpm.new_page(init(new_free_id))?)
+            Ok(self
+                .bpm
+                .new_page(Page::empty_page(new_free_id, PageBody::Free { next: None }))?)
         }
     }
 
@@ -95,13 +98,19 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
         Ok(())
     }
 
-    pub fn root_id(&self) -> Result<PageId, BpmError> {
+    pub fn root_id(&self) -> Result<PageId, TableError> {
         let id = self.bpm.fetch_read(self.meta_id)?.meta_get_root_id()?;
         Ok(id)
     }
 
     pub fn set_root_id(&self, id: PageId) -> Result<(), TableError> {
         self.bpm.fetch_write(self.meta_id)?.meta_set_root_id(id)?;
+        Ok(())
+    }
+
+    pub fn insert(&self, row: Row) -> Result<(), TableError> {
+        let row = self.schema.validate_row(row)?;
+        BTree::new(self).insert(row)?;
         Ok(())
     }
 }
@@ -150,20 +159,13 @@ mod tests {
 
     impl<'a> Table<'a, FakeDisk, Replacer> {
         // helper to generate a row and insert it
-        fn insert_row(
-            &self,
-            page_id: PageId,
-            row_id: i64,
-            content: &str,
-        ) -> Result<(), TableError> {
+        fn insert_row(&self, row_id: i64, content: &str) -> Result<(), TableError> {
             let row = Row::try_from(vec![
                 RowValue::Integer(row_id),
                 RowValue::String(content.into()),
             ])
             .expect("this will work");
-            let vr = self.schema.validate_row(row)?;
-            let mut page = self.bpm.fetch_write(page_id).expect("fetch write failed");
-            page.leaf_insert(vr)?;
+            self.insert(row)?;
             Ok(())
         }
 
@@ -183,14 +185,12 @@ mod tests {
 
     #[test]
     fn table_basics() {
-        let bpm = BufferPoolManager::new(FakeDisk::default(), Replacer, 2);
+        let bpm = BufferPoolManager::new(FakeDisk::default(), Replacer, 512);
         let table = Table::create(&bpm, TableId::new(999), leaf_schema().0)
             .expect("failed to create table");
-        let root_id = table.root_id().expect("failed to get root id");
-
-        for row_num in -100..100 {
+        for row_num in -100000..=100000 {
             if table
-                .insert_row(root_id, row_num, &format!("stuff in row {row_num}"))
+                .insert_row(row_num, &format!("stuff in row {row_num}"))
                 .is_err()
             {
                 break;

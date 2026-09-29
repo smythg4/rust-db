@@ -89,7 +89,7 @@ pub enum PageError {
     #[error("Page too small to split: {0}")]
     TooSmallToSplit(PageId),
     #[error("Page too full to fit row -- need to split")]
-    PageFull,
+    PageFull, // TODO: have this variant return the row or key!
     #[error("Attempt to insert a duplicate key")]
     DuplicateKey,
     #[error("Attempt to complete operation on page type that doesn't support it")]
@@ -1529,9 +1529,13 @@ impl Page {
         else {
             return Err(PageError::WrongPageType);
         };
-        *page_count += 1;
         let new_page_id = PageId::new(root_id.get_table_id(), *page_count);
+        *page_count += 1;
         Ok(new_page_id)
+    }
+
+    pub(crate) fn replace(&mut self, other: Page) {
+        *self = other;
     }
 }
 
