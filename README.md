@@ -2,7 +2,9 @@
 A learning project focused on learning more about databases.
 
 ### Current Status
-I still have a list of tests to write for the storage layout/layer, noted below. I started some ugly work on the `BufferPoolManager`. For now it will be dependent on a `big_dumb_lock` to protect BPM state throughout operations. I'm gonna chew on it a little bit before going too much further. My current challenge to solve is where/how to make a `Frame` as dirty. My gut says on `WriteGuard::drop` to check if the `Page` changed at all, then mark it dirty, but access patterns are a little ugly the way I initially laid it out.
+I still have a list of tests to write for the storage layout/layer, noted below. I started some ugly work on the `BufferPoolManager`. For now it will be dependent on a `big_dumb_lock` to protect BPM state throughout operations. I'm gonna chew on it a little bit before going too much further. I made `DiskManager` and `EvictionPolicy` both traits so that I can make some dummy implementations to test the core `BufferPoolManager` logic before building those other components.
+
+I decided to use `DerefMut` on the `WriteGuard` as the when/where to mark the `dirty` flag, rather than at guard drop. This way if someone takes the write lock, but doesn't do anything with it, we have a cleaner state for eviction, and fewer syscalls to write to the `DiskManager`.
 
 #### Testing
 Recent work has been primarily focused on good property based tests with the `quickcheck` crate. I was able to implement `Arbitrary` for all my base types and put operations through the wringer.
@@ -95,7 +97,7 @@ old key missing (`MissingKey` returns `new`), larger key on a full page (`PageFu
 - The fundamental unit of storage `Page` holds core metadata like `page_id: PageId` and `Lsn` (not currently used, but will be important for WAL implementation), as well as a `PageBody` that is either a `Leaf`, `Internal`, `Meta`, or `Free`.
   - `Internal` page bodies hold a list of keys and child `PageId`s. There should always be 1 more child than keys. This is enforced through `debug_assert!`s for operations on `Page`s and `PageError::Corrupt { kind }` for deserialization.
   - `Leaf` page bodies hold a list of `Rows` and sibling pointers (`next: Option<PageId>`, `prev: Option<PageId>`) to allow quicker sequential scans.
-  - `Meta` page bodies contain all the `Table` metadata including `root_page_id`, `num_pages`, and a `free_list_head` pointer.
+  - `Meta` page bodies contain all the `Table` metadata including `root_page_id`, `num_pages`, the table `Schema`, and a `free_list_head` pointer.
   - `Free` page bodies only contain a single value `next: Option<PageId>` and act as entries in a linked list of a `Page`s that have been freed through merge operations.
 ```
 #[derive(Debug, PartialEq, Clone)]

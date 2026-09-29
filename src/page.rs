@@ -2,7 +2,7 @@ use crate::commontypes::{
     Key, KeyError, Lsn, LsnError, PAGE_ID_SIZE, PageId, PageLsn, SLOT_ENTRY_SIZE, SlotEntry,
 };
 
-use crate::schema::{Row, RowValue, RowValueError, SchemaError, ValidatedRow};
+use crate::schema::{Row, RowValue, RowValueError, Schema, SchemaError, ValidatedRow};
 use crate::traits::Serializable;
 use crc32_light::Crc32Stream;
 use std::cmp::Ordering;
@@ -157,6 +157,7 @@ pub enum CorruptionKind {
     RowTooLarge { slot: usize },
     KeyTooLarge { slot: usize },
     PageNumOutOfRange(usize), // that page number that exceeds the meta data's stored page_count
+    BadSchema,
 }
 
 pub type RawPage = [u8; PAGE_SIZE];
@@ -184,6 +185,7 @@ pub enum PageBody {
         root_id: PageId,
         page_count: u32,
         free_list_head: Option<PageId>,
+        schema: Schema,
     },
     Free {
         next: Option<PageId>, // pointer to the next free page
@@ -246,6 +248,7 @@ impl Page {
             free_list_head,
             root_id,
             page_count,
+            ..
         } = &mut self.body
         else {
             unreachable!()
@@ -377,7 +380,12 @@ impl Page {
                     records.iter().map(Self::leaf_entry_size).sum::<usize>()
                 }
                 PageBody::Free { .. } => 1 + PAGE_ID_SIZE,
-                PageBody::Meta { .. } => 1 + PAGE_ID_SIZE,
+                PageBody::Meta { schema, .. } => {
+                    PAGE_ID_SIZE + // root_id
+                    size_of::<u32>() + // page_count
+                    1 + PAGE_ID_SIZE + // free_list_head
+                    schema.encoded_size() // schema
+                }
             };
         PAGE_SIZE.checked_sub(used_size)
     }
@@ -480,11 +488,13 @@ impl Page {
                 root_id,
                 page_count,
                 free_list_head,
+                schema,
             } => {
                 // write the data straight out in order
                 root_id.serialize(writer)?;
                 writer.write_all(&page_count.to_be_bytes())?;
                 free_list_head.serialize(writer)?;
+                schema.serialize(writer)?;
                 Ok((0, 0))
             }
         }
@@ -1179,8 +1189,7 @@ impl Page {
             _ => None,
         }
     }
-
-    #[allow(dead_code)]
+    #[allow(dead_code)] // TODO: Remove the lint catcher later
     pub(crate) fn leaf_remove(&mut self, key: &Key) -> Result<Option<Row>, PageError> {
         let PageBody::Leaf { records, .. } = &mut self.body else {
             return Err(PageError::WrongPageType);
@@ -1192,8 +1201,7 @@ impl Page {
         self.debug_check_invariants("leaf_remove");
         Ok(removed)
     }
-
-    #[allow(dead_code)]
+    #[allow(dead_code)] // TODO: Remove the lint catcher later
     pub(crate) fn internal_remove(
         &mut self,
         key: &Key,
@@ -1212,7 +1220,6 @@ impl Page {
         Ok(removed)
     }
 
-    #[allow(dead_code)]
     pub(crate) fn next(&self) -> Result<Option<PageId>, PageError> {
         match self.body {
             PageBody::Leaf { next, .. } => Ok(next),
@@ -1231,15 +1238,13 @@ impl Page {
         }
     }
 
-    #[allow(dead_code)]
     pub(crate) fn prev(&self) -> Result<Option<PageId>, PageError> {
         match self.body {
             PageBody::Leaf { prev, .. } => Ok(prev),
             _ => Err(PageError::WrongPageType),
         }
     }
-
-    #[allow(dead_code)]
+    #[allow(dead_code)] // TODO: Remove the lint catcher later
     pub(crate) fn set_prev(&mut self, new: Option<PageId>) -> Result<(), PageError> {
         match &mut self.body {
             PageBody::Leaf { prev, .. } => {
@@ -1294,6 +1299,7 @@ impl Page {
 
         Ok(ranges)
     }
+
     /// Decodes one slot's bytes, requiring the value to use exactly all of them.
     fn decode_slot<T: Serializable>(
         bytes: &[u8],
@@ -1470,6 +1476,63 @@ impl Page {
         self.debug_check_invariants("internal_replace_key");
         Ok(())
     }
+
+    /// Returns the root `PageId` from a Meta `Page`
+    pub(crate) fn meta_get_root_id(&self) -> Result<PageId, PageError> {
+        let PageBody::Meta { root_id, .. } = &self.body else {
+            return Err(PageError::WrongPageType);
+        };
+        Ok(*root_id)
+    }
+
+    /// Returns the root `PageId` from a Meta `Page`
+    pub(crate) fn meta_set_root_id(&mut self, id: PageId) -> Result<(), PageError> {
+        let PageBody::Meta { root_id, .. } = &mut self.body else {
+            return Err(PageError::WrongPageType);
+        };
+        *root_id = id;
+        Ok(())
+    }
+
+    #[allow(dead_code)] // TODO: Remove the lint catcher later
+    /// Returns the number of pages in the `Table`
+    pub(crate) fn meta_get_page_count(&self) -> Result<usize, PageError> {
+        let PageBody::Meta { page_count, .. } = &self.body else {
+            return Err(PageError::WrongPageType);
+        };
+        Ok(*page_count as usize)
+    }
+
+    /// Returns the number of pages in the `Table`
+    pub(crate) fn meta_get_schema(&self) -> Result<&Schema, PageError> {
+        let PageBody::Meta { schema, .. } = &self.body else {
+            return Err(PageError::WrongPageType);
+        };
+        Ok(schema)
+    }
+
+    /// Returns the head of the free page list
+    pub(crate) fn meta_get_free_list_head(&self) -> Result<Option<PageId>, PageError> {
+        let PageBody::Meta { free_list_head, .. } = &self.body else {
+            return Err(PageError::WrongPageType);
+        };
+        Ok(*free_list_head)
+    }
+
+    /// Increments the page_count on a meta page
+    pub(crate) fn meta_bump_page_count(&mut self) -> Result<PageId, PageError> {
+        let PageBody::Meta {
+            page_count,
+            root_id,
+            ..
+        } = &mut self.body
+        else {
+            return Err(PageError::WrongPageType);
+        };
+        *page_count += 1;
+        let new_page_id = PageId::new(root_id.get_table_id(), *page_count);
+        Ok(new_page_id)
+    }
 }
 
 impl Serializable for Page {
@@ -1598,10 +1661,13 @@ impl Serializable for Page {
                 let page_count = u32::from_be_bytes(buf_four);
                 let free_list_head = Option::<PageId>::deserialize(&mut cursor)
                     .map_err(|_| corrupt(CorruptionKind::InvalidPointerTag))?;
+                let schema = Schema::deserialize(&mut cursor)
+                    .map_err(|_| corrupt(CorruptionKind::BadSchema))?;
                 PageBody::Meta {
                     root_id,
                     page_count,
                     free_list_head,
+                    schema,
                 }
             }
             _ => unreachable!(),

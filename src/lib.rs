@@ -2,6 +2,7 @@ pub mod bpm;
 pub mod commontypes;
 pub mod page;
 pub mod schema;
+pub mod table;
 
 #[cfg(test)]
 pub(crate) mod test_support;

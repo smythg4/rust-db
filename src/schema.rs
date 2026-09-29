@@ -19,8 +19,6 @@ pub(crate) const MAX_NUM_FIELDS: usize = 255;
 pub enum RowValueError {
     #[error(transparent)]
     IoError(#[from] std::io::Error),
-    #[error(transparent)]
-    Utf8Error(#[from] FromUtf8Error),
     #[error("Unknown schema field tag: {0}")]
     UnknownTag(u8),
     #[error("Field length: {0}. Fields cannot be longer than {MAX_FIELD_LEN}")]
@@ -29,6 +27,8 @@ pub enum RowValueError {
     TooManyFields(usize),
     #[error("Booleans must come from bytes holding '0' or '1', got {0}")]
     InvalidBool(u8),
+    #[error(transparent)]
+    Utf8Error(#[from] FromUtf8Error),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -239,6 +239,34 @@ impl ColumnType {
     }
 }
 
+impl Serializable for ColumnType {
+    type Error = SchemaError;
+    fn deserialize<R: Read>(r: &mut R) -> Result<Self, Self::Error> {
+        let mut buf = [0u8; 1];
+        r.read_exact(&mut buf)?;
+        Ok(match buf[0] {
+            INT_FLAG => ColumnType::Integer,
+            FLOAT_FLAG => ColumnType::Float,
+            STRING_FLAG => ColumnType::String,
+            BOOL_FLAG => ColumnType::Bool,
+            _ => return Err(SchemaError::TagError(buf[0])),
+        })
+    }
+    fn serialize<W: Write>(&self, w: &mut W) -> Result<(), Self::Error> {
+        let tag = match self {
+            Self::Integer => INT_FLAG,
+            Self::Float => FLOAT_FLAG,
+            Self::String => STRING_FLAG,
+            Self::Bool => BOOL_FLAG,
+        };
+        w.write_all(&[tag])?;
+        Ok(())
+    }
+    fn encoded_size(&self) -> usize {
+        1
+    }
+}
+
 /// A value stored in a `Schema` representing the defined column type
 /// and whether or not the field is nullable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,6 +274,43 @@ pub struct Column {
     pub(crate) name: String,
     pub(crate) col_type: ColumnType,
     pub(crate) nullable: bool,
+}
+
+impl Serializable for Column {
+    type Error = SchemaError;
+    fn deserialize<R: Read>(r: &mut R) -> Result<Self, Self::Error> {
+        let col_type = ColumnType::deserialize(r)?;
+        let mut buf_one = [0u8; 1];
+        r.read_exact(&mut buf_one)?;
+        let nullable = match buf_one[0] {
+            0 => false,
+            1 => true,
+            _ => return Err(SchemaError::InvalidBool(buf_one[0])),
+        };
+        let name_len = r.read_varint()?;
+        if name_len > MAX_FIELD_LEN {
+            return Err(SchemaError::FieldTooLong(name_len));
+        }
+        let mut name_buf = vec![0u8; name_len];
+        r.read_exact(&mut name_buf)?;
+        let name = String::from_utf8(name_buf)?;
+        Ok(Self {
+            name,
+            col_type,
+            nullable,
+        })
+    }
+    fn serialize<W: Write>(&self, w: &mut W) -> Result<(), Self::Error> {
+        self.col_type.serialize(w)?;
+        w.write_all(&[self.nullable as u8])?;
+        let str_len = self.name.len();
+        w.write_all(&str_len.encode_var_vec())?;
+        w.write_all(self.name.as_bytes())?;
+        Ok(())
+    }
+    fn encoded_size(&self) -> usize {
+        1 + 1 + self.name.len().required_space() + self.name.len()
+    }
 }
 
 macro_rules! column_constructors {
@@ -304,6 +369,14 @@ pub enum SchemaError {
     InvalidKey,
     #[error("Column names can't be empty strings")]
     EmptyColumnName,
+    #[error(transparent)]
+    IoError(#[from] std::io::Error),
+    #[error("Unknown byte tag {0}")]
+    TagError(u8),
+    #[error("Booleans must come from bytes holding '0' or '1', got {0}")]
+    InvalidBool(u8),
+    #[error(transparent)]
+    Utf8Error(#[from] FromUtf8Error),
 }
 
 /// ValidatedRow is the only type accepted for `insert` operations on the B+Tree
@@ -341,7 +414,7 @@ impl From<ValidatedRow> for Row {
 
 /// Stores the list of columns for a Table. Columns include a ColumnType (e.g. Integer, String,
 /// Float) as well as an `nullable` flag indicated whether or not the field is nullable.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Schema {
     pub(crate) columns: Vec<Column>,
 }
@@ -403,6 +476,35 @@ impl Schema {
         }
 
         Ok(ValidatedRow(row))
+    }
+}
+
+impl Serializable for Schema {
+    type Error = SchemaError;
+    fn deserialize<R: Read>(r: &mut R) -> Result<Self, Self::Error> {
+        let num_cols: usize = r.read_varint()?;
+        if num_cols > MAX_NUM_FIELDS {
+            return Err(SchemaError::TooManyColumns);
+        }
+        let mut columns = Vec::with_capacity(num_cols);
+        for _ in 0..num_cols {
+            columns.push(Column::deserialize(r)?);
+        }
+        Self::try_from(columns)
+    }
+
+    fn serialize<W: Write>(&self, w: &mut W) -> Result<(), Self::Error> {
+        let num_cols = self.columns.len();
+        w.write_all(&num_cols.encode_var_vec())?;
+        for col in &self.columns {
+            col.serialize(w)?;
+        }
+        Ok(())
+    }
+
+    fn encoded_size(&self) -> usize {
+        self.columns.len().required_space()
+            + self.columns.iter().map(|c| c.encoded_size()).sum::<usize>()
     }
 }
 
