@@ -1,6 +1,7 @@
-use crate::bpm::{BpmError, PageWriteGuard};
+use crate::bpm::{BpmError, PageReadGuard, PageWriteGuard};
+use crate::commontypes::Key;
 use crate::page::{Page, PageError};
-use crate::schema::ValidatedRow;
+use crate::schema::{Row, ValidatedRow};
 use crate::table::Table;
 use crate::traits::{DiskManager, EvictionPolicy};
 use thiserror::Error;
@@ -21,18 +22,39 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
         Self { table }
     }
 
-    pub fn insert(&self, row: ValidatedRow) -> Result<(), BTreeError> {
-        let root_id = loop {
+    pub fn get_root_write(&self) -> Result<PageWriteGuard<'_, Dm, Ep>, BTreeError> {
+        // basically a CAS loop to make sure we have the absolute newest root_id
+        let root_page = loop {
             let id = self.table.root_id().expect("failed to get root id");
             let guard = self.table.bpm.fetch_write(id)?;
             if self.table.root_id().expect("failed to get root id") == id {
-                break id;
+                break guard;
             }
             drop(guard);
         };
+        Ok(root_page)
+    }
 
-        let mut curr_page = self.table.bpm.fetch_write(root_id)?;
+    pub fn get_root_read(&self) -> Result<PageReadGuard<'_, Dm, Ep>, BTreeError> {
+        // basically a CAS loop to make sure we have the absolute newest root_id
+        let root_page = loop {
+            let id = self.table.root_id().expect("failed to get root id");
+            let guard = self.table.bpm.fetch_read(id)?;
+            if self.table.root_id().expect("failed to get root id") == id {
+                break guard;
+            }
+            drop(guard);
+        };
+        Ok(root_page)
+    }
+
+    pub fn insert(&self, row: ValidatedRow) -> Result<(), BTreeError> {
+        let mut curr_page = self.get_root_write()?;
+
         let key = row.primary_key();
+
+        // a stack of parents traversed on the way down to finding the leaf page
+        // for insertion. Holding `WriteGuards` along the way.
         let mut ancestors = Vec::new();
 
         // descend through the internal pages
@@ -41,7 +63,16 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
         {
             ancestors.push(curr_page);
             curr_page = self.table.bpm.fetch_write(ch)?;
+
+            // check if it's safe to split this page (if it's internal) or if a leaf
+            // leaf can accept the entry. If either is true, then we don't need
+            // the ancestors anymore and can release their guards by clearing the vec.
+            if curr_page.is_split_safe() || curr_page.can_insert(row.as_ref()) {
+                log::debug!("Clearing ancestors above page {}", curr_page.page_id());
+                ancestors.clear(); // drops the guards: releases latches and unpins, root first
+            }
         }
+
         // now we know we're at a leaf page
         if curr_page.can_insert(row.as_ref()) {
             Ok(curr_page.leaf_insert(row)?)
@@ -50,6 +81,8 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
             if curr_page.leaf_get(&key)?.is_some() {
                 return Err(PageError::DuplicateKey.into());
             }
+            log::debug!("Splitting page: {}", curr_page.page_id());
+            // we need to split the leaf and insert the entry into the proper side
             self.split_and_insert(curr_page, row, ancestors)
         }
     }
@@ -60,28 +93,47 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
         row: ValidatedRow,
         mut ancestors: Vec<PageWriteGuard<'_, Dm, Ep>>,
     ) -> Result<(), BTreeError> {
+        // allocate a new page from the table
         let mut right = self.table.allocate().expect("table allocation failed");
+
+        // split the leaf page, returning the separator key and a new page
         let (mut sep, new_page) = page.split_page(right.page_id())?;
+
+        // overwrite the page we got from the allocator with the new_page from the split
         right.replace(new_page);
+
+        // fix up the page pointers
+        if let Some(n) = right.next()? {
+            self.table
+                .bpm
+                .fetch_write(n)?
+                .set_prev(Some(right.page_id()))?;
+        }
 
         let mut left_id = page.page_id();
         let mut right_id = right.page_id();
+
+        // insert the row into the appropriate leaf page
+        if row.primary_key() <= sep {
+            page.leaf_insert(row)?;
+        } else {
+            right.leaf_insert(row)?;
+        }
+
+        // drop the guards for the leaves we were holding
         drop(page);
         drop(right);
+
         loop {
             match ancestors.pop() {
                 None => {
+                    // the root node was split, we need to allocate a new root
                     let mut new_root = self.table.allocate().expect("table allocation failed");
                     let root = Page::new_root(new_root.page_id(), left_id, sep.clone(), right_id);
                     new_root.replace(root);
                     self.table
                         .set_root_id(new_root.page_id())
                         .expect("setting root node failed");
-                    if row.primary_key() >= sep {
-                        self.table.bpm.fetch_write(right_id)?.leaf_insert(row)?;
-                    } else {
-                        self.table.bpm.fetch_write(left_id)?.leaf_insert(row)?;
-                    }
                     return Ok(());
                 }
                 Some(mut parent) if parent.can_insert_separator(&sep) => {
@@ -90,20 +142,79 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
                 }
                 Some(mut parent) => {
                     // parent was full...
+
+                    // allocate a new page, this guard should drop at the end of the loop iteration
                     let mut new_right_internal =
                         self.table.allocate().expect("table allocation failed");
+
+                    // split the parent page - same drill as before with the leaf
                     let (promoted, page) = parent.split_page(new_right_internal.page_id())?;
                     new_right_internal.replace(page);
+
+                    // put the separator from below in the correct half
                     if sep > promoted {
                         new_right_internal.internal_insert(sep, right_id)?;
                     } else {
                         parent.internal_insert(sep, right_id)?;
                     }
+
+                    // now we're moving up the tree with a new separator
                     left_id = parent.page_id();
                     right_id = new_right_internal.page_id();
                     sep = promoted;
                 }
             }
         }
+    }
+
+    pub fn get(&self, key: &Key) -> Result<Option<Row>, BTreeError> {
+        let mut curr_page = self.get_root_read()?;
+
+        // descend through the internal pages
+        while curr_page.is_internal()
+            && let Some(ch) = curr_page.find_child(key)
+        {
+            curr_page = self.table.bpm.fetch_read(ch)?;
+        }
+
+        // now we're in a leaf
+        Ok(curr_page.leaf_get(key)?.cloned())
+    }
+
+    pub fn get_range(&self, start_key: &Key, end_key: &Key) -> Result<Vec<Row>, BTreeError> {
+        let mut curr_page = self.get_root_read()?;
+
+        // descend through the internal pages
+        while curr_page.is_internal()
+            && let Some(ch) = curr_page.find_child(start_key)
+        {
+            curr_page = self.table.bpm.fetch_read(ch)?;
+        }
+
+        let mut result = Vec::with_capacity(curr_page.num_items());
+
+        loop {
+            result.extend(
+                curr_page
+                    .leaf_records_from(start_key)?
+                    .filter(|r| r.cmp_key(end_key) != std::cmp::Ordering::Greater)
+                    .cloned(),
+            );
+            match curr_page.next()? {
+                None => break,
+                Some(n) => curr_page = self.table.bpm.fetch_read(n)?,
+            }
+        }
+
+        Ok(result)
+    }
+
+    pub fn get_all(&self) -> Result<Vec<Row>, BTreeError> {
+        // TODO: Add a schema helper that returns minimum key for that schema
+        let min_key = Key::Integer(i64::MIN);
+        // TODO: Add a schema helper that returns the max key for that schema
+        let max_key = Key::String(String::from("a").repeat(100));
+
+        self.get_range(&min_key, &max_key)
     }
 }

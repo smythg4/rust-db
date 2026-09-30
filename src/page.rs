@@ -562,6 +562,19 @@ impl Page {
         Self::internal_entry_size(key) <= free_space
     }
 
+    /// Returns `true` if `Page` is internal and can accept the largest possible `Key` value
+    pub(crate) fn is_split_safe(&self) -> bool {
+        if !self.is_internal() {
+            return false;
+        }
+        // immediately return `false` if the page is already overfull
+        let free_space = match self.free_space() {
+            None => return false,
+            Some(s) => s,
+        };
+        MAX_INTERNAL_ENTRY_SIZE <= free_space
+    }
+
     /// Returns `true` if the `Page` is underfull and can be merged with any other underfull `Page`
     pub fn is_underfull(&self) -> bool {
         match &self.body {

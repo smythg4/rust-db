@@ -31,10 +31,16 @@ pub enum BpmError {
 struct Wal;
 
 #[derive(Default, Debug)]
-pub(crate) struct Frame {
+pub struct Frame {
     latch: RwLock<Option<Page>>, // guards the page contents
     pin_count: AtomicU32,
     dirty: AtomicBool,
+}
+
+impl Frame {
+    pub(crate) fn is_pinned(&self) -> bool {
+        self.pin_count.load(Ordering::Acquire) != 0
+    }
 }
 
 struct BpmState<Ep: EvictionPolicy> {
@@ -185,21 +191,29 @@ impl<Dm: DiskManager, Ep: EvictionPolicy> BufferPoolManager<Dm, Ep> {
                 // ask the eviction policy for a victim frame
                 let victim_id = state
                     .eviction_policy
-                    .find_victim()
+                    .find_victim(&self.frames)
                     .ok_or(BpmError::NoFreeFrames)?;
                 let victim = &self.frames[victim_id];
+                if victim.is_pinned() {
+                    return Err(BpmError::NoFreeFrames);
+                }
 
-                let guard = victim.latch.read().unwrap();
+                let guard = victim
+                    .latch
+                    .try_write()
+                    .map_err(|_| BpmError::NoFreeFrames)?;
                 let pid = guard.as_ref().expect("data shouldn't be empty").page_id();
 
                 // if the frame was dirty, we need to write it to disk before returning
                 if victim.dirty.load(Ordering::Acquire) {
+                    log::debug!("Flushing dirty frame {} to disk", victim_id);
                     let raw = guard
                         .as_ref()
                         .expect("page shouldn't be empty")
                         .as_raw_page()?;
                     self.persistant_layer.write_page(pid, &raw)?;
                 }
+                log::debug!("Evicting page {pid} from the pool...");
                 // remove the victim from the active page table
                 state.page_table.remove(&pid);
                 Ok(victim_id)

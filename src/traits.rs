@@ -1,3 +1,4 @@
+use crate::bpm::Frame;
 use crate::commontypes::{FrameId, PageId};
 use crate::page::RawPage;
 use std::io::ErrorKind;
@@ -13,7 +14,7 @@ pub trait DiskManager: Send + Sync {
 }
 
 pub trait EvictionPolicy {
-    fn find_victim(&self) -> Option<FrameId>;
+    fn find_victim(&mut self, frames: &[Frame]) -> Option<FrameId>;
 }
 
 pub trait Serializable

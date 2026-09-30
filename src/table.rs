@@ -118,19 +118,30 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commontypes::FrameId;
+    use crate::bpm::Frame;
+    use crate::commontypes::{FrameId, Key};
     use crate::page::RawPage;
     use crate::schema::{Row, RowValue};
     use crate::test_support::leaf_schema;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    struct Replacer;
+    #[derive(Default)]
+    struct Replacer {
+        hand: usize,
+    }
 
     impl EvictionPolicy for Replacer {
         /// TODO: This is just a placeholder until I figure this out...
-        fn find_victim(&self) -> Option<FrameId> {
-            Some(FrameId::new(0))
+        fn find_victim(&mut self, frames: &[Frame]) -> Option<FrameId> {
+            for _ in 0..frames.len() {
+                let id = self.hand;
+                self.hand = (self.hand + 1) % frames.len();
+                if !frames[id].is_pinned() {
+                    return Some(FrameId::new(id));
+                }
+            }
+            None // everything pinned → NoFreeFrames
         }
     }
 
@@ -169,6 +180,7 @@ mod tests {
             Ok(())
         }
 
+        #[allow(dead_code)]
         fn print_pages(&self) -> Result<(), TableError> {
             let num_pages = self.bpm.fetch_read(self.meta_id)?.meta_get_page_count()?;
             let table_id = self.bpm.fetch_read(self.meta_id)?.page_id().get_table_id();
@@ -181,23 +193,68 @@ mod tests {
 
             Ok(())
         }
+
+        fn print_and_check_row_keys_order(&self, start: i64, end: i64) -> Result<(), TableError> {
+            let expected_count = (end.checked_sub(start).unwrap_or_default().abs() + 1) as usize;
+            let start_key = Key::Integer(start);
+            let end_key = Key::Integer(end);
+            let rows = BTree::new(self).get_range(&start_key, &end_key)?;
+            let keys: Vec<Key> = rows
+                .iter()
+                .map(|r| Key::try_from(&r.fields[0]))
+                .collect::<Result<_, _>>()
+                .expect("stored rows have valid keys");
+
+            assert_eq!(keys.len(), expected_count);
+            assert!(
+                keys.windows(2).all(|w| w[0] < w[1]),
+                "keys aren't strictly increasing"
+            );
+
+            for row in rows {
+                println!("{:?}, ", row)
+            }
+            Ok(())
+        }
     }
 
     #[test]
     fn table_basics() {
-        let bpm = BufferPoolManager::new(FakeDisk::default(), Replacer, 512);
-        let table = Table::create(&bpm, TableId::new(999), leaf_schema().0)
-            .expect("failed to create table");
-        for row_num in -100000..=100000 {
-            if table
-                .insert_row(row_num, &format!("stuff in row {row_num}"))
-                .is_err()
-            {
-                break;
-            }
-        }
+        //env_logger::init();
+        let bpm = BufferPoolManager::new(FakeDisk::default(), Replacer::default(), 6);
+        let table =
+            Table::create(&bpm, TableId::new(1), leaf_schema().0).expect("failed to create table");
+        let num_iters = 10000;
 
-        table.print_pages().expect("failed to print pages");
+        std::thread::scope(|s| {
+            let h = s.spawn(|| {
+                for row_num in (-num_iters..=num_iters).rev() {
+                    if table
+                        .insert_row(row_num, &format!("stuff in row {row_num}"))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+            let h2 = s.spawn(|| {
+                for i in -num_iters..=num_iters {
+                    if let Some(thing) = BTree::new(&table).get(&Key::Integer(i)).unwrap() {
+                        assert_eq!(
+                            thing.cmp_key(&Key::Integer(i)),
+                            std::cmp::Ordering::Equal,
+                            "keys don't match"
+                        );
+                    }
+                }
+            });
+            h.join().unwrap();
+            table
+                .print_and_check_row_keys_order(-5, 5)
+                .expect("failed to print keys");
+            h2.join().unwrap();
+        });
+
         println!("Done!");
     }
 }
