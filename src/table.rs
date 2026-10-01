@@ -49,14 +49,14 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
     ) -> Result<Self, TableError> {
         use crate::page::PageBody;
         let meta_id = PageId::new(table_id, 0);
-        println!("Opening the file...");
+        log::info!("Opening the file...");
         match bpm.fetch_read(meta_id) {
             Ok(_) => return Err(TableError::AlreadyExists(table_id)),
             Err(BpmError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {} // file isn't populated yet
             Err(BpmError::IoError(e)) if e.kind() == std::io::ErrorKind::NotFound => {} // clear path to make the table
             Err(e) => return Err(e.into()),
         }
-        println!("File opened! Making new pages...");
+        log::info!("File opened! Making new pages...");
         let root_id = PageId::new(table_id, 1);
         let meta_page = Page::empty_page(
             meta_id,
@@ -71,7 +71,7 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
 
         bpm.new_page(leaf_root)?;
         bpm.new_page(meta_page)?;
-        println!("Meta and root pages created. Flushing to disk...");
+        log::info!("Meta and root pages created. Flushing to disk...");
         bpm.flush_all()?;
         Ok(Self {
             bpm,
@@ -121,6 +121,7 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::bpm::Frame;
     use crate::commontypes::{FrameId, Key};
@@ -237,7 +238,7 @@ mod tests {
 
     #[test]
     fn table_basics() {
-        env_logger::init();
+        //env_logger::init();
         let path = std::env::temp_dir().join(format!(
             "rust-db-{}-{}.db",
             std::process::id(),
@@ -259,7 +260,7 @@ mod tests {
                     match table.insert_row(row_num, &format!("user{}@aol.com", row_num.abs())) {
                         Ok(_) => {}
                         Err(TableError::BTree(BTreeError::Page(DuplicateKey))) => {
-                            eprintln!("Duplicate key at {row_num}, skipping...")
+                            log::warn!("Duplicate key at {row_num}, skipping...")
                         }
                         Err(e) => panic!("Unexpected Btree error {e:?}"),
                     }
@@ -271,7 +272,7 @@ mod tests {
                     match table.insert_row(row_num, &format!("user{}@yahoo.com", row_num.abs())) {
                         Ok(_) => {}
                         Err(TableError::BTree(BTreeError::Page(DuplicateKey))) => {
-                            eprintln!("Duplicate key at {row_num}, skipping...");
+                            log::warn!("Duplicate key at {row_num}, skipping...");
                         }
                         Err(e) => panic!("Unexpected Btree error {e:?}"),
                     }
@@ -283,7 +284,7 @@ mod tests {
                     match table.insert_row(row_num, "NULL") {
                         Ok(_) => {}
                         Err(TableError::BTree(BTreeError::Page(DuplicateKey))) => {
-                            eprintln!("Duplicate key at {row_num}, skipping...");
+                            log::warn!("Duplicate key at {row_num}, skipping...");
                         }
                         Err(e) => panic!("Unexpected Btree error {e:?}"),
                     }
@@ -313,7 +314,7 @@ mod tests {
             reader.join().unwrap();
 
             let remover = s.spawn(|| {
-                for i in (num_iters - 13)..=(num_iters - 3) {
+                for i in -num_iters..num_iters - 10 {
                     BTree::new(&table)
                         .delete(&Key::Integer(i))
                         .expect("failed to delete a row");
@@ -324,6 +325,21 @@ mod tests {
         });
 
         table.print_table().expect("failed to print table");
+
+        let rows = BTree::new(&table).get_all().expect("failed to fetch rows");
+
+        drop(table);
+        drop(bpm);
+
+        let new_disk = FileDisk::new(&path).expect("failed to reopen file");
+        let new_bpm = BufferPoolManager::new(new_disk, Replacer::default(), 512);
+        let new_table = Table::open(&new_bpm, TableId::new(1)).expect("failed to reopen table");
+
+        let after_rows = BTree::new(&new_table)
+            .get_all()
+            .expect("failed to fetch rows on reload");
+
+        assert_eq!(rows, after_rows, "reload rows were different");
 
         let _ = std::fs::remove_file(&path); // clean up the temp file
         println!("Done!");

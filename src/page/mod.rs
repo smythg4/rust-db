@@ -369,6 +369,25 @@ impl Page {
         }
     }
 
+    /// Used in tree rebalancing to avoid many hits of single borrows
+    /// donor will provide entries until the receiver has an equal number of entries in it
+    pub(crate) fn bulk_borrow_from_right(
+        &mut self,
+        right: &mut Page,
+        parent_sep: Key,
+    ) -> Result<Key, PageError> {
+        let mut sep = self.borrow_from_right(right, parent_sep)?; // the first move has to succeed
+        while self.entries_size() < right.entries_size() {
+            match self.borrow_from_right(right, sep.clone()) {
+                Ok(new_sep) => sep = new_sep,
+                // the next entry wouldn't fit, or the donor is down to its minimum: stop here
+                Err(PageError::PageFull | PageError::InvalidBorrow(_)) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(sep)
+    }
+
     /// Thin dispatch to cover use cases for callers
     pub(crate) fn borrow_from_left(
         &mut self,
@@ -380,6 +399,25 @@ impl Page {
         } else {
             self.leaf_borrow_from_left(left)
         }
+    }
+
+    /// Used in tree rebalancing to avoid many hits of single borrows
+    /// donor will provide entries until the receiver has an equal number of entries in it
+    pub(crate) fn bulk_borrow_from_left(
+        &mut self,
+        left: &mut Page,
+        parent_sep: Key,
+    ) -> Result<Key, PageError> {
+        let mut sep = self.borrow_from_left(left, parent_sep)?; // the first move has to succeed
+        while self.entries_size() < left.entries_size() {
+            match self.borrow_from_left(left, sep.clone()) {
+                Ok(new_sep) => sep = new_sep,
+                // the next entry wouldn't fit, or the donor is down to its minimum: stop here
+                Err(PageError::PageFull | PageError::InvalidBorrow(_)) => break,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(sep)
     }
 
     fn entries_size(&self) -> usize {

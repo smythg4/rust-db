@@ -277,7 +277,7 @@ impl<Dm: DiskManager, Ep: EvictionPolicy> BufferPoolManager<Dm, Ep> {
             let guard = frame.latch.read().unwrap();
             if frame.dirty.load(Ordering::Acquire) {
                 if let Some(page) = guard.as_ref() {
-                    log::debug!("flushing frame {:?} to disk", frame);
+                    log::info!("flushing frame {:?} to disk", frame);
                     let raw = page.as_raw_page()?;
                     self.persistant_layer.write_page(page.page_id(), &raw)?;
                 }

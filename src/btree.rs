@@ -81,7 +81,7 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
             if curr_page.leaf_get(&key)?.is_some() {
                 return Err(PageError::DuplicateKey.into());
             }
-            log::debug!("Splitting page: {}", curr_page.page_id());
+            log::info!("Splitting page: {}", curr_page.page_id());
             // we need to split the leaf and insert the entry into the proper side
             self.split_and_insert(curr_page, row, ancestors)
         }
@@ -261,7 +261,7 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
             };
 
             if left.can_merge_with(&right, &sib.separator) {
-                log::debug!("merging pages {} and {}", left.page_id(), right.page_id());
+                log::info!("merging pages {} and {}", left.page_id(), right.page_id());
                 // merge with the right neighbor
                 let _freed_id = left.merge_from_right(&mut right, sib.separator.clone())?;
                 // remove the separator from the parent
@@ -282,19 +282,33 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
                 // move up the tree
                 page = parent;
             } else {
-                log::debug!(
-                    "can't merge, so we {} is borrowing from {}",
-                    left.page_id(),
-                    right.page_id()
-                );
+                log::info!("{} borrowing from {}", left.page_id(), right.page_id());
                 // we couldn't merge, so let's try to borrow
                 let new_sep = match sib.side {
-                    Side::Right => left.borrow_from_right(&mut right, sib.separator.clone())?, // node = left, takes from the right
-                    Side::Left => right.borrow_from_left(&mut left, sib.separator.clone())?, // node = right, takes from the left
+                    Side::Right => {
+                        left.bulk_borrow_from_right(&mut right, sib.separator.clone())?
+                    } // node = left, takes from the right
+                    Side::Left => right.bulk_borrow_from_left(&mut left, sib.separator.clone())?, // node = right, takes from the left
                 };
                 parent.internal_replace_key(&sib.separator, new_sep)?;
-                break;
+                return Ok(());
             }
+        }
+
+        // the loop only leaves `page` as an internal page with no ancestors if it walked all the way up to the root
+        if ancestors.is_empty() && page.is_internal() && page.num_items() == 0 {
+            let only_child = *page
+                .children()
+                .expect("internal")
+                .next()
+                .expect("one child");
+            self.table
+                .set_root_id(only_child)
+                .expect("failed to set new root page"); // while still holding the old root's latch
+            page.make_free();
+            self.table
+                .free(page)
+                .expect("failed to free lonely root page");
         }
         Ok(())
     }
