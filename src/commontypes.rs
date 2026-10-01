@@ -321,11 +321,18 @@ mod tests {
 
     impl Arbitrary for Key {
         fn arbitrary(g: &mut Gen) -> Self {
-            let num = g.choose(&[0, 1]).unwrap();
-            match num {
-                0 => Key::Integer(i64::arbitrary(g)),
-                1 => Key::String(String::arbitrary(g)),
-                _ => unreachable!(),
+            let coin_flip = bool::arbitrary(g);
+            if coin_flip {
+                Key::Integer(i64::arbitrary(g))
+            } else {
+                Key::String(String::arbitrary(g))
+            }
+        }
+
+        fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+            match self {
+                Key::Integer(n) => Box::new(n.shrink().map(Key::Integer)),
+                Key::String(s) => Box::new(s.shrink().map(Key::String)),
             }
         }
     }

@@ -1,6 +1,6 @@
 use crate::bpm::{BpmError, PageReadGuard, PageWriteGuard};
-use crate::commontypes::Key;
-use crate::page::{Page, PageError};
+use crate::commontypes::{Key, PageId};
+use crate::page::{ChildIndex, Page, PageError};
 use crate::schema::{Row, ValidatedRow};
 use crate::table::Table;
 use crate::traits::{DiskManager, EvictionPolicy};
@@ -216,5 +216,119 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
         let max_key = Key::String(String::from("a").repeat(100));
 
         self.get_range(&min_key, &max_key)
+    }
+
+    pub fn delete(&self, key: &Key) -> Result<Option<Row>, BTreeError> {
+        let mut curr_page = self.get_root_write()?;
+        let mut ancestors = Vec::new();
+
+        // descend down to leaf page
+        while curr_page.is_internal() {
+            // push the path you took to get here onto an ancestors stack
+            let (idx, child_id) = curr_page
+                .find_child_index(key)
+                .expect("internal page always has a child for any key");
+            ancestors.push((curr_page, idx));
+            curr_page = self.table.bpm.fetch_write(child_id)?;
+        }
+
+        // now we're at a leaf - if there was nothing to remove, return early
+        let Some(row) = curr_page.leaf_remove(key)? else {
+            return Ok(None);
+        };
+
+        self.rebalance(curr_page, ancestors)?;
+
+        Ok(Some(row))
+    }
+
+    fn rebalance(
+        &self,
+        mut page: PageWriteGuard<'t, Dm, Ep>,
+        mut ancestors: Vec<(PageWriteGuard<'t, Dm, Ep>, ChildIndex)>,
+    ) -> Result<(), BTreeError> {
+        while page.is_underfull() {
+            let Some((mut parent, idx)) = ancestors.pop() else {
+                break;
+            };
+            let sib = pick_sibling(&parent, idx).expect("non-root has a sibling");
+            let sibling = self.table.bpm.fetch_write(sib.id)?;
+
+            // name the pair left/right so there's only one path for each case
+            let (mut left, mut right) = match sib.side {
+                Side::Right => (page, sibling),
+                Side::Left => (sibling, page),
+            };
+
+            if left.can_merge_with(&right, &sib.separator) {
+                log::debug!("merging pages {} and {}", left.page_id(), right.page_id());
+                // merge with the right neighbor
+                let _freed_id = left.merge_from_right(&mut right, sib.separator.clone())?;
+                // remove the separator from the parent
+                let removed = parent.internal_remove(&sib.separator)?;
+                debug_assert_eq!(removed.map(|(_, id)| id), Some(right.page_id()));
+
+                // Fix up leaf pointers
+                if left.is_leaf()
+                    && let Some(n) = left.next()?
+                {
+                    self.table
+                        .bpm
+                        .fetch_write(n)?
+                        .set_prev(Some(left.page_id()))?;
+                }
+                // free the merged page
+                self.table.free(right).expect("failed to free right page");
+                // move up the tree
+                page = parent;
+            } else {
+                log::debug!(
+                    "can't merge, so we {} is borrowing from {}",
+                    left.page_id(),
+                    right.page_id()
+                );
+                // we couldn't merge, so let's try to borrow
+                let new_sep = match sib.side {
+                    Side::Right => left.borrow_from_right(&mut right, sib.separator.clone())?, // node = left, takes from the right
+                    Side::Left => right.borrow_from_left(&mut left, sib.separator.clone())?, // node = right, takes from the left
+                };
+                parent.internal_replace_key(&sib.separator, new_sep)?;
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+enum Side {
+    Left,
+    Right,
+}
+
+struct Sibling {
+    id: PageId,
+    separator: Key,
+    side: Side,
+}
+
+fn pick_sibling(parent: &Page, idx: ChildIndex) -> Option<Sibling> {
+    if let Some(id) = parent.child_at(idx.right_sibling()) {
+        Some(Sibling {
+            id,
+            separator: parent
+                .key_at(idx.right_separator())
+                .expect("children.len() == keys.len() + 1")
+                .clone(),
+            side: Side::Right,
+        })
+    } else {
+        Some(Sibling {
+            id: parent.child_at(idx.left_sibling()?)?,
+            separator: parent
+                .key_at(idx.left_separator()?)
+                .expect("children.len() == keys.len() + 1")
+                .clone(),
+            side: Side::Left,
+        })
     }
 }

@@ -49,11 +49,14 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
     ) -> Result<Self, TableError> {
         use crate::page::PageBody;
         let meta_id = PageId::new(table_id, 0);
+        println!("Opening the file...");
         match bpm.fetch_read(meta_id) {
             Ok(_) => return Err(TableError::AlreadyExists(table_id)),
+            Err(BpmError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {} // file isn't populated yet
             Err(BpmError::IoError(e)) if e.kind() == std::io::ErrorKind::NotFound => {} // clear path to make the table
             Err(e) => return Err(e.into()),
         }
+        println!("File opened! Making new pages...");
         let root_id = PageId::new(table_id, 1);
         let meta_page = Page::empty_page(
             meta_id,
@@ -68,6 +71,7 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
 
         bpm.new_page(leaf_root)?;
         bpm.new_page(meta_page)?;
+        println!("Meta and root pages created. Flushing to disk...");
         bpm.flush_all()?;
         Ok(Self {
             bpm,
@@ -120,11 +124,10 @@ mod tests {
     use super::*;
     use crate::bpm::Frame;
     use crate::commontypes::{FrameId, Key};
-    use crate::page::RawPage;
+    use crate::disk::FileDisk;
+    use crate::page::PageError::DuplicateKey;
     use crate::schema::{Row, RowValue};
     use crate::test_support::leaf_schema;
-    use std::collections::HashMap;
-    use std::sync::Mutex;
 
     #[derive(Default)]
     struct Replacer {
@@ -145,56 +148,57 @@ mod tests {
         }
     }
 
-    #[derive(Default)]
-    struct FakeDisk {
-        stuff: Mutex<HashMap<PageId, RawPage>>,
-    }
-
-    impl DiskManager for FakeDisk {
-        fn read_page(&self, id: PageId, buf: &mut RawPage) -> std::io::Result<()> {
-            let pages = self.stuff.lock().unwrap();
-            let page = pages
-                .get(&id)
-                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))?;
-            buf.copy_from_slice(page);
-            Ok(())
-        }
-        fn write_page(&self, id: PageId, buf: &RawPage) -> std::io::Result<()> {
-            self.stuff.lock().unwrap().insert(id, *buf);
-            Ok(())
-        }
-        fn sync(&self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> Table<'a, FakeDisk, Replacer> {
+    impl<'a> Table<'a, FileDisk, Replacer> {
         // helper to generate a row and insert it
         fn insert_row(&self, row_id: i64, content: &str) -> Result<(), TableError> {
-            let row = Row::try_from(vec![
-                RowValue::Integer(row_id),
-                RowValue::String(content.into()),
-            ])
-            .expect("this will work");
+            let payload = if content == "NULL" {
+                RowValue::Null
+            } else {
+                RowValue::String(content.into())
+            };
+
+            let row =
+                Row::try_from(vec![RowValue::Integer(row_id), payload]).expect("this will work");
             self.insert(row)?;
             Ok(())
         }
 
-        #[allow(dead_code)]
-        fn print_pages(&self) -> Result<(), TableError> {
-            let num_pages = self.bpm.fetch_read(self.meta_id)?.meta_get_page_count()?;
-            let table_id = self.bpm.fetch_read(self.meta_id)?.page_id().get_table_id();
-            let page_id = |num| PageId::new(table_id, num);
+        fn print_table(&self) -> Result<(), TableError> {
+            let rows = BTree::new(self).get_all().expect("failed to fetch rows");
+            let header = line(self.schema.columns.iter().map(|c| {
+                format!(
+                    "{} ({:?}{})",
+                    c.name,
+                    c.col_type,
+                    if c.nullable { "*" } else { "" }
+                )
+            }));
 
-            for i in 0..num_pages as u32 {
-                let guard = self.bpm.fetch_read(page_id(i))?;
-                println!("{:?}", guard);
+            let rule = "-".repeat(header.chars().count());
+
+            let print_rows = |rows: &[Row]| {
+                for row in rows {
+                    println!("{}", line(row.fields.iter().map(|v| v.to_string())));
+                }
+            };
+
+            println!("{rule}\n{header}\n{rule}");
+            if rows.len() <= 10 {
+                print_rows(&rows);
+            } else {
+                print_rows(&rows[..5]);
+                println!(
+                    "{}",
+                    line(self.schema.columns.iter().map(|_| "...".to_string()))
+                );
+                print_rows(&rows[rows.len() - 5..]);
             }
+            println!("{rule}\n({} rows)", rows.len());
 
             Ok(())
         }
 
-        fn print_and_check_row_keys_order(&self, start: i64, end: i64) -> Result<(), TableError> {
+        fn check_row_keys_order(&self, start: i64, end: i64) -> Result<(), TableError> {
             let expected_count = (end.checked_sub(start).unwrap_or_default().abs() + 1) as usize;
             let start_key = Key::Integer(start);
             let end_key = Key::Integer(end);
@@ -210,34 +214,83 @@ mod tests {
                 keys.windows(2).all(|w| w[0] < w[1]),
                 "keys aren't strictly increasing"
             );
-
-            for row in rows {
-                println!("{:?}, ", row)
-            }
             Ok(())
         }
     }
 
+    const COL_WIDTH: usize = 30;
+
+    /// Pads to COL_WIDTH, or cuts with "…" if too long (counts chars, not bytes).
+    fn cell(s: &str) -> String {
+        if s.chars().count() > COL_WIDTH {
+            let cut: String = s.chars().take(COL_WIDTH - 1).collect();
+            format!("{cut}…")
+        } else {
+            format!("{s:<COL_WIDTH$}")
+        }
+    }
+
+    fn line(cells: impl IntoIterator<Item = String>) -> String {
+        let cells: Vec<String> = cells.into_iter().map(|c| cell(&c)).collect();
+        format!("| {} |", cells.join(" | "))
+    }
+
     #[test]
     fn table_basics() {
-        //env_logger::init();
-        let bpm = BufferPoolManager::new(FakeDisk::default(), Replacer::default(), 6);
-        let table =
-            Table::create(&bpm, TableId::new(1), leaf_schema().0).expect("failed to create table");
-        let num_iters = 10000;
+        env_logger::init();
+        let path = std::env::temp_dir().join(format!(
+            "rust-db-{}-{}.db",
+            std::process::id(),
+            "table_basics"
+        ));
+        let _ = std::fs::remove_file(&path); // start clean
+
+        let disk = FileDisk::new(&path).expect("failed to open file");
+        let bpm = BufferPoolManager::new(disk, Replacer::default(), 10);
+        let mut schema = leaf_schema().0;
+        schema.columns[1].nullable = true;
+        let table = Table::create(&bpm, TableId::new(1), schema).expect("failed to create table");
+        let num_iters: i64 = 100_000;
+        let keys_for = |k: i64| (-num_iters..=num_iters).filter(move |n| n.rem_euclid(3) == k);
 
         std::thread::scope(|s| {
-            let h = s.spawn(|| {
-                for row_num in (-num_iters..=num_iters).rev() {
-                    if table
-                        .insert_row(row_num, &format!("stuff in row {row_num}"))
-                        .is_err()
-                    {
-                        break;
+            let writer1 = s.spawn(|| {
+                for row_num in keys_for(0).rev() {
+                    match table.insert_row(row_num, &format!("user{}@aol.com", row_num.abs())) {
+                        Ok(_) => {}
+                        Err(TableError::BTree(BTreeError::Page(DuplicateKey))) => {
+                            eprintln!("Duplicate key at {row_num}, skipping...")
+                        }
+                        Err(e) => panic!("Unexpected Btree error {e:?}"),
                     }
                 }
             });
-            let h2 = s.spawn(|| {
+
+            let writer2 = s.spawn(|| {
+                for row_num in keys_for(1) {
+                    match table.insert_row(row_num, &format!("user{}@yahoo.com", row_num.abs())) {
+                        Ok(_) => {}
+                        Err(TableError::BTree(BTreeError::Page(DuplicateKey))) => {
+                            eprintln!("Duplicate key at {row_num}, skipping...");
+                        }
+                        Err(e) => panic!("Unexpected Btree error {e:?}"),
+                    }
+                }
+            });
+
+            let writer3 = s.spawn(|| {
+                for row_num in keys_for(2).rev() {
+                    match table.insert_row(row_num, "NULL") {
+                        Ok(_) => {}
+                        Err(TableError::BTree(BTreeError::Page(DuplicateKey))) => {
+                            eprintln!("Duplicate key at {row_num}, skipping...");
+                        }
+                        Err(e) => panic!("Unexpected Btree error {e:?}"),
+                    }
+                }
+            });
+
+            let reader = s.spawn(|| {
                 for i in -num_iters..=num_iters {
                     if let Some(thing) = BTree::new(&table).get(&Key::Integer(i)).unwrap() {
                         assert_eq!(
@@ -248,13 +301,31 @@ mod tests {
                     }
                 }
             });
-            h.join().unwrap();
+
+            writer1.join().unwrap();
+            writer2.join().unwrap();
+            writer3.join().unwrap();
+
             table
-                .print_and_check_row_keys_order(-5, 5)
-                .expect("failed to print keys");
-            h2.join().unwrap();
+                .check_row_keys_order(-num_iters, num_iters)
+                .expect("failed to check all keys and ordering");
+
+            reader.join().unwrap();
+
+            let remover = s.spawn(|| {
+                for i in (num_iters - 13)..=(num_iters - 3) {
+                    BTree::new(&table)
+                        .delete(&Key::Integer(i))
+                        .expect("failed to delete a row");
+                }
+            });
+
+            remover.join().unwrap();
         });
 
+        table.print_table().expect("failed to print table");
+
+        let _ = std::fs::remove_file(&path); // clean up the temp file
         println!("Done!");
     }
 }

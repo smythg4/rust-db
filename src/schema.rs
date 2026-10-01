@@ -12,7 +12,7 @@ const FLOAT_FLAG: u8 = 2;
 const STRING_FLAG: u8 = 3;
 const BOOL_FLAG: u8 = 4;
 
-const MAX_FIELD_LEN: usize = MAX_LEAF_ENTRY_SIZE;
+const MAX_FIELD_LEN: usize = MAX_LEAF_ENTRY_SIZE - 1 - 2; // max entry minus 1 byte tag and 2 byte varint
 pub(crate) const MAX_NUM_FIELDS: usize = 255;
 
 #[derive(Error, Debug)]
@@ -38,6 +38,18 @@ pub enum RowValue {
     String(String),
     Boolean(bool),
     Null,
+}
+
+impl std::fmt::Display for RowValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Integer(n) => write!(f, "{n}"),
+            Self::Float(n) => write!(f, "{n}"),
+            Self::Boolean(b) => write!(f, "{b}"),
+            Self::Null => write!(f, "NULL"),
+            Self::String(s) => write!(f, "'{s}'"),
+        }
+    }
 }
 
 impl RowValue {
@@ -230,7 +242,7 @@ pub enum ColumnType {
 }
 
 impl ColumnType {
-    fn is_valid_key(&self) -> bool {
+    pub(crate) fn is_valid_key(&self) -> bool {
         match self {
             Self::Float => false,
             Self::Bool => false,
@@ -512,102 +524,13 @@ impl Serializable for Schema {
 mod tests {
     use super::*;
     use crate::commontypes::{PAGE_ID_SIZE, SLOT_ENTRY_SIZE};
+    use crate::page::tests::generators::SchemaRowPair;
     use crate::test_support::*;
     use quickcheck::{Arbitrary, Gen, TestResult};
     use quickcheck_macros::quickcheck;
     use std::collections::HashSet;
     use std::io::Cursor;
     use std::mem::discriminant;
-
-    fn non_nan_f64(g: &mut Gen) -> f64 {
-        let mut f = f64::arbitrary(g);
-        while f.is_nan() {
-            f = f64::arbitrary(g);
-        }
-        f
-    }
-
-    impl Arbitrary for ColumnType {
-        fn arbitrary(g: &mut Gen) -> Self {
-            g.choose(&[
-                ColumnType::String,
-                ColumnType::Bool,
-                ColumnType::Float,
-                ColumnType::Integer,
-            ])
-            .cloned()
-            .unwrap()
-        }
-    }
-
-    impl Arbitrary for Column {
-        fn arbitrary(g: &mut Gen) -> Self {
-            let mut name = String::arbitrary(g);
-            while name.is_empty() {
-                name = String::arbitrary(g);
-            }
-            Column {
-                name,
-                col_type: ColumnType::arbitrary(g),
-                nullable: bool::arbitrary(g),
-            }
-        }
-    }
-
-    impl Arbitrary for Schema {
-        fn arbitrary(g: &mut Gen) -> Self {
-            let mut first_entry = Column::arbitrary(g);
-            while !first_entry.col_type.is_valid_key() || first_entry.nullable {
-                first_entry = Column::arbitrary(g);
-            }
-            Schema {
-                columns: [first_entry]
-                    .into_iter()
-                    .chain((0..gen_len(g, MAX_NUM_FIELDS - 1) % 25).map(|_| Column::arbitrary(g)))
-                    .collect(),
-            }
-        }
-    }
-
-    impl Arbitrary for RowValue {
-        fn arbitrary(g: &mut Gen) -> Self {
-            // RowValue: a table of generator functions
-            let gens: &[fn(&mut Gen) -> RowValue] = &[
-                |g| RowValue::Integer(i64::arbitrary(g)),
-                |g| RowValue::Float(non_nan_f64(g)),
-                |g| RowValue::String(String::arbitrary(g)),
-                |g| RowValue::Boolean(bool::arbitrary(g)),
-                |_| RowValue::Null,
-            ];
-            g.choose(gens).unwrap()(g)
-        }
-    }
-
-    /// TODO: Figure out how to cap g.size() in Arbitrary instead of these contrived
-    /// caps I put in the implementation
-    impl Arbitrary for Row {
-        /// Builds a row within the real limits by construction: the first, then extra
-        /// fields until either the generated count or the row's byte budget runs out.
-        fn arbitrary(g: &mut Gen) -> Self {
-            let key = loop {
-                let k = Key::arbitrary(g);
-                if Page::internal_entry_size(&k) <= MAX_INTERNAL_ENTRY_SIZE {
-                    break k;
-                }
-            };
-            let mut row = Row {
-                fields: vec![key.into()],
-            };
-            for _ in 0..gen_len(g, MAX_NUM_FIELDS - 1) {
-                row.fields.push(RowValue::arbitrary(g));
-                if Page::leaf_entry_size(&row) > MAX_LEAF_ENTRY_SIZE {
-                    row.fields.pop();
-                    break;
-                }
-            }
-            row
-        }
-    }
 
     #[quickcheck]
     fn primary_key_returns_key(SchemaRowPair(schema, row): SchemaRowPair) -> TestResult {
@@ -691,6 +614,21 @@ mod tests {
 
         assert!(ser_result.is_err());
         assert_matches!(ser_result.unwrap_err(), RowValueError::TooManyFields(256));
+    }
+
+    #[test]
+    fn string_rows_boundary_value_holds() {
+        // exactly MAX_FIELD_LEN bytes round-trips
+        let rv = RowValue::String("a".repeat(MAX_FIELD_LEN));
+        assert_roundtrip(rv.clone());
+
+        // one more → FieldTooLong, and nothing written
+        let rv = RowValue::String("a".repeat(MAX_FIELD_LEN + 1));
+        let mut buf = Vec::new();
+
+        let err = rv.serialize(&mut buf).unwrap_err();
+        assert_matches!(err, RowValueError::FieldTooLong(n) if n == MAX_FIELD_LEN + 1);
+        assert!(buf.is_empty(), "rejected field wrote {} bytes", buf.len());
     }
 
     #[test]

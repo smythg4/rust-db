@@ -2,14 +2,37 @@
 A learning project focused on learning more about databases.
 
 ### Current Status
-I got things working well enough with a dummy storage layer and eviction policy that I built a simple `BTree` on top of a `Table` structure. `Table` holds a `BufferPoolManager` and a `Schema`. It'll read the metadata off a page given the `TableId` `tid` (`PageId(tid, 0))`). `BTree` is just a wrapper around a reference to a `Table`, constructed on the fly based on `Table` methods such as `insert` or `get`. Insertions, point retrieval, and sequential scan work now!
+Ok, the futzing continues, but this is cool! I implemented a simple durable `DiskManager` and produced the following:
+```
+Opening the file...
+File opened! Making new pages...
+Meta and root pages created. Flushing to disk...
+-------------------------------------------------------------------
+| id (Integer)                   | data (String*)                 |
+-------------------------------------------------------------------
+| -100000                        | NULL                           |
+| -99999                         | 'user99999@aol.com'            |
+| -99998                         | 'user99998@yahoo.com'          |
+| -99997                         | NULL                           |
+| -99996                         | 'user99996@aol.com'            |
+| ...                            | ...                            |
+| 99985                          | 'user99985@yahoo.com'          |
+| 99986                          | NULL                           |
+| 99998                          | NULL                           |
+| 99999                          | 'user99999@aol.com'            |
+| 100000                         | 'user100000@yahoo.com'         |
+-------------------------------------------------------------------
+(199990 rows)
+Done!
+```
+That example made 200,001 entries into a simple table (-100,000..=100_000). There were three concurrent writers (thread A used 'aol', thread B used 'yahoo', thread C wrote `NULL` values). The '*' in the column name means it's nullable. Then I had a reader in there confirming that everything it requested returned the key it was looking for. Then a deleter thread jumped in to remove 10 items towards then end. Finally the main thread picked up to print this pretty table output (notice how 99987 to 99997 are missing). The code for this in is `table.rs` under the test module `table_basics`.
 
-I've been futzing around in `table.rs` with the `table_basics` test. Multi-threaded point and range scans are working! If the `pool_size` for the `BufferPoolManager` is too small I've seen occasional deadlocks. This is from splitting operations on tree descent when there's no unpinned `Frames` to evict. This prompted me to check for the opportunity for eager release of ancestor latches on descent.
+To make this work, I made a simple `BTree` that can `insert`, `get`, and `delete`. It handle page splits, merges, and borrows. I also made a range scan option that will find the leftmost `Key`'s `Leaf` `Page` then follow sibling pointers until the `Leaf` belonging to the rightmost `Key`.
+
+I really need to get back to basics and clean up a ton with the project. I started to reorganize `Page`, but made a bit of a mess. Then I need to buckle down and write some real tests, but this has been too exciting to not do!
 
 Next steps include:
-- Make a real struct to implement `DiskManager` (currently it's just an in-memory `HashMap`).
-  - `Table::create` can take an `AsRef<Path>`, create a file, basic metadata, and an empty leaf, flush to disk.
-  - I probably want to add a `table_name` field to `Table`.
+- I probably want to add a `table_name` field to `Table`, then I'll have to adjust the page layout for `Meta` pages...
 - Write a real `EvictionPolicy` using clock eviction (currently it's just round-robin, evicting the first unpinned frame it finds).
 - Abstract out trait layers so `Page` can eventually be swapped out.
 - Write many, many, many more tests to hammer `BufferPoolManager`, `Table`, and `BTree`.
@@ -64,8 +87,8 @@ old key missing (`MissingKey` returns `new`), larger key on a full page (`PageFu
 
 #### Invariants and size limits
 - [ ] `check_invariants` returns each kind: `RowTooLarge`, `KeyTooLarge` (leaf and internal), `ChildCountMismatch`, `UnsortedKeys { at }` (check `at`), `ExceedsCapacity` — build pages from `empty_page`
-- [ ] `as_raw_page` refuses a page that fails `check_invariants`
-- [ ] string of exactly `MAX_FIELD_LEN` bytes round-trips; one more → `FieldTooLong` with nothing written
+- [x] `as_raw_page` refuses a page that fails `check_invariants`
+- [x] string of exactly `MAX_FIELD_LEN` bytes round-trips; one more → `FieldTooLong` with nothing written
 - [ ] crafted string length prefix over `MAX_FIELD_LEN` → `FieldTooLong` on read
 - [ ] `validate_row`: string field at the limit accepted, one byte over → `FieldTooLong`
 - [ ] `Row::deserialize`: field count over `MAX_NUM_FIELDS` → `TooManyFields`
@@ -77,7 +100,7 @@ old key missing (`MissingKey` returns `new`), larger key on a full page (`PageFu
 - [x] every `RowValue` and `ColumnType` variant is generated
 - [x] `higher_key(k) > k`
 - [ ] `MAX_*_ITEMS` never too low (smallest distinct entries never exceed it)
-- [ ] every shrink candidate passes `check_invariants`
+- [x] every shrink candidate passes `check_invariants`
 
 #### Durability
 - [ ] Torn write: old/new page spliced at any offset decodes to old, new, or `Corrupt` — never a third page

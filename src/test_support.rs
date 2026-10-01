@@ -1,8 +1,7 @@
 use crate::commontypes::{Key, PageId, TableId};
 use crate::page::{MAX_INTERNAL_ENTRY_SIZE, MAX_LEAF_ENTRY_SIZE, Page, PageBody, PageError};
-use crate::schema::{Column, ColumnType, MAX_NUM_FIELDS, Row, RowValue, Schema, ValidatedRow};
+use crate::schema::{Column, Row, RowValue, Schema, ValidatedRow};
 use crate::traits::Serializable;
-use quickcheck::{Arbitrary, Gen};
 use std::io::Cursor;
 
 /// Like `assert!(matches!(..))`, but prints the actual value on failure.
@@ -20,36 +19,6 @@ macro_rules! assert_matches {
       };
   }
 pub(crate) use assert_matches;
-
-/// A length in `0..=max`, scaled by quickcheck's size parameter (`QUICKCHECK_GENERATOR_SIZE`,
-/// default 100) so every generator grows and shrinks together.
-pub(crate) fn gen_len(g: &mut Gen, max: usize) -> usize {
-    usize::arbitrary(g) % (max.min(g.size()) + 1)
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct SchemaWithRows(pub(crate) Schema, pub(crate) Vec<Row>);
-
-impl Arbitrary for SchemaWithRows {
-    fn arbitrary(g: &mut Gen) -> Self {
-        let schema = Schema::arbitrary(g);
-        let rows: Vec<Row> = (0..gen_len(g, MAX_NUM_FIELDS - 1) % 25)
-            .map(|_| valid_row_from_schema(&schema, g).into())
-            .collect();
-        SchemaWithRows(schema, rows)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct SchemaRowPair(pub(crate) Schema, pub(crate) Row);
-
-impl Arbitrary for SchemaRowPair {
-    fn arbitrary(g: &mut Gen) -> Self {
-        let schema = Schema::arbitrary(g);
-        let row = valid_row_from_schema(&schema, g).into();
-        SchemaRowPair(schema, row)
-    }
-}
 
 pub(crate) fn assert_roundtrip<T>(value: T)
 where
@@ -77,8 +46,8 @@ pub(crate) fn padded_key(index: usize, total_len: usize) -> Key {
 /// Two-column schema (integer key + string payload) and the largest payload that still validates.
 pub(crate) fn leaf_schema() -> (Schema, usize) {
     let schema = Schema::try_from(vec![
-        Column::integer("int column").unwrap(),
-        Column::string("string column").unwrap(),
+        Column::integer("id").unwrap(),
+        Column::string("data").unwrap(),
     ])
     .unwrap();
     let row_with = |key: i64, len: usize| Row {
@@ -96,36 +65,6 @@ pub(crate) fn higher_key(key: &Key) -> Key {
         Key::Integer(n) if *n < i64::MAX => Key::Integer(n.wrapping_add(1)),
         Key::Integer(_) => Key::String("()".to_string()),
         Key::String(s) => Key::String(format!("{s}s")),
-    }
-}
-
-pub(crate) fn valid_row_from_schema(schema: &Schema, g: &mut Gen) -> ValidatedRow {
-    loop {
-        let row = Row {
-            fields: schema
-                .columns
-                .iter()
-                .map(|c| {
-                    let coin_flip = bool::arbitrary(g);
-                    match c.col_type {
-                        _ if c.nullable && coin_flip => RowValue::Null,
-                        ColumnType::Bool => RowValue::Boolean(bool::arbitrary(g)),
-                        ColumnType::Float => {
-                            let mut f = f64::arbitrary(g);
-                            while f.is_nan() {
-                                f = f64::arbitrary(g);
-                            }
-                            RowValue::Float(f)
-                        }
-                        ColumnType::Integer => RowValue::Integer(i64::arbitrary(g)),
-                        ColumnType::String => RowValue::String(String::arbitrary(g)),
-                    }
-                })
-                .collect(),
-        };
-        if let Ok(vr) = schema.validate_row(row) {
-            break vr;
-        }
     }
 }
 

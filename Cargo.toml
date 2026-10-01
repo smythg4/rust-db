@@ -5,11 +5,11 @@ edition = "2024"
 
 [dependencies]
 crc32_light = "0.1.2"
-env_logger = "0.11.11"
 integer-encoding = "4.1.0"
 log = "0.4.34"
 thiserror = "2.0.20"
 
 [dev-dependencies]
+env_logger = "0.11.11"
 quickcheck = "1.1.0"
 quickcheck_macros = "1.2.0"
