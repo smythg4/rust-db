@@ -83,6 +83,7 @@ impl<Dm: DiskManager, Ep: EvictionPolicy> BufferPoolManager<Dm, Ep> {
         let page_id = page.page_id();
 
         let frame_id = self.claim_frame(&mut state)?;
+
         let frame_data = Some(page);
         // grab the frame sitting in this slot from the active list
         let frame = &self.frames[frame_id];
@@ -98,6 +99,7 @@ impl<Dm: DiskManager, Ep: EvictionPolicy> BufferPoolManager<Dm, Ep> {
         // update the active page table
         state.page_table.insert(page_id, frame_id);
         let _ = self.pin_frame(frame_id);
+        // this has to be down here to prevent another thread from evicting this frame after we grab it, but before we pin it
         drop(state);
         Ok(PageWriteGuard {
             bpm: self,

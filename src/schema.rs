@@ -233,7 +233,7 @@ impl Serializable for Row {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ColumnType {
     Integer,
     Float,
@@ -286,6 +286,18 @@ pub struct Column {
     pub(crate) name: String,
     pub(crate) col_type: ColumnType,
     pub(crate) nullable: bool,
+}
+
+impl std::fmt::Display for Column {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} ({:?}{})",
+            self.name,
+            self.col_type,
+            if self.nullable { "*" } else { "" }
+        )
+    }
 }
 
 impl Serializable for Column {

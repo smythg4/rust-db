@@ -16,6 +16,7 @@ mod meta;
 pub(crate) mod tests;
 
 pub use error::*;
+use integer_encoding::VarInt;
 pub(crate) use internal::ChildIndex;
 
 /// The page size for the entire application
@@ -108,6 +109,7 @@ pub enum PageBody {
         page_count: u32,
         free_list_head: Option<PageId>,
         schema: Schema,
+        table_name: String,
     },
     Free {
         next: Option<PageId>, // pointer to the next free page
@@ -213,11 +215,15 @@ impl Page {
                     records.iter().map(Self::leaf_entry_size).sum::<usize>()
                 }
                 PageBody::Free { .. } => 1 + PAGE_ID_SIZE,
-                PageBody::Meta { schema, .. } => {
+                PageBody::Meta {
+                    schema, table_name, ..
+                } => {
                     PAGE_ID_SIZE + // root_id
                     size_of::<u32>() + // page_count
                     1 + PAGE_ID_SIZE + // free_list_head
-                    schema.encoded_size() // schema
+                    schema.encoded_size() + // schema
+                    table_name.len().required_space() + // name varint size
+                    table_name.len()
                 }
             };
         PAGE_SIZE.checked_sub(used_size)

@@ -54,6 +54,7 @@ impl Page {
             PageBody::Meta {
                 page_count,
                 free_list_head,
+                table_name,
                 ..
             } => {
                 if let Some(flh) = free_list_head
@@ -62,6 +63,9 @@ impl Page {
                     return Err(CorruptionKind::PageNumOutOfRange(
                         flh.get_page_num() as usize
                     ));
+                }
+                if table_name.len() > u16::MAX as usize {
+                    return Err(CorruptionKind::TableNameTooLong(table_name.len()));
                 }
             }
             PageBody::Free { .. } => {} // nothing to check within the page. BPM needs to make sure it's in the right table

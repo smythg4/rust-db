@@ -2161,4 +2161,121 @@ mod tests {
         assert_matches!(page.as_raw_page(), Err(PageError::Corrupt { kind, .. }) if kind == expected);
         TestResult::passed()
     }
+
+    #[quickcheck]
+    fn internal_borrow_rejects_separator_that_doesnt_fit(key_sizes: Vec<u16>) -> TestResult {
+        if key_sizes.is_empty() {
+            return TestResult::discard();
+        }
+
+        let mut left = fill_internal(child(1), key_sizes);
+        let n = left.num_items();
+
+        let sep = padded_key(2 * n - 1, max_internal_len());
+        assert!(
+            !left.can_insert_separator(&sep),
+            "a full page can't take a max-size separator"
+        );
+
+        let mut right = internal_with_one_child(1000);
+        right
+            .internal_insert(padded_key(2 * n + 1, 6), child(1002))
+            .unwrap();
+
+        let (left_before, right_before) = (left.clone(), right.clone());
+
+        assert_matches!(
+            left.borrow_from_right(&mut right, sep),
+            Err(PageError::PageFull)
+        );
+        assert_unchanged(&left_before, &left);
+        assert_unchanged(&right_before, &right);
+
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn leaf_borrows_in_wrong_directions_fail(LeafPage(mut left): LeafPage) -> TestResult {
+        let Some((parent_sep, mut right)) = try_split(&mut left, child(999)) else {
+            return TestResult::discard();
+        };
+
+        // left borrow from left with right
+        let expected_prev = left.prev().unwrap();
+        let got_prev = right.page_id();
+        let (left_before, right_before) = (left.clone(), right.clone());
+        let result = left.borrow_from_left(&mut right, parent_sep.clone());
+        assert_matches!(result, Err(PageError::InvalidBorrow(BorrowFailReason::PointerMismatch { expected, got })) if expected == expected_prev && got == Some(got_prev));
+        assert_unchanged(&left_before, &left);
+        assert_unchanged(&right_before, &right);
+
+        // right borrow from right with right
+        let expected_next = right.next().unwrap();
+        let got_next = left.page_id();
+        let (left_before, right_before) = (left.clone(), right.clone());
+
+        let result = right.borrow_from_right(&mut left, parent_sep.clone());
+        assert_matches!(result, Err(PageError::InvalidBorrow(BorrowFailReason::PointerMismatch { expected, got })) if expected == expected_next && got == Some(got_next));
+        assert_unchanged(&left_before, &left);
+        assert_unchanged(&right_before, &right);
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn leaf_borrows_with_overlapping_ranges_fail(
+        SchemaWithRows(schema, rows): SchemaWithRows,
+    ) -> TestResult {
+        if rows.is_empty() {
+            return TestResult::discard();
+        }
+        let mut rows: Vec<ValidatedRow> = rows
+            .into_iter()
+            .map(|r| schema.validate_row(r).unwrap())
+            .collect();
+        rows.sort_by_key(|a| a.primary_key());
+        rows.dedup_by(|a, b| a.primary_key() == b.primary_key());
+
+        let mut left = Page::empty_leaf(child(1));
+        let mut right = Page::empty_leaf(child(2));
+
+        left.set_next(Some(right.page_id())).unwrap();
+
+        // alternate sorted rows: left gets 0, 2, 4, …; right gets 1, 3, 5, …
+        for (i, row) in rows.into_iter().enumerate() {
+            let page = if i % 2 == 0 { &mut left } else { &mut right };
+            match page.leaf_insert(row) {
+                Ok(()) | Err(PageError::PageFull) => {}
+                Err(e) => panic!("unexpected insert error: {e:?}"),
+            }
+        }
+
+        // make sure one of them didn't fill up too fast with large payloads so we have valid key ordering
+        let left_max = left
+            .records()
+            .unwrap()
+            .last()
+            .map(|r| Key::try_from(&r.fields[0]).unwrap());
+        let right_min = right
+            .records()
+            .unwrap()
+            .next()
+            .map(|r| Key::try_from(&r.fields[0]).unwrap());
+        match (left_max, right_min) {
+            (Some(l), Some(r)) if r < l => {}
+            _ => return TestResult::discard(),
+        }
+
+        let (left_before, right_before) = (left.clone(), right.clone());
+
+        let result = left.leaf_borrow_from_right(&mut right);
+        assert_matches!(
+            result,
+            Err(PageError::InvalidBorrow(BorrowFailReason::KeysOutOfOrder(
+                _
+            )))
+        );
+        assert_unchanged(&left_before, &left);
+        assert_unchanged(&right_before, &right);
+        TestResult::passed()
+    }
 }

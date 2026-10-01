@@ -7,6 +7,7 @@ use crate::page::{CorruptionKind, Page, PageBody, PageError, RawPage};
 use crate::schema::{Row, Schema};
 use crate::traits::Serializable;
 use crc32_light::Crc32Stream;
+use integer_encoding::{VarInt, VarIntReader};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};
 
 impl Serializable for Page {
@@ -137,11 +138,17 @@ impl Serializable for Page {
                     .map_err(|_| corrupt(CorruptionKind::InvalidPointerTag))?;
                 let schema = Schema::deserialize(&mut cursor)
                     .map_err(|_| corrupt(CorruptionKind::BadSchema))?;
+                let name_len = cursor.read_varint()?;
+                let mut name_buffer = vec![0u8; name_len];
+                cursor.read_exact(&mut name_buffer)?;
+                let table_name = String::from_utf8(name_buffer)?;
+
                 PageBody::Meta {
                     root_id,
                     page_count,
                     free_list_head,
                     schema,
+                    table_name,
                 }
             }
             _ => unreachable!(),
@@ -264,12 +271,16 @@ impl Page {
                 page_count,
                 free_list_head,
                 schema,
+                table_name,
             } => {
                 // write the data straight out in order
                 root_id.serialize(writer)?;
                 writer.write_all(&page_count.to_be_bytes())?;
                 free_list_head.serialize(writer)?;
                 schema.serialize(writer)?;
+                let name_len = table_name.len().required_space();
+                writer.write_all(&name_len.encode_var_vec())?;
+                writer.write_all(table_name.as_bytes())?;
                 Ok((0, 0))
             }
         }

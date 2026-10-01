@@ -2,37 +2,54 @@
 A learning project focused on learning more about databases.
 
 ### Current Status
-Ok, the futzing continues, but this is cool! I implemented a simple durable `DiskManager` and produced the following:
+I added a few `Page` tests and rolled out a super basic REPL for real time interaction. Run it with `cargo run repl`. It keeps everything in a temp file that it wipes after each use right now. Sample session below:
 ```
-Opening the file...
-File opened! Making new pages...
-Meta and root pages created. Flushing to disk...
--------------------------------------------------------------------
-| id (Integer)                   | data (String*)                 |
--------------------------------------------------------------------
-| -100000                        | NULL                           |
-| -99999                         | 'user99999@aol.com'            |
-| -99998                         | 'user99998@yahoo.com'          |
-| -99997                         | NULL                           |
-| -99996                         | 'user99996@aol.com'            |
-| ...                            | ...                            |
-| 99985                          | 'user99985@yahoo.com'          |
-| 99986                          | NULL                           |
-| 99998                          | NULL                           |
-| 99999                          | 'user99999@aol.com'            |
-| 100000                         | 'user100000@yahoo.com'         |
--------------------------------------------------------------------
-(199990 rows)
-Done!
+File Size: 0.01MB
+rust-db > .table
+Users
+----------------------------------------------------------------------------------------------------
+| id (Integer)                   | email (String*)                | active (Bool)                  |
+----------------------------------------------------------------------------------------------------
+----------------------------------------------------------------------------------------------------
+(0 rows)
+rust-db > insert 999 name@email.com true
+Insert successful
+rust-db > insert 1 null false
+Insert successful
+rust-db > insert 50 user@place.edu true
+Insert successful
+rust-db > insert 51 username@emailaccount.org false
+Insert successful
+rust-db > .table
+Users
+----------------------------------------------------------------------------------------------------
+| id (Integer)                   | email (String*)                | active (Bool)                  |
+----------------------------------------------------------------------------------------------------
+| 1                              | NULL                           | false                          |
+| 50                             | 'user@place.edu'               | true                           |
+| 51                             | 'username@emailaccount.org'    | false                          |
+| 999                            | 'name@email.com'               | true                           |
+----------------------------------------------------------------------------------------------------
+(4 rows)
+rust-db > delete 1
+Removed: Row { fields: [Integer(1), Null, Boolean(false)] }
+rust-db > .table
+Users
+----------------------------------------------------------------------------------------------------
+| id (Integer)                   | email (String*)                | active (Bool)                  |
+----------------------------------------------------------------------------------------------------
+| 50                             | 'user@place.edu'               | true                           |
+| 51                             | 'username@emailaccount.org'    | false                          |
+| 999                            | 'name@email.com'               | true                           |
+----------------------------------------------------------------------------------------------------
+(3 rows)
+rust-db > .exit
+Unknown command: '.exit'
+rust-db > .quit
+File Size: 0.01MB
 ```
-That example made 200,001 entries into a simple table (-100,000..=100_000). There were three concurrent writers (thread A used 'aol', thread B used 'yahoo', thread C wrote `NULL` values). The '*' in the column name means it's nullable. Then I had a reader in there confirming that everything it requested returned the key it was looking for. Then a deleter thread jumped in to remove 10 items towards then end. Finally the main thread picked up to print this pretty table output (notice how 99987 to 99997 are missing). The code for this in is `table.rs` under the test module `table_basics`.
-
-To make this work, I made a simple `BTree` that can `insert`, `get`, and `delete`. It handle page splits, merges, and borrows. I also made a range scan option that will find the leftmost `Key`'s `Leaf` `Page` then follow sibling pointers until the `Leaf` belonging to the rightmost `Key`.
-
-I really need to get back to basics and clean up a ton with the project. I started to reorganize `Page`, but made a bit of a mess. Then I need to buckle down and write some real tests, but this has been too exciting to not do!
 
 Next steps include:
-- I probably want to add a `table_name` field to `Table`, then I'll have to adjust the page layout for `Meta` pages...
 - Write a real `EvictionPolicy` using clock eviction (currently it's just round-robin, evicting the first unpinned frame it finds).
 - Abstract out trait layers so `Page` can eventually be swapped out.
 - Write many, many, many more tests to hammer `BufferPoolManager`, `Table`, and `BTree`.
@@ -45,69 +62,36 @@ QUICKCHECK_TESTS=10000 cargo test
 ```
 
 ### Immediate To-Do
-#### New code with no tests yet
-- [x] `leaf_get`: key present → that row; absent → `Ok(None)`; empty leaf → `Ok(None)`; internal page →
-`NotLeaf`.
-Add present and absent checks to `insertion_order_on_leaves` after every step
-- [x] `leaf_records_from` vs `BTreeMap::range(start..)`: start below all keys, equal to a key (included),
-between keys, above all keys, empty page; internal page → `NotLeaf`
-- [x] `leaf_records_from`: iterator still usable after the key is dropped (guards `use<'a>`)
-- [x] `internal_replace_key`: borrow between children of a `new_root` parent, replace the separator →`find_child` routes every key to the page that holds it
-- [x] `internal_replace_key` rejections (page unchanged): new ≤ left neighbor, new ≥ right neighbor,
-old key missing (`MissingKey` returns `new`), larger key on a full page (`PageFull`), leaf page
-(`NotInternal`)
-- [x] `internal_insert`: oversized key → `KeyTooLong`
-
-#### Borrow rejections
-- [x] internal borrows, both directions: donor with 0 keys → `EmptyBorrow`; donor with 1 key → succeeds
-- [x] internal borrows: `self`'s edge key on the wrong side of the separator → `KeysOutOfOrder`
-- [x] internal borrows: donor's edge key on the wrong side of the separator → `KeysOutOfOrder`
-- [ ] internal borrows: separator too big for `self` → `PageFull`
-- [ ] leaf borrows, both directions: wrong neighbor → `PointerMismatch` (check expected/actual order)
-- [ ] leaf borrows: overlapping ranges incl. an equal key → `KeysOutOfOrder`
-- [x] leaf borrow from left: destination full → `PageFull`; donor with 1 row → `EmptyBorrow`
-- [x] conservation test for `internal_borrow_from_left` (the right-hand version exists)
 
 #### Merges
 - [ ] underfull guarantee: two leaves just under `LEAF_UNDERFULL_BYTES` merge successfully
 - [ ] underfull guarantee: two internal pages just under `INTERNAL_UNDERFULL_BYTES` + a max-size separator merge successfully
-- [x] internal merge with an empty side (0 keys, 1 child) → 1 key, 2 children
 
 #### Accessors and small functions
-- [x] `set_lsn`: smaller → `StaleLsnUpdate` (unchanged), equal and larger accepted; LSN survives a round trip
 - [ ] `can_insert_separator`: exact fit → true, one byte over → false, leaf → false
-- [ ] `is_underfull`: exactly at each threshold, both page types
-- [x] `next`/`set_next`/`prev`/`set_prev` on an internal page → `NotLeaf`, page unchanged
+- [ ] `is_underfull`: exactly at each threshold, all 4 page types
 - [ ] `split_page`: 0 or 1 rows, or fewer than 3 keys → `TooSmallToSplit`
 
 #### Routing and indexes
-- [x] `find_child_index`: index matches the linear-scan reference and `child_at(index)` equals the returned ID
 - [ ] `child_at` / `key_at`: out of range → `None`; on a leaf → `None`
 - [ ] `ChildIndex` navigation: index 0 has no left sibling/separator; for every child, keys routed to it lie between `key_at(left_separator)` and `key_at(right_separator)`
 
 #### Invariants and size limits
-- [ ] `check_invariants` returns each kind: `RowTooLarge`, `KeyTooLarge` (leaf and internal), `ChildCountMismatch`, `UnsortedKeys { at }` (check `at`), `ExceedsCapacity` — build pages from `empty_page`
-- [x] `as_raw_page` refuses a page that fails `check_invariants`
-- [x] string of exactly `MAX_FIELD_LEN` bytes round-trips; one more → `FieldTooLong` with nothing written
+- [ ] `check_invariants` returns: `RowTooLarge`, `KeyTooLarge`.
 - [ ] crafted string length prefix over `MAX_FIELD_LEN` → `FieldTooLong` on read
-- [ ] `validate_row`: string field at the limit accepted, one byte over → `FieldTooLong`
-- [ ] `Row::deserialize`: field count over `MAX_NUM_FIELDS` → `TooManyFields`
+- [ ] `validate_row`: largest payload from `leaf_schema()` helper at the limit accepted, one byte over → `FieldTooLong`
 
 #### Corruption kinds without a targeted test
-- [ ] `InvalidTag`, `InvalidPointerTag`, `CorruptRow`, `MissingKey`, `InvalidKey`, `UnsortedKeys` (via slot swap), `ExceedsCapacity`, `RowTooLarge` / `KeyTooLarge` from `deserialize`
+- [ ] `InvalidTag`, `InvalidPointerTag`, `CorruptRow`, `ExceedsCapacity`, `RowTooLarge` / `KeyTooLarge`, `ExceedsCapacity` from `deserialize`
 
 #### Generators and helpers
-- [x] every `RowValue` and `ColumnType` variant is generated
-- [x] `higher_key(k) > k`
 - [ ] `MAX_*_ITEMS` never too low (smallest distinct entries never exceed it)
-- [x] every shrink candidate passes `check_invariants`
 
 #### Durability
 - [ ] Torn write: old/new page spliced at any offset decodes to old, new, or `Corrupt` — never a third page
 
-#### Before tests can cover them
-- [ ] `Meta` / `Free`: finish or remove — `todo!()` / `unreachable!()` in `free_space`, `write_header`,
-`write_body`, `check_invariants`, `split_page`, `entries_size`; then add round-trip and corruption tests
+#### `Meta`/`Free` Tests
+- [ ] 
 
 
 ### Phase 0 — Types

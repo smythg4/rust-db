@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
@@ -44,6 +44,8 @@ impl DiskManager for FileDisk {
 
     fn sync(&self) -> std::io::Result<()> {
         let guard = self.file.write().unwrap();
+        let size = guard.metadata().unwrap().size() as f64 / (1024 * 1024) as f64;
+        println!("File Size: {size:.2}MB");
         guard.sync_all()
     }
 }

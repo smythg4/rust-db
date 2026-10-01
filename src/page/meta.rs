@@ -18,7 +18,6 @@ impl Page {
         Ok(())
     }
 
-    #[allow(dead_code)] // TODO: Remove the lint catcher later
     /// Returns the number of pages in the `Table`
     pub(crate) fn meta_get_page_count(&self) -> Result<usize, PageError> {
         let PageBody::Meta { page_count, .. } = &self.body else {
@@ -27,12 +26,20 @@ impl Page {
         Ok(*page_count as usize)
     }
 
-    /// Returns the number of pages in the `Table`
+    /// Returns the schema from the `Table`
     pub(crate) fn meta_get_schema(&self) -> Result<&Schema, PageError> {
         let PageBody::Meta { schema, .. } = &self.body else {
             return Err(PageError::WrongPageType);
         };
         Ok(schema)
+    }
+
+    /// Returns the table_name from the `Table`
+    pub(crate) fn meta_get_table_name(&self) -> Result<&String, PageError> {
+        let PageBody::Meta { table_name, .. } = &self.body else {
+            return Err(PageError::WrongPageType);
+        };
+        Ok(table_name)
     }
 
     /// Returns the head of the free page list
@@ -99,41 +106,36 @@ impl Page {
         else {
             unreachable!()
         };
+
+        let id = freed.page_id();
+        if id.get_table_id() != root_id.get_table_id() {
+            return Err(PageError::WrongTable(id));
+        }
+        if id.get_page_num() == 0 {
+            return Err(PageError::ReservedPage);
+        }
+        if id.get_page_num() >= *page_count {
+            return Err(PageError::PageOutOfRange(id));
+        }
+        if *free_list_head == Some(id) {
+            return Err(PageError::AlreadyFree(id));
+        }
+
         let PageBody::Free { next } = &mut freed.body else {
             unreachable!()
         };
 
-        if *free_list_head == *next {
-            // head was the same, no-op
-            return Ok(());
-        }
-
-        match next {
-            None => return Ok(()), // another no-op
-            Some(free_id) => {
-                if free_id.get_table_id() != root_id.get_table_id() {
-                    // page in wrong table
-                    // TODO: This isn't the right error type, make a new one
-                    return Err(PageError::DuplicateKey);
-                }
-                if free_id.get_page_num() >= *page_count {
-                    // Page out of range
-                    // TODO: This isn't the right error type, make a new one
-                    return Err(PageError::DuplicateKey);
-                }
-                if free_id.get_page_num() == 0 {
-                    // reserved meta page
-                    // TODO: This isn't the right error type, make a new one
-                    return Err(PageError::DuplicateKey);
-                }
-            }
-        }
-
         *next = *free_list_head;
-
-        *free_list_head = Some(freed.page_id);
+        *free_list_head = Some(id);
 
         self.debug_check_invariants("free_list_push");
         Ok(())
+    }
+
+    pub fn free_next(&self) -> Result<Option<PageId>, PageError> {
+        let PageBody::Free { next } = &self.body else {
+            return Err(PageError::WrongPageType);
+        };
+        Ok(*next)
     }
 }

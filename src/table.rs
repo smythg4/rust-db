@@ -1,9 +1,10 @@
-use crate::bpm::{BpmError, BufferPoolManager, PageWriteGuard};
+use crate::bpm::{BpmError, BufferPoolManager, Frame, PageWriteGuard};
 use crate::btree::{BTree, BTreeError};
-use crate::commontypes::{PageId, TableId};
+use crate::commontypes::{FrameId, Key, PageId, TableId};
 use crate::page::{Page, PageBody, PageError};
-use crate::schema::{Row, Schema, SchemaError};
+use crate::schema::{Column, ColumnType, Row, RowValue, Schema, SchemaError};
 use crate::traits::{DiskManager, EvictionPolicy};
+use std::collections::HashSet;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -18,6 +19,8 @@ pub enum TableError {
     BTree(#[from] BTreeError),
     #[error("Table already exists: {0}")]
     AlreadyExists(TableId),
+    #[error("Unexpected table error")]
+    Unexpected,
 }
 
 pub struct Table<'a, Dm: DiskManager, Ep: EvictionPolicy> {
@@ -26,6 +29,8 @@ pub struct Table<'a, Dm: DiskManager, Ep: EvictionPolicy> {
     #[allow(dead_code)]
     // only tests right now. maybe package this into always reading from the meta page? though caching is probably fine since it should never change
     schema: Schema,
+    #[allow(dead_code)] // for now...
+    table_name: String,
 }
 
 impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
@@ -34,11 +39,25 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
         let guard = bpm.fetch_read(PageId::new(table_id, 0))?;
         let meta_id = guard.page_id();
         let schema = guard.meta_get_schema()?.clone();
-        Ok(Self {
+        let table_name = guard.meta_get_table_name()?.clone();
+        let table = Self {
             bpm,
             meta_id,
             schema,
-        })
+            table_name,
+        };
+        //table.debug_check_space_accounting("open");
+        Ok(table)
+    }
+
+    /// Finishes using this table. In debug builds, checks that every page is either in the
+    /// tree or on the free list. Does not flush: durability is the buffer pool's job, so call
+    /// `BufferPoolManager::close` to persist changes.
+    pub fn close(self) -> Result<(), TableError> {
+        let rows = BTree::new(&self).get_all()?;
+        println!("Rows: {}", rows.len());
+        self.debug_check_space_accounting("close");
+        Ok(())
     }
 
     /// Writes a fresh meta page plus an empty leaf root
@@ -46,6 +65,7 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
         bpm: &'a BufferPoolManager<Dm, Ep>,
         table_id: TableId,
         schema: Schema,
+        name: &str,
     ) -> Result<Self, TableError> {
         use crate::page::PageBody;
         let meta_id = PageId::new(table_id, 0);
@@ -65,6 +85,7 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
                 page_count: 2,
                 free_list_head: None,
                 schema: schema.clone(),
+                table_name: name.to_string(),
             },
         );
         let leaf_root = Page::empty_leaf(root_id);
@@ -73,11 +94,14 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
         bpm.new_page(meta_page)?;
         log::info!("Meta and root pages created. Flushing to disk...");
         bpm.flush_all()?;
-        Ok(Self {
+        let table = Self {
             bpm,
             meta_id,
             schema,
-        })
+            table_name: name.to_string(),
+        };
+        //table.debug_check_space_accounting("create");
+        Ok(table)
     }
 
     pub fn allocate(&self) -> Result<PageWriteGuard<'_, Dm, Ep>, TableError> {
@@ -87,9 +111,11 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
             let mut free_guard = self.bpm.fetch_write(free_list_head)?;
             meta_guard.free_list_pop(&free_guard)?;
             *free_guard = Page::empty_page(free_guard.page_id(), PageBody::Free { next: None });
+            self.debug_check_space_accounting("allocate");
             Ok(free_guard)
         } else {
             let new_free_id = meta_guard.meta_bump_page_count()?;
+            //self.debug_check_space_accounting("allocate");
             Ok(self
                 .bpm
                 .new_page(Page::empty_page(new_free_id, PageBody::Free { next: None }))?)
@@ -99,6 +125,7 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
     pub fn free(&self, mut page: PageWriteGuard<'a, Dm, Ep>) -> Result<(), TableError> {
         let mut meta_guard = self.bpm.fetch_write(self.meta_id)?;
         meta_guard.free_list_push(&mut page)?;
+        //self.debug_check_space_accounting("free");
         Ok(())
     }
 
@@ -109,96 +136,202 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
 
     pub fn set_root_id(&self, id: PageId) -> Result<(), TableError> {
         self.bpm.fetch_write(self.meta_id)?.meta_set_root_id(id)?;
+        //self.debug_check_space_accounting("set root id");
         Ok(())
     }
 
     pub fn insert(&self, row: Row) -> Result<(), TableError> {
         let row = self.schema.validate_row(row)?;
         BTree::new(self).insert(row)?;
+        //self.debug_check_space_accounting("insert");
+        Ok(())
+    }
+
+    pub fn delete(&self, key: &Key) -> Result<Option<Row>, TableError> {
+        Ok(BTree::new(self).delete(key)?)
+    }
+
+    fn check_space_accounting(&self) {
+        let page_count = self
+            .bpm
+            .fetch_read(self.meta_id)
+            .expect("failed to fetch meta data")
+            .meta_get_page_count()
+            .expect("failed to read meta data page count");
+        let root_id = self.root_id().expect("failed to fetch root id");
+        let mut in_tree = HashSet::new();
+        let mut child_stack = vec![root_id];
+        while let Some(cid) = child_stack.pop() {
+            assert!(in_tree.insert(cid), "page {cid} is reachable twice");
+            let curr_page = self.bpm.fetch_read(cid).expect("failed to find child");
+            if let Some(children) = curr_page.children() {
+                child_stack.extend(children);
+            }
+        }
+        let mut on_free_list = HashSet::new();
+        let mut cur = self
+            .bpm
+            .fetch_read(self.meta_id)
+            .expect("failed to fetch meta page")
+            .meta_get_free_list_head()
+            .expect("failed to get the free list head");
+        while let Some(id) = cur {
+            assert!(on_free_list.insert(id), "cycle in the free list at {id}");
+            cur = self
+                .bpm
+                .fetch_read(id)
+                .expect("failed to fetch the next free list entry")
+                .free_next()
+                .expect("failed to read next pointer on free list");
+        }
+        assert!(
+            in_tree.is_disjoint(&on_free_list),
+            "a page is both in the tree and free"
+        );
+        assert_eq!(in_tree.len() + on_free_list.len(), page_count - 1); // minus the meta page
+    }
+
+    /// Panics (debug builds only) if `check_space_accounting` fails. Call at the end of every
+    /// operation that changes a table; `op` names the operation in the panic message.
+    #[inline]
+    #[allow(unused_variables)]
+    pub(crate) fn debug_check_space_accounting(&self, op: &str) {
+        #[cfg(debug_assertions)]
+        self.check_space_accounting();
+
+        #[cfg(not(debug_assertions))]
+        let _ = op;
+    }
+
+    #[cfg(test)]
+    // test helper to generate a row and insert it
+    fn insert_row(&self, row_id: i64, email: &str, active: bool) -> Result<(), TableError> {
+        let payload = if email == "NULL" {
+            RowValue::Null
+        } else {
+            RowValue::String(email.into())
+        };
+
+        let row = Row::try_from(vec![
+            RowValue::Integer(row_id),
+            payload,
+            RowValue::Boolean(active),
+        ])
+        .expect("this will work");
+        self.insert(row)?;
+        Ok(())
+    }
+
+    fn map_raw(kind: ColumnType, arg: &str) -> Result<RowValue, TableError> {
+        if arg.to_uppercase() == "NULL" {
+            return Ok(RowValue::Null);
+        }
+        Ok(match kind {
+            ColumnType::Bool => RowValue::Boolean(arg.parse().map_err(|_| TableError::Unexpected)?),
+            ColumnType::Float => RowValue::Float(arg.parse().map_err(|_| TableError::Unexpected)?),
+            ColumnType::Integer => {
+                RowValue::Integer(arg.parse().map_err(|_| TableError::Unexpected)?)
+            }
+            ColumnType::String => RowValue::String(arg.to_string()),
+        })
+    }
+
+    pub fn insert_raw(&self, args: &[&str]) -> Result<(), TableError> {
+        let row = Row {
+            fields: self
+                .schema
+                .columns
+                .iter()
+                .map(|c| c.col_type)
+                .zip(args.iter())
+                .map(|(ct, a)| Self::map_raw(ct, a))
+                .collect::<Result<Vec<RowValue>, TableError>>()?,
+        };
+        self.insert(row)
+    }
+
+    pub fn delete_raw(&self, args: &[&str]) -> Result<Option<Row>, TableError> {
+        assert!(args.len() == 1);
+        let row_val = Self::map_raw(self.schema.columns[0].col_type, args[0])?;
+        let key = &Key::try_from(&row_val).expect("invalid key");
+        self.delete(key)
+    }
+
+    pub fn print_table(&self) -> Result<(), TableError> {
+        println!("{}", self.table_name);
+        let rows = BTree::new(self).get_all().expect("failed to fetch rows");
+        let header = line(self.schema.columns.iter().map(Column::to_string));
+
+        let rule = "-".repeat(header.chars().count());
+
+        let print_rows = |rows: &[Row]| {
+            for row in rows {
+                println!("{}", line(row.fields.iter().map(|v| v.to_string())));
+            }
+        };
+
+        println!("{rule}\n{header}\n{rule}");
+        if rows.len() <= 10 {
+            print_rows(&rows);
+        } else {
+            print_rows(&rows[..5]);
+            println!(
+                "{}",
+                line(self.schema.columns.iter().map(|_| "...".to_string()))
+            );
+            print_rows(&rows[rows.len() - 5..]);
+        }
+        println!("{rule}\n({} rows)", rows.len());
+
         Ok(())
     }
 }
 
+const COL_WIDTH: usize = 30;
+
+/// Pads to COL_WIDTH, or cuts with "…" if too long (counts chars, not bytes).
+fn cell(s: &str) -> String {
+    if s.chars().count() > COL_WIDTH {
+        let cut: String = s.chars().take(COL_WIDTH - 1).collect();
+        format!("{cut}…")
+    } else {
+        format!("{s:<COL_WIDTH$}")
+    }
+}
+
+fn line(cells: impl IntoIterator<Item = String>) -> String {
+    let cells: Vec<String> = cells.into_iter().map(|c| cell(&c)).collect();
+    format!("| {} |", cells.join(" | "))
+}
+
+#[derive(Default)]
+pub struct Replacer {
+    hand: usize,
+}
+
+impl EvictionPolicy for Replacer {
+    /// TODO: This is just a placeholder until I figure this out...
+    fn find_victim(&mut self, frames: &[Frame]) -> Option<FrameId> {
+        for _ in 0..frames.len() {
+            let id = self.hand;
+            self.hand = (self.hand + 1) % frames.len();
+            if !frames[id].is_pinned() {
+                return Some(FrameId::new(id));
+            }
+        }
+        None // everything pinned → NoFreeFrames
+    }
+}
 #[cfg(test)]
 mod tests {
 
     use super::*;
-    use crate::bpm::Frame;
-    use crate::commontypes::{FrameId, Key};
+    use crate::commontypes::Key;
     use crate::disk::FileDisk;
     use crate::page::PageError::DuplicateKey;
-    use crate::schema::{Row, RowValue};
-    use crate::test_support::leaf_schema;
+    use crate::schema::Column;
 
-    #[derive(Default)]
-    struct Replacer {
-        hand: usize,
-    }
-
-    impl EvictionPolicy for Replacer {
-        /// TODO: This is just a placeholder until I figure this out...
-        fn find_victim(&mut self, frames: &[Frame]) -> Option<FrameId> {
-            for _ in 0..frames.len() {
-                let id = self.hand;
-                self.hand = (self.hand + 1) % frames.len();
-                if !frames[id].is_pinned() {
-                    return Some(FrameId::new(id));
-                }
-            }
-            None // everything pinned → NoFreeFrames
-        }
-    }
-
-    impl<'a> Table<'a, FileDisk, Replacer> {
-        // helper to generate a row and insert it
-        fn insert_row(&self, row_id: i64, content: &str) -> Result<(), TableError> {
-            let payload = if content == "NULL" {
-                RowValue::Null
-            } else {
-                RowValue::String(content.into())
-            };
-
-            let row =
-                Row::try_from(vec![RowValue::Integer(row_id), payload]).expect("this will work");
-            self.insert(row)?;
-            Ok(())
-        }
-
-        fn print_table(&self) -> Result<(), TableError> {
-            let rows = BTree::new(self).get_all().expect("failed to fetch rows");
-            let header = line(self.schema.columns.iter().map(|c| {
-                format!(
-                    "{} ({:?}{})",
-                    c.name,
-                    c.col_type,
-                    if c.nullable { "*" } else { "" }
-                )
-            }));
-
-            let rule = "-".repeat(header.chars().count());
-
-            let print_rows = |rows: &[Row]| {
-                for row in rows {
-                    println!("{}", line(row.fields.iter().map(|v| v.to_string())));
-                }
-            };
-
-            println!("{rule}\n{header}\n{rule}");
-            if rows.len() <= 10 {
-                print_rows(&rows);
-            } else {
-                print_rows(&rows[..5]);
-                println!(
-                    "{}",
-                    line(self.schema.columns.iter().map(|_| "...".to_string()))
-                );
-                print_rows(&rows[rows.len() - 5..]);
-            }
-            println!("{rule}\n({} rows)", rows.len());
-
-            Ok(())
-        }
-
+    impl<'t, Dm: DiskManager, Ep: EvictionPolicy> Table<'t, Dm, Ep> {
         fn check_row_keys_order(&self, start: i64, end: i64) -> Result<(), TableError> {
             let expected_count = (end.checked_sub(start).unwrap_or_default().abs() + 1) as usize;
             let start_key = Key::Integer(start);
@@ -219,26 +352,9 @@ mod tests {
         }
     }
 
-    const COL_WIDTH: usize = 30;
-
-    /// Pads to COL_WIDTH, or cuts with "…" if too long (counts chars, not bytes).
-    fn cell(s: &str) -> String {
-        if s.chars().count() > COL_WIDTH {
-            let cut: String = s.chars().take(COL_WIDTH - 1).collect();
-            format!("{cut}…")
-        } else {
-            format!("{s:<COL_WIDTH$}")
-        }
-    }
-
-    fn line(cells: impl IntoIterator<Item = String>) -> String {
-        let cells: Vec<String> = cells.into_iter().map(|c| cell(&c)).collect();
-        format!("| {} |", cells.join(" | "))
-    }
-
     #[test]
     fn table_basics() {
-        //env_logger::init();
+        let _ = env_logger::try_init();
         let path = std::env::temp_dir().join(format!(
             "rust-db-{}-{}.db",
             std::process::id(),
@@ -247,17 +363,27 @@ mod tests {
         let _ = std::fs::remove_file(&path); // start clean
 
         let disk = FileDisk::new(&path).expect("failed to open file");
-        let bpm = BufferPoolManager::new(disk, Replacer::default(), 10);
-        let mut schema = leaf_schema().0;
-        schema.columns[1].nullable = true;
-        let table = Table::create(&bpm, TableId::new(1), schema).expect("failed to create table");
+        let bpm = BufferPoolManager::new(disk, Replacer::default(), 128);
+        let schema = Schema::try_from(vec![
+            Column::integer("id").unwrap(),
+            Column::nullable_string("email").unwrap(),
+            Column::bool("active").unwrap(),
+        ])
+        .expect("failed to build schema");
+
+        let table = Table::create(&bpm, TableId::new(1), schema, "Test Table")
+            .expect("failed to create table");
         let num_iters: i64 = 100_000;
         let keys_for = |k: i64| (-num_iters..=num_iters).filter(move |n| n.rem_euclid(3) == k);
 
         std::thread::scope(|s| {
             let writer1 = s.spawn(|| {
                 for row_num in keys_for(0).rev() {
-                    match table.insert_row(row_num, &format!("user{}@aol.com", row_num.abs())) {
+                    match table.insert_row(
+                        row_num,
+                        &format!("user{}@aol.com", row_num.abs()),
+                        row_num % 5 == 0,
+                    ) {
                         Ok(_) => {}
                         Err(TableError::BTree(BTreeError::Page(DuplicateKey))) => {
                             log::warn!("Duplicate key at {row_num}, skipping...")
@@ -269,7 +395,11 @@ mod tests {
 
             let writer2 = s.spawn(|| {
                 for row_num in keys_for(1) {
-                    match table.insert_row(row_num, &format!("user{}@yahoo.com", row_num.abs())) {
+                    match table.insert_row(
+                        row_num,
+                        &format!("user{}@yahoo.com", row_num.abs()),
+                        row_num % 5 == 0,
+                    ) {
                         Ok(_) => {}
                         Err(TableError::BTree(BTreeError::Page(DuplicateKey))) => {
                             log::warn!("Duplicate key at {row_num}, skipping...");
@@ -281,7 +411,7 @@ mod tests {
 
             let writer3 = s.spawn(|| {
                 for row_num in keys_for(2).rev() {
-                    match table.insert_row(row_num, "NULL") {
+                    match table.insert_row(row_num, "NULL", row_num % 5 == 0) {
                         Ok(_) => {}
                         Err(TableError::BTree(BTreeError::Page(DuplicateKey))) => {
                             log::warn!("Duplicate key at {row_num}, skipping...");
@@ -314,7 +444,7 @@ mod tests {
             reader.join().unwrap();
 
             let remover = s.spawn(|| {
-                for i in -num_iters..num_iters - 10 {
+                for i in (-num_iters..=num_iters).rev().skip(9) {
                     BTree::new(&table)
                         .delete(&Key::Integer(i))
                         .expect("failed to delete a row");
@@ -328,8 +458,8 @@ mod tests {
 
         let rows = BTree::new(&table).get_all().expect("failed to fetch rows");
 
-        drop(table);
-        drop(bpm);
+        table.close().expect("failed to close table");
+        bpm.close().expect("failed to close bpm");
 
         let new_disk = FileDisk::new(&path).expect("failed to reopen file");
         let new_bpm = BufferPoolManager::new(new_disk, Replacer::default(), 512);

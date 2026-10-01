@@ -1,6 +1,7 @@
 use crate::commontypes::{Key, KeyError, Lsn, LsnError, PageId};
 use crate::schema::{RowValue, RowValueError, SchemaError};
 use std::ops::Range;
+use std::string::FromUtf8Error;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -42,6 +43,16 @@ pub enum PageError {
     KeyNotInOrder(Key),
     #[error("Attempt to pop a page off the free list that wasn't the head")]
     NotFreeListHead { head: Option<PageId>, got: PageId },
+    #[error("Page already freed, this would create a cycle: {0}")]
+    AlreadyFree(PageId),
+    #[error("Page is out of range for this table: {0}")]
+    PageOutOfRange(PageId),
+    #[error("Page is pointing to wrong table: {0}")]
+    WrongTable(PageId),
+    #[error("Page is reserved")]
+    ReservedPage,
+    #[error(transparent)]
+    Utf8Error(#[from] FromUtf8Error),
 }
 
 #[derive(Error, Debug, Clone, PartialEq)]
@@ -67,6 +78,7 @@ pub enum MergeFailReason {
     #[error("Keys aren't sorted or duplicate key found")]
     Keys,
 }
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CorruptionKind {
     InvalidTag(u8),
@@ -87,4 +99,5 @@ pub enum CorruptionKind {
     KeyTooLarge { slot: usize },
     PageNumOutOfRange(usize), // that page number that exceeds the meta data's stored page_count
     BadSchema,
+    TableNameTooLong(usize),
 }
