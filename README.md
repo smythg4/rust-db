@@ -1,9 +1,12 @@
 ## rust-db
-A learning project focused on learning more about databases.
+A project focused on learning more about databases.
 
 ### Current Status
-I added a few `Page` tests and rolled out a super basic REPL for real time interaction. Run it with `cargo run repl`. It keeps everything in a temp file that it wipes after each use right now. Sample session below:
+I added a few `Page` tests and rolled out a super basic REPL for interactive inserts and deletes. Run it with `cargo run --bin repl -- data/test.db --pool-size 100`. CLI arguments are a filepath (required) and pool-size (optional) which defaults to 64.
 ```
+cargo run --bin repl -- data/test.db --pool-size 4
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
+     Running `target/debug/repl data/test.db --pool-size 4`
 File Size: 0.01MB
 rust-db > .table
 Users
@@ -12,50 +15,44 @@ Users
 ----------------------------------------------------------------------------------------------------
 ----------------------------------------------------------------------------------------------------
 (0 rows)
-rust-db > insert 999 name@email.com true
+rust-db > insert 1 name@email.com true
+Insert successful
+rust-db > insert 5 name@email.com false
 Insert successful
 rust-db > insert 1 null false
-Insert successful
-rust-db > insert 50 user@place.edu true
-Insert successful
-rust-db > insert 51 username@emailaccount.org false
+Error on insert: Attempt to insert a duplicate key
+rust-db > insert 2 null true
 Insert successful
 rust-db > .table
 Users
 ----------------------------------------------------------------------------------------------------
 | id (Integer)                   | email (String*)                | active (Bool)                  |
 ----------------------------------------------------------------------------------------------------
-| 1                              | NULL                           | false                          |
-| 50                             | 'user@place.edu'               | true                           |
-| 51                             | 'username@emailaccount.org'    | false                          |
-| 999                            | 'name@email.com'               | true                           |
-----------------------------------------------------------------------------------------------------
-(4 rows)
-rust-db > delete 1
-Removed: Row { fields: [Integer(1), Null, Boolean(false)] }
-rust-db > .table
-Users
-----------------------------------------------------------------------------------------------------
-| id (Integer)                   | email (String*)                | active (Bool)                  |
-----------------------------------------------------------------------------------------------------
-| 50                             | 'user@place.edu'               | true                           |
-| 51                             | 'username@emailaccount.org'    | false                          |
-| 999                            | 'name@email.com'               | true                           |
+| 1                              | 'name@email.com'               | true                           |
+| 2                              | NULL                           | true                           |
+| 5                              | 'name@email.com'               | false                          |
 ----------------------------------------------------------------------------------------------------
 (3 rows)
-rust-db > .exit
-Unknown command: '.exit'
+rust-db > delete 5
+Removed: Row { fields: [Integer(5), String("name@email.com"), Boolean(false)] }
+rust-db > .help
+   .help: show this message
+   .table: print the table (first and last 5 rows)
+   .quit: save and exit
+   insert: insert <id> <email|null> <true|false>
+   delete: delete <id>
 rust-db > .quit
+Rows: 2
+File Size: 0.01MB
 File Size: 0.01MB
 ```
 
 Next steps include:
-- Write a real `EvictionPolicy` using clock eviction (currently it's just round-robin, evicting the first unpinned frame it finds).
 - Abstract out trait layers so `Page` can eventually be swapped out.
-- Write many, many, many more tests to hammer `BufferPoolManager`, `Table`, and `BTree`.
+- Write many, many, many more tests to hammer `BufferPoolManager`, `FileDisk`, `Table`, and `BTree`.
 
 #### Testing
-The `Page` layer is tested extensively, but I still need to spend some time testing everything else. I'm using `quickcheck` and many, many property based tests to ensure a rock solid foundation.
+The `Page` layer is tested extensively, but I still need to spend some time testing everything else. I'm using `quickcheck` and property based tests to ensure a rock solid foundation.
 
 ```
 QUICKCHECK_TESTS=10000 cargo test
@@ -180,9 +177,9 @@ pub enum PageBody {
   
 ### Phase 2 — BufferPoolManager
 - Is in charge of handing out `Frames` that hold in-memory representations of the `Page`s on disk. It requires both a `DiskManager` and an `EvictionPolicy` on creation.
-  - `DiskManager` represents the underlying persistent layer. By making it a trait I am able to keep a quick-and-dirty in-memory version that's just a `HashMap<FrameId, Frame>` for testing, as well as a `FaultyDiskManager` to simulate torn writes and other failures. Right now I have an actual `FileDisk` that pushes to/from the filesystem.
-  - `EvictionPolicy` is how the `BufferPoolManager` will decide to purge a `Page` from its cache and back to the `DiskManager`. I implemented a simple FIFO version as well as a `ClockEvictor` that is an efficient subsitute for an LRU cache.
-    - The `EvictionPolicy` rotates through the `Frames` and finds one that isn't currently 'pinned' (has an open read or write latch to it). It should prefer to find one that isn't 'dirty' (has uncommitted writes) to avoid having to flush it to disk.
+  - `DiskManager` represents the underlying persistent layer. By making it a trait I am able to keep a quick-and-dirty in-memory version that's just a `HashMap<FrameId, RawPage>` for testing, as well as a `FaultyDiskManager` (planned) to simulate torn writes and other failures. Right now I have an actual `FileDisk` that pushes to/from the filesystem.
+  - `EvictionPolicy` is how the `BufferPoolManager` will decide to purge a `Page` from its cache and back to the `DiskManager`. I implemented a simple round-robin version as well as a `ClockEvictor` that is an efficient subsitute for an LRU cache.
+    - The `EvictionPolicy` rotates through the `Frames` and finds one that isn't currently 'pinned' (has an open read or write latch to it). It should prefer to find one that isn't 'dirty' (writes not yet pushed to disk) to avoid having to flush it to disk.
 - An occupied `Frame` holds a `RwLock` guarding a cached `Page`. This is used for synchronization across multiple threads trying to access the same data.
   - It also holds an atomic counter of how many read or write guards are out there (`pin_count`). This is all controlled using RAII guards. A `Frame` can't be evicted from the pool until the `pin_count` is `0` (otherwise you're leaving a reader with access to whatever `Page` you loaded in its place).
   - The `referenced` `AtomicBool` is used by the `ClockEvictor` to estimate recency of access. It's set to `true` when a `Frame` is pinned, and set to `false` when the `ClockEvictor` is searching for a victim `Frame`.
@@ -248,11 +245,26 @@ pub struct BTree<'t, Dm: DiskManager, Ep: EvictionPolicy> {
 - Maybe I'll start with a default dummy `Schema` to avoid all the `Table` declarations with the REPL.
 
 ### Phase 4 — Concurrency
-- `RwLock`-guarded pages (built in Phase 2) used for real.
-- Latch crabbing (lock coupling) for B+Tree traversal: hold the parent's
-  latch, acquire the child's, release the parent once the child is confirmed
-  safe (won't split/merge). Standard technique for concurrent tree traversal
-  without one thread pinning the root latch for an entire operation.
+- Tree descents all follow a similar pattern: 
+```
+        let mut curr_page = self.get_root_write()?;
+
+        // a stack of parents traversed on the way down to finding the leaf page
+        // for insertion. Holding `WriteGuards` along the way.
+        let mut ancestors = Vec::new();
+
+        while curr_page.is_internal()
+            && let Some(ch) = curr_page.find_child(&key)
+        {
+            ancestors.push(curr_page);
+            curr_page = self.table.bpm.fetch_write(ch)?;
+            ...
+```
+- Grabbing a write latch at the root, then following it down until hitting a leaf, pushing guards onto an `ancestors` stack along the way.
+  - Read only operations like `get` don't require an `ancestor` stack.
+- Once an operation is safe (e.g. a `Page` can fit a max-sized entry, or if a `Page` below it split or merged with its neighbor this one can definitely handle the `Key` deletion or insertion), we clear the the ancestors `Vec`, releasing all the latches above and allowing another thread to grab the root.
+  - This is a pessimistic approach to latching with an 'early' release on `ancestor` latches.
+  - Alternatively I could try an optimistic approach where I only take read guards all the way down and if the leaf is safe to `insert` or `delete`, only take that write guard. Otherwise, trace back to the highest write guard I'd need to perform the operation.
 
 ### Phase 5 — WAL / ARIES
 Hardest item on the list — sequence deliberately rather than attempting full

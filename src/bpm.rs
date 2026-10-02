@@ -17,7 +17,7 @@ pub enum BpmError {
     #[error("Unexpected error with a BPM operation")]
     Unexpected,
     #[error(transparent)]
-    IoError(#[from] std::io::Error),
+    Io(#[from] std::io::Error),
     #[error(transparent)]
     Page(#[from] PageError),
     #[error("No free frames available")]

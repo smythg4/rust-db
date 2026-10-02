@@ -72,8 +72,8 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
         log::info!("Opening the file...");
         match bpm.fetch_read(meta_id) {
             Ok(_) => return Err(TableError::AlreadyExists(table_id)),
-            Err(BpmError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {} // file isn't populated yet
-            Err(BpmError::IoError(e)) if e.kind() == std::io::ErrorKind::NotFound => {} // clear path to make the table
+            Err(BpmError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {} // file isn't populated yet
+            Err(BpmError::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {} // clear path to make the table
             Err(e) => return Err(e.into()),
         }
         log::info!("File opened! Making new pages...");
@@ -149,6 +149,10 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
 
     pub fn delete(&self, key: &Key) -> Result<Option<Row>, TableError> {
         Ok(BTree::new(self).delete(key)?)
+    }
+
+    pub fn get(&self, key: &Key) -> Result<Option<Row>, TableError> {
+        Ok(BTree::new(self).get(key)?)
     }
 
     fn check_space_accounting(&self) {
@@ -255,6 +259,13 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
         let row_val = Self::map_raw(self.schema.columns[0].col_type, args[0])?;
         let key = &Key::try_from(&row_val).expect("invalid key");
         self.delete(key)
+    }
+
+    pub fn get_raw(&self, args: &[&str]) -> Result<Option<Row>, TableError> {
+        assert!(args.len() == 1);
+        let row_val = Self::map_raw(self.schema.columns[0].col_type, args[0])?;
+        let key = &Key::try_from(&row_val).expect("invalid key");
+        self.get(key)
     }
 
     pub fn print_table(&self) -> Result<(), TableError> {

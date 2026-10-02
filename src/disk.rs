@@ -15,11 +15,11 @@ impl FileDisk {
     // TODO: Add support for one file per table
     pub fn new(path: impl AsRef<Path>) -> Result<Self, std::io::Error> {
         let path = path.as_ref();
-        // this will result in a fresh file each time
         let f = OpenOptions::new()
             .read(true)
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(false)
             .open(path)?;
         Ok(Self {
             file: Arc::new(RwLock::new(f)),
@@ -31,6 +31,9 @@ impl DiskManager for FileDisk {
     fn read_page(&self, id: PageId, buf: &mut RawPage) -> std::io::Result<()> {
         let file_offset = id.get_page_num() as u64 * PAGE_SIZE as u64;
         let guard = self.file.read().unwrap();
+        if file_offset >= guard.metadata()?.len() {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound)); // the page was never written
+        }
         guard.read_exact_at(buf, file_offset)?;
         Ok(())
     }

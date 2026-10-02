@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
 crc32_light = "0.1.2"
 integer-encoding = "4.1.0"
 log = "0.4.34"
