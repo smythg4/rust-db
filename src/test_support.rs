@@ -1,5 +1,8 @@
-use crate::commontypes::{Key, PageId, TableId};
-use crate::page::{MAX_INTERNAL_ENTRY_SIZE, MAX_LEAF_ENTRY_SIZE, Page, PageBody, PageError};
+use crate::commontypes::{Key, PAGE_ID_SIZE, PageId, SLOT_ENTRY_SIZE, TableId};
+use crate::page::{
+    CHECKSUM_OFFSET, MAX_INTERNAL_ENTRY_SIZE, MAX_LEAF_ENTRY_SIZE, MAX_LEAF_HEADER_SIZE, Page,
+    PageBody, PageError, RawPage,
+};
 use crate::schema::{Column, Row, RowValue, Schema, ValidatedRow};
 use crate::traits::Serializable;
 use std::io::Cursor;
@@ -19,6 +22,48 @@ macro_rules! assert_matches {
       };
   }
 pub(crate) use assert_matches;
+
+/// A two-row leaf (both pointers `None`) and the byte offset of its slot array.
+pub(crate) fn two_row_leaf() -> (RawPage, usize) {
+    let (schema, _) = leaf_schema();
+    let mut page = Page::empty_leaf(child(1));
+    for key in [1, 2] {
+        let row = Row {
+            fields: vec![RowValue::Integer(key), RowValue::String("abc".into())],
+        };
+        page.leaf_insert(schema.validate_row(row).unwrap()).unwrap();
+    }
+    // header with both sibling pointers None: MAX_LEAF_HEADER_SIZE minus 8 bytes each
+    (
+        page.as_raw_page().unwrap(),
+        MAX_LEAF_HEADER_SIZE - 2 * PAGE_ID_SIZE,
+    )
+}
+
+pub(crate) fn get_slot(bytes: &RawPage, slot_array: usize, slot: usize) -> (u16, u16) {
+    let at = slot_array + slot * SLOT_ENTRY_SIZE;
+    (
+        u16::from_be_bytes([bytes[at], bytes[at + 1]]),
+        u16::from_be_bytes([bytes[at + 2], bytes[at + 3]]),
+    )
+}
+
+pub(crate) fn set_slot(
+    bytes: &mut RawPage,
+    slot_array: usize,
+    slot: usize,
+    offset: u16,
+    length: u16,
+) {
+    let at = slot_array + slot * SLOT_ENTRY_SIZE;
+    bytes[at..at + 2].copy_from_slice(&offset.to_be_bytes());
+    bytes[at + 2..at + 4].copy_from_slice(&length.to_be_bytes());
+}
+
+pub(crate) fn fix_checksum(bytes: &mut RawPage) {
+    let crc = Page::page_checksum(bytes);
+    bytes[CHECKSUM_OFFSET..CHECKSUM_OFFSET + 4].copy_from_slice(&crc.to_be_bytes());
+}
 
 pub(crate) fn assert_roundtrip<T>(value: T)
 where

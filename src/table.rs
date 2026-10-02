@@ -308,9 +308,9 @@ fn line(cells: impl IntoIterator<Item = String>) -> String {
 mod tests {
 
     use super::*;
-    use crate::clock::ClockEvictor;
     use crate::commontypes::Key;
     use crate::disk::FileDisk;
+    use crate::eviction::ClockEvictor;
     use crate::page::PageError::DuplicateKey;
     use crate::schema::Column;
 

@@ -7,12 +7,12 @@ use std::io::Cursor;
 use std::ops::Range;
 
 pub mod codec;
-pub mod common;
 pub mod error;
 mod internal;
 pub mod invariants;
 mod leaf;
 mod meta;
+#[cfg(test)]
 pub(crate) mod tests;
 
 pub use error::*;

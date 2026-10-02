@@ -1,8 +1,8 @@
 pub mod bpm;
 pub mod btree;
-pub mod clock;
 pub mod commontypes;
 pub mod disk;
+pub mod eviction;
 pub mod page;
 pub mod schema;
 pub mod table;

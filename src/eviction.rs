@@ -9,7 +9,7 @@ pub struct ClockEvictor {
 
 impl EvictionPolicy for ClockEvictor {
     fn find_victim(&mut self, frames: &[Frame]) -> Option<FrameId> {
-        // go through the `Frames` two times in case something cleared up in between
+        // go through the `Frames` twice in case something cleared up in between
         for _ in 0..frames.len() * 2 {
             let id = self.hand;
             self.hand = (self.hand + 1) % frames.len();
@@ -22,7 +22,7 @@ impl EvictionPolicy for ClockEvictor {
             }
             return Some(FrameId::new(id));
         }
-        None
+        None // everything pinned
     }
 }
 
@@ -42,6 +42,6 @@ impl EvictionPolicy for Replacer {
                 return Some(FrameId::new(id));
             }
         }
-        None // everything pinned → NoFreeFrames
+        None // everything pinned
     }
 }

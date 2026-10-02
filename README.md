@@ -70,7 +70,7 @@ QUICKCHECK_TESTS=10000 cargo test
 #### Accessors and small functions
 - [ ] `can_insert_separator`: exact fit → true, one byte over → false, leaf → false
 - [ ] `is_underfull`: exactly at each threshold, all 4 page types
-- [ ] `split_page`: 0 or 1 rows, or fewer than 3 keys → `TooSmallToSplit`
+- [x] `split_page`: 0 or 1 rows, or fewer than 3 keys → `TooSmallToSplit`
 
 #### Routing and indexes
 - [x] `child_at` / `key_at`: out of range → `None`; on a leaf → `None`
