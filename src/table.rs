@@ -1,6 +1,6 @@
-use crate::bpm::{BpmError, BufferPoolManager, Frame, PageWriteGuard};
+use crate::bpm::{BpmError, BufferPoolManager, PageWriteGuard};
 use crate::btree::{BTree, BTreeError};
-use crate::commontypes::{FrameId, Key, PageId, TableId};
+use crate::commontypes::{Key, PageId, TableId};
 use crate::page::{Page, PageBody, PageError};
 use crate::schema::{Column, ColumnType, Row, RowValue, Schema, SchemaError};
 use crate::traits::{DiskManager, EvictionPolicy};
@@ -304,28 +304,11 @@ fn line(cells: impl IntoIterator<Item = String>) -> String {
     format!("| {} |", cells.join(" | "))
 }
 
-#[derive(Default)]
-pub struct Replacer {
-    hand: usize,
-}
-
-impl EvictionPolicy for Replacer {
-    /// TODO: This is just a placeholder until I figure this out...
-    fn find_victim(&mut self, frames: &[Frame]) -> Option<FrameId> {
-        for _ in 0..frames.len() {
-            let id = self.hand;
-            self.hand = (self.hand + 1) % frames.len();
-            if !frames[id].is_pinned() {
-                return Some(FrameId::new(id));
-            }
-        }
-        None // everything pinned → NoFreeFrames
-    }
-}
 #[cfg(test)]
 mod tests {
 
     use super::*;
+    use crate::clock::ClockEvictor;
     use crate::commontypes::Key;
     use crate::disk::FileDisk;
     use crate::page::PageError::DuplicateKey;
@@ -363,7 +346,7 @@ mod tests {
         let _ = std::fs::remove_file(&path); // start clean
 
         let disk = FileDisk::new(&path).expect("failed to open file");
-        let bpm = BufferPoolManager::new(disk, Replacer::default(), 128);
+        let bpm = BufferPoolManager::new(disk, ClockEvictor::default(), 128);
         let schema = Schema::try_from(vec![
             Column::integer("id").unwrap(),
             Column::nullable_string("email").unwrap(),
@@ -462,7 +445,7 @@ mod tests {
         bpm.close().expect("failed to close bpm");
 
         let new_disk = FileDisk::new(&path).expect("failed to reopen file");
-        let new_bpm = BufferPoolManager::new(new_disk, Replacer::default(), 512);
+        let new_bpm = BufferPoolManager::new(new_disk, ClockEvictor::default(), 512);
         let new_table = Table::open(&new_bpm, TableId::new(1)).expect("failed to reopen table");
 
         let after_rows = BTree::new(&new_table)

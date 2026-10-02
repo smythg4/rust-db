@@ -238,6 +238,25 @@ impl Page {
         }
     }
 
+    ///  Returns true if a delete below this page makes everything above it safe.
+    ///  - A borrow from below might replace a `Key` with a bigger one, so we first check
+    ///    that there's room for the maximum size `Key` in the `Page`
+    ///  - A merge below will remove a `Key` from the `Page` and we need to be sure
+    ///    that doesn't make this `Page` underfull and require another a merge or borrow.
+    pub(crate) fn is_delete_safe(&self) -> bool {
+        match &self.body {
+            PageBody::Internal { .. } => {
+                self.free_space()
+                    .is_some_and(|f| f >= MAX_INTERNAL_ENTRY_SIZE)
+                    && self.entries_size() >= INTERNAL_UNDERFULL_BYTES + MAX_INTERNAL_ENTRY_SIZE
+            }
+            PageBody::Leaf { .. } => {
+                self.entries_size() >= LEAF_UNDERFULL_BYTES + MAX_LEAF_ENTRY_SIZE
+            }
+            _ => false,
+        }
+    }
+
     /// Accepts a `new_page_id` to assign to the new `Page` and splits the current `Page` into two
     /// parts. Used by a controlling `B+Tree` structure when `Page`s would overflow from an `insert`.
     /// Returns the new `Page` (new right neighbor) and promoted `Key`.

@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::commontypes::*;
+    use crate::page::internal::KeyIndex;
     use crate::page::*;
     use std::cmp::Ordering;
 
@@ -2276,6 +2277,38 @@ mod tests {
         );
         assert_unchanged(&left_before, &left);
         assert_unchanged(&right_before, &right);
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn internal_key_child_ats_work(InternalPage(page): InternalPage) -> TestResult {
+        let num_childs = page.children().unwrap().count();
+        let num_keys = page.keys().unwrap().count();
+
+        assert_eq!(num_keys + 1, num_childs);
+        for i in 0..num_childs * 2 {
+            if i < num_childs {
+                assert!(page.child_at(ChildIndex::new(i)).is_some());
+            } else {
+                assert!(page.child_at(ChildIndex::new(i)).is_none());
+            }
+            if i < num_childs - 1 {
+                assert!(page.key_at(KeyIndex::new(i)).is_some());
+            } else {
+                assert!(page.key_at(KeyIndex::new(i)).is_none());
+            }
+        }
+
+        TestResult::passed()
+    }
+
+    #[quickcheck]
+    fn leaf_doesnt_work_for_child_at_or_key_at(LeafPage(page): LeafPage) -> TestResult {
+        for i in 0..page.num_items() {
+            assert!(page.child_at(ChildIndex::new(i)).is_none());
+            assert!(page.key_at(KeyIndex::new(i)).is_none());
+        }
+
         TestResult::passed()
     }
 }

@@ -35,11 +35,19 @@ pub struct Frame {
     latch: RwLock<Option<Page>>, // guards the page contents
     pin_count: AtomicU32,
     dirty: AtomicBool,
+    referenced: AtomicBool,
 }
 
 impl Frame {
+    /// Returns whether anybody holds an active reference to the `Frame`
     pub(crate) fn is_pinned(&self) -> bool {
         self.pin_count.load(Ordering::Acquire) != 0
+    }
+
+    /// Returns whether the frame was used since the last sweep, and clears the flag.
+    /// Used for clock eviction
+    pub(crate) fn take_referenced(&self) -> bool {
+        self.referenced.swap(false, Ordering::Acquire)
     }
 }
 
@@ -258,6 +266,9 @@ impl<Dm: DiskManager, Ep: EvictionPolicy> BufferPoolManager<Dm, Ep> {
     /// Increments the `pin_count` for a given `FrameId`, called by acquiring read and write guards
     /// Returns the pin count before the increment
     fn pin_frame(&self, id: FrameId) -> u32 {
+        // first mark this `Frame` as referenced for the eviction policy
+        self.frames[id].referenced.store(true, Ordering::Release);
+        // then bump its pin_count
         let prev = self.frames[id].pin_count.fetch_add(1, Ordering::Release);
         debug_assert!(
             prev < u32::MAX,

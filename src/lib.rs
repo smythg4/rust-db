@@ -1,5 +1,6 @@
 pub mod bpm;
 pub mod btree;
+pub mod clock;
 pub mod commontypes;
 pub mod disk;
 pub mod page;

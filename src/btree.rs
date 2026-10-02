@@ -120,10 +120,6 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
             right.leaf_insert(row)?;
         }
 
-        // drop the guards for the leaves we were holding
-        drop(page);
-        drop(right);
-
         loop {
             match ancestors.pop() {
                 None => {
@@ -228,6 +224,12 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
             let (idx, child_id) = curr_page
                 .find_child_index(key)
                 .expect("internal page always has a child for any key");
+
+            // check to make sure a delete below will stop at this page
+            // this frees up the latches at all levels higher in the tree
+            if curr_page.is_delete_safe() {
+                ancestors.clear();
+            }
             ancestors.push((curr_page, idx));
             curr_page = self.table.bpm.fetch_write(child_id)?;
         }
@@ -252,12 +254,18 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
                 break;
             };
             let sib = pick_sibling(&parent, idx).expect("non-root has a sibling");
-            let sibling = self.table.bpm.fetch_write(sib.id)?;
 
             // name the pair left/right so there's only one path for each case
             let (mut left, mut right) = match sib.side {
-                Side::Right => (page, sibling),
-                Side::Left => (sibling, page),
+                Side::Right => (page, self.table.bpm.fetch_write(sib.id)?),
+                Side::Left => {
+                    let right_id = page.page_id();
+                    drop(page);
+                    (
+                        self.table.bpm.fetch_write(sib.id)?,
+                        self.table.bpm.fetch_write(right_id)?,
+                    )
+                }
             };
 
             if left.can_merge_with(&right, &sib.separator) {

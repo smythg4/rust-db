@@ -73,7 +73,7 @@ QUICKCHECK_TESTS=10000 cargo test
 - [ ] `split_page`: 0 or 1 rows, or fewer than 3 keys → `TooSmallToSplit`
 
 #### Routing and indexes
-- [ ] `child_at` / `key_at`: out of range → `None`; on a leaf → `None`
+- [x] `child_at` / `key_at`: out of range → `None`; on a leaf → `None`
 - [ ] `ChildIndex` navigation: index 0 has no left sibling/separator; for every child, keys routed to it lie between `key_at(left_separator)` and `key_at(right_separator)`
 
 #### Invariants and size limits
@@ -87,11 +87,8 @@ QUICKCHECK_TESTS=10000 cargo test
 #### Generators and helpers
 - [ ] `MAX_*_ITEMS` never too low (smallest distinct entries never exceed it)
 
-#### Durability
-- [ ] Torn write: old/new page spliced at any offset decodes to old, new, or `Corrupt` — never a third page
-
 #### `Meta`/`Free` Tests
-- [ ] 
+- [ ] `free_list_push` and `free_list_pop` tests
 
 
 ### Phase 0 — Types

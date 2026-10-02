@@ -1,10 +1,11 @@
 use std::io::Write;
 
 use rust_db::bpm::BufferPoolManager;
+use rust_db::clock::ClockEvictor;
 use rust_db::commontypes::TableId;
 use rust_db::disk::FileDisk;
 use rust_db::schema::{Column, Schema};
-use rust_db::table::{Replacer, Table};
+use rust_db::table::Table;
 
 fn main() {
     let mut stdin = std::io::stdin().lines();
@@ -18,7 +19,7 @@ fn main() {
     let _ = std::fs::remove_file(&path); // start clean
 
     let disk = FileDisk::new(&path).expect("failed to open file");
-    let bpm = BufferPoolManager::new(disk, Replacer::default(), 128);
+    let bpm = BufferPoolManager::new(disk, ClockEvictor::default(), 128);
     let schema = Schema::try_from(vec![
         Column::integer("id").unwrap(),
         Column::nullable_string("email").unwrap(),

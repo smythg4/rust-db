@@ -5,7 +5,11 @@ use crate::page::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct ChildIndex(usize);
 
+#[allow(dead_code)] // used only in tests right now
 impl ChildIndex {
+    pub(crate) fn new(i: usize) -> Self {
+        ChildIndex(i)
+    }
     /// The separator between this child and the next one.
     pub(crate) fn right_separator(self) -> KeyIndex {
         KeyIndex(self.0)
@@ -29,6 +33,12 @@ impl ChildIndex {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct KeyIndex(usize);
 
+#[allow(dead_code)] // used only in tests right now
+impl KeyIndex {
+    pub(crate) fn new(i: usize) -> Self {
+        KeyIndex(i)
+    }
+}
 impl Page {
     /// Returns the fully loaded cost for inserting a `Key` into an Internal page to include the slot entry
     /// and child page pointer
