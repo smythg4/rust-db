@@ -26,6 +26,15 @@ impl Page {
         Ok(*page_count as usize)
     }
 
+    /// Overwrites the number of pages in the `Table`
+    pub(crate) fn meta_set_page_count(&mut self, new_count: u32) -> Result<(), PageError> {
+        let PageBody::Meta { page_count, .. } = &mut self.body else {
+            return Err(PageError::WrongPageType);
+        };
+        *page_count = new_count;
+        Ok(())
+    }
+
     /// Returns the schema from the `Table`
     pub(crate) fn meta_get_schema(&self) -> Result<&Schema, PageError> {
         let PageBody::Meta { schema, .. } = &self.body else {
@@ -48,6 +57,19 @@ impl Page {
             return Err(PageError::WrongPageType);
         };
         Ok(*free_list_head)
+    }
+
+    /// Sets the head of the free page list. Returns the old head
+    pub(crate) fn meta_set_free_list_head(
+        &mut self,
+        new_head: Option<PageId>,
+    ) -> Result<Option<PageId>, PageError> {
+        let PageBody::Meta { free_list_head, .. } = &mut self.body else {
+            return Err(PageError::WrongPageType);
+        };
+        let old_head = *free_list_head;
+        *free_list_head = new_head;
+        Ok(old_head)
     }
 
     /// Increments the page_count on a meta page

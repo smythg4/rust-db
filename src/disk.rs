@@ -1,14 +1,15 @@
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::{FileExt, MetadataExt};
-use std::path::Path;
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use crate::commontypes::PageId;
-use crate::page::{PAGE_SIZE, RawPage};
-use crate::traits::DiskManager;
+use crate::page::{PAGE_SIZE, Page, RawPage};
+use crate::traits::{DiskManager, Serializable};
 
 pub struct FileDisk {
     file: Arc<RwLock<File>>,
+    path: PathBuf,
 }
 
 impl FileDisk {
@@ -23,6 +24,7 @@ impl FileDisk {
             .open(path)?;
         Ok(Self {
             file: Arc::new(RwLock::new(f)),
+            path: path.into(),
         })
     }
 }
@@ -47,9 +49,21 @@ impl DiskManager for FileDisk {
 
     fn sync(&self) -> std::io::Result<()> {
         let guard = self.file.write().unwrap();
-        let size = guard.metadata().unwrap().size() as f64 / (1024 * 1024) as f64;
+        let size = std::fs::metadata(&self.path).unwrap().len() as f64 / (1024 * 1024) as f64;
         println!("File Size: {size:.2}MB");
         guard.sync_all()
+    }
+
+    fn swap_file(&self, pages: Vec<Page>) -> Result<(), std::io::Error> {
+        let temp_path = self.path.with_extension("vac");
+        let mut temp_file = std::fs::File::create(&temp_path)?;
+        for page in pages {
+            page.serialize(&mut temp_file)
+                .expect("failed to serialize on swap");
+        }
+        std::fs::rename(&temp_path, &self.path)?;
+        let _ = std::fs::remove_file(&temp_path);
+        Ok(())
     }
 }
 
@@ -74,11 +88,25 @@ impl DiskManager for FakeDisk {
         buf.copy_from_slice(page);
         Ok(())
     }
+
     fn write_page(&self, id: PageId, buf: &RawPage) -> std::io::Result<()> {
         self.stuff.lock().unwrap().insert(id, *buf);
         Ok(())
     }
+
     fn sync(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn swap_file(&self, pages: Vec<Page>) -> Result<(), std::io::Error> {
+        let mut new_hash = HashMap::new();
+        for page in pages {
+            new_hash.insert(
+                page.page_id(),
+                page.as_raw_page().expect("failed to serialize in swap"),
+            );
+        }
+        *self.stuff.lock().unwrap() = new_hash;
         Ok(())
     }
 }

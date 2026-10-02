@@ -35,12 +35,15 @@ Users
 (3 rows)
 rust-db > delete 5
 Removed: Row { fields: [Integer(5), String("name@email.com"), Boolean(false)] }
+rust-db > insert 3 null null
+Error on insert: Null value in non-nullable column 2
 rust-db > .help
-   .help: show this message
-   .table: print the table (first and last 5 rows)
-   .quit: save and exit
-   insert: insert <id> <email|null> <true|false>
-   delete: delete <id>
+   .help   : show this message
+   .table  : print the table (first and last 5 rows)
+   .quit   : save and exit
+   insert  : insert <id> <email|null> <true|false>
+   delete  : delete <id>
+   select  : select <id>
 rust-db > .quit
 Rows: 2
 File Size: 0.01MB
@@ -265,6 +268,9 @@ pub struct BTree<'t, Dm: DiskManager, Ep: EvictionPolicy> {
 - Once an operation is safe (e.g. a `Page` can fit a max-sized entry, or if a `Page` below it split or merged with its neighbor this one can definitely handle the `Key` deletion or insertion), we clear the the ancestors `Vec`, releasing all the latches above and allowing another thread to grab the root.
   - This is a pessimistic approach to latching with an 'early' release on `ancestor` latches.
   - Alternatively I could try an optimistic approach where I only take read guards all the way down and if the leaf is safe to `insert` or `delete`, only take that write guard. Otherwise, trace back to the highest write guard I'd need to perform the operation.
+
+### Phase 4.5 - Bloom Filters
+- A quick way to test if an element is in the `Table` or not. Avoiding unecessary latch crabbing and speeding things up in cases where we know an entry isn't in the tree.
 
 ### Phase 5 — WAL / ARIES
 Hardest item on the list — sequence deliberately rather than attempting full

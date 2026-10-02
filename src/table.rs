@@ -1,7 +1,7 @@
 use crate::bpm::{BpmError, BufferPoolManager, PageWriteGuard};
 use crate::btree::{BTree, BTreeError};
 use crate::commontypes::{Key, PageId, TableId};
-use crate::page::{Page, PageBody, PageError};
+use crate::page::{PAGE_SIZE, Page, PageBody, PageError};
 use crate::schema::{Column, ColumnType, Row, RowValue, Schema, SchemaError};
 use crate::traits::{DiskManager, EvictionPolicy};
 use std::collections::HashSet;
@@ -153,6 +153,121 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
 
     pub fn get(&self, key: &Key) -> Result<Option<Row>, TableError> {
         Ok(BTree::new(self).get(key)?)
+    }
+
+    pub fn size(&self) -> Result<usize, TableError> {
+        Ok(self.bpm.fetch_read(self.meta_id)?.meta_get_page_count()? * PAGE_SIZE)
+    }
+
+    fn get_page_id(&self, page_num: u32) -> PageId {
+        let table_id = self.meta_id.get_table_id();
+        PageId::new(table_id, page_num)
+    }
+
+    fn new_internal(&self, page_num: &mut u32, right_child: PageId) -> Page {
+        let body = PageBody::Internal {
+            keys: Vec::new(),
+            children: vec![right_child],
+        };
+        let page = Page::empty_page(self.get_page_id(*page_num), body);
+        *page_num += 1;
+        page
+    }
+
+    fn build_internal_level(
+        &self,
+        children: Vec<(Key, PageId)>,
+        next_page_num: &mut u32,
+        out: &mut Vec<Page>,
+    ) -> Result<Vec<(Key, PageId)>, TableError> {
+        let mut iter = children.into_iter();
+        let (mut low_key, first_child) = iter.next().expect("a level has at least one page");
+        let mut page = self.new_internal(next_page_num, first_child);
+        let mut level = Vec::new();
+
+        for (key, child) in iter {
+            if page.can_insert_separator(&key) {
+                page.internal_insert(key, child)?;
+            } else {
+                level.push((low_key, page.page_id()));
+                out.push(page);
+                low_key = key;
+                page = self.new_internal(next_page_num, child);
+            }
+        }
+        level.push((low_key, page.page_id()));
+        out.push(page);
+
+        Ok(level)
+    }
+
+    fn first_key(page: &Page) -> Key {
+        let row = page
+            .records()
+            .expect("leaves have records")
+            .next()
+            .expect("has first row");
+        Key::try_from(row.fields.first().expect("row has keys")).expect("keys are valid")
+    }
+
+    pub fn vacuum(&self) -> Result<(), TableError> {
+        log::info!("Starting vacuum on table '{}'...", self.table_name);
+        // collect all the rows into memory
+        let rows: Vec<Row> = BTree::new(self).get_all()?;
+
+        let mut next_page_num: u32 = 1; // page 0 is the meta page
+        let new_leaf = |n: &mut u32| {
+            let page = Page::empty_leaf(self.get_page_id(*n));
+            *n += 1;
+            page
+        };
+
+        // build a series of leaf pages
+        let mut leaves: Vec<Page> = Vec::new();
+        let mut curr_page = new_leaf(&mut next_page_num);
+        for row in rows {
+            // start at 2
+            if curr_page.can_insert(&row) {
+                let validated_row = self.schema.validate_row(row)?;
+                curr_page.leaf_insert(validated_row)?;
+            } else {
+                leaves.push(std::mem::replace(
+                    &mut curr_page,
+                    new_leaf(&mut next_page_num),
+                ));
+                curr_page = new_leaf(&mut next_page_num);
+                let validated_row = self.schema.validate_row(row)?;
+                curr_page.leaf_insert(validated_row)?;
+            }
+        }
+        leaves.push(curr_page);
+
+        // link the neighbors - wanted to do this windows, but that's not mutable
+        let ids: Vec<PageId> = leaves.iter().map(|l| l.page_id()).collect();
+        for (i, leaf) in leaves.iter_mut().enumerate() {
+            leaf.set_prev(i.checked_sub(1).map(|j| ids[j]))?;
+            leaf.set_next(ids.get(i + 1).copied())?;
+        }
+
+        let mut level: Vec<(Key, PageId)> = leaves
+            .iter()
+            .map(|l| (Self::first_key(l), l.page_id()))
+            .collect();
+        let mut internals = Vec::new();
+        while level.len() > 1 {
+            level = self.build_internal_level(level, &mut next_page_num, &mut internals)?;
+        }
+        let root_id = level[0].1;
+        let mut meta_page = self.bpm.fetch_read(self.meta_id)?.clone();
+        meta_page.meta_set_root_id(root_id)?;
+        meta_page.meta_set_page_count(next_page_num)?; // every page from here on doesn't exist
+        meta_page.meta_set_free_list_head(None)?; // the new file is fully packed: nothing is free
+        let mut all_pages = vec![meta_page];
+        all_pages.extend(internals);
+        all_pages.extend(leaves);
+
+        self.bpm.swap_file(all_pages)?;
+        Ok(())
     }
 
     fn check_space_accounting(&self) {
@@ -464,6 +579,19 @@ mod tests {
             .expect("failed to fetch rows on reload");
 
         assert_eq!(rows, after_rows, "reload rows were different");
+
+        new_table.vacuum().expect("vacuum failed");
+
+        assert!(
+            std::fs::metadata(&path).unwrap().len() <= 3 * PAGE_SIZE as u64,
+            "vacuum didn't shrink the file"
+        );
+
+        assert_eq!(BTree::new(&new_table).get_all().unwrap(), rows);
+        new_table.debug_check_space_accounting("post-vacuum reopen");
+
+        new_table.close().expect("failed to close new table");
+        new_bpm.close().expect("failed to close new bpm");
 
         let _ = std::fs::remove_file(&path); // clean up the temp file
         println!("Done!");

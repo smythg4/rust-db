@@ -24,12 +24,15 @@ const COMMANDS: &[(&str, &str)] = &[
     (".help", "show this message"),
     (".table", "print the table (first and last 5 rows)"),
     (".quit", "save and exit"),
+    (".size", "prints size of db file"),
+    (".vacuum", "de-fragments the on disk storage"),
     ("insert", "insert <id> <email|null> <true|false>"),
     ("delete", "delete <id>"),
     ("select", "select <id>"),
 ];
 
 fn main() {
+    env_logger::init();
     let cli = Cli::parse();
     let mut stdin = std::io::stdin().lines();
     let mut stdout = std::io::stdout();
@@ -65,6 +68,17 @@ fn main() {
                 bpm.close().expect("failed to close the bpm");
                 break;
             }
+            ".size" => {
+                match table.size() {
+                    Ok(n) => println!("File size: {n} bytes"),
+                    Err(e) => eprintln!("Error on size: {e}"),
+                };
+            }
+            ".vacuum" => match table.vacuum() {
+                Ok(_) => println!("Vacuum successful!"),
+                Err(e) => eprintln!("Error on vacuum: {e}"),
+            },
+            ".help" => print_commands(),
             "insert" => match table.insert_raw(&parts[1..]) {
                 Ok(_) => println!("Insert successful"),
                 Err(e) => eprintln!("Error on insert: {e}"),
@@ -79,7 +93,6 @@ fn main() {
                 Ok(Some(r)) => println!("Found: {r:?}"),
                 Err(e) => eprintln!("Error on get: {e}"),
             },
-            ".help" => print_commands(),
             command => println!("Unknown command: '{command}'"),
         }
     }
@@ -87,6 +100,6 @@ fn main() {
 
 fn print_commands() {
     for (command, description) in COMMANDS {
-        println!("   {command}: {description}");
+        println!("   {command:<8}: {description}");
     }
 }

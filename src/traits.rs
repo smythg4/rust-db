@@ -1,6 +1,6 @@
 use crate::bpm::Frame;
 use crate::commontypes::{FrameId, PageId};
-use crate::page::RawPage;
+use crate::page::{Page, RawPage};
 use std::io::ErrorKind;
 use std::io::{Read, Write};
 
@@ -11,6 +11,7 @@ pub trait DiskManager: Send + Sync {
     fn read_page(&self, id: PageId, buf: &mut RawPage) -> std::io::Result<()>;
     fn write_page(&self, id: PageId, buf: &RawPage) -> std::io::Result<()>;
     fn sync(&self) -> std::io::Result<()>;
+    fn swap_file(&self, pages: Vec<Page>) -> Result<(), std::io::Error>;
 }
 
 pub trait EvictionPolicy {

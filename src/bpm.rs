@@ -307,6 +307,21 @@ impl<Dm: DiskManager, Ep: EvictionPolicy> BufferPoolManager<Dm, Ep> {
         Ok(())
     }
 
+    pub(crate) fn swap_file(&self, pages: Vec<Page>) -> Result<(), BpmError> {
+        self.flush_all()?;
+        let mut state = self.big_dumb_lock.lock().unwrap();
+        self.persistant_layer.swap_file(pages)?;
+        for frame in self.frames.iter() {
+            assert!(!frame.is_pinned());
+            *frame.latch.write().unwrap() = None;
+            frame.dirty.store(false, Ordering::Release);
+            frame.referenced.store(false, Ordering::Release);
+        }
+        state.page_table.clear();
+        state.free_frames = (0..self.frames.len()).map(FrameId::new).collect();
+        Ok(())
+    }
+
     /// Flushes every dirty page and syncs. Call this for a clean shutdown and handle the error.
     pub fn close(self) -> Result<(), BpmError> {
         self.flush_all()
