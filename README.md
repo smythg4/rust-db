@@ -179,73 +179,69 @@ pub enum PageBody {
   | `length` | 2 | length of the encoded row or key |
   
 ### Phase 2 — BufferPoolManager
-- Reads pages off disk, deserializes into a proper `Page` struct, serializes
-  back to bytes only at the swap boundary (eviction or shutdown).
-- Need to design all BPM methods to be `&self` to enable concurrency in later stages
-- `RwLock`-guarded pages
-- Pin counting via RAII guard (increment on fetch, decrement on `Drop`) — a
-  bookkeeping mechanism that informs the eviction policy if it's safe to evict.
-- Clock eviction policy: reference bit per frame, set on access, cleared as
-  the clock hand sweeps past without evicting. Only `pin_count == 0` frames
-  are eligible.
-    - This will be a separate type stored by the BPM. Consider defining a trait `EvictionPolicy` to allow easy swap outs and experimentation with different policies.
-- Dirty bit set on write-guard drop
-- One access path only (`fetch_page`, always faults in on a miss) — no
-  separate forcing/non-forcing variants. Half of cstack_db's session-restart
-  bugs were exactly a call site using the read-only accessor that returned
-  `None` on a cache miss instead of loading from disk.
-- `DiskManager` layer will contain methods like `read_page(id: PageId)` and `write_page(raw: &RawPage)`.
-  - File listing could be a map with `TableId` -> `Path` and `PageId` -> `offset`.
-- `ReadGuard`s will need to implement `Deref` and `WriteGuard`s will need to implement `Deref` and `DerefMut` for `Page` so I can use them with `Page` operations.
+- Is in charge of handing out `Frames` that hold in-memory representations of the `Page`s on disk. It requires both a `DiskManager` and an `EvictionPolicy` on creation.
+  - `DiskManager` represents the underlying persistent layer. By making it a trait I am able to keep a quick-and-dirty in-memory version that's just a `HashMap<FrameId, Frame>` for testing, as well as a `FaultyDiskManager` to simulate torn writes and other failures. Right now I have an actual `FileDisk` that pushes to/from the filesystem.
+  - `EvictionPolicy` is how the `BufferPoolManager` will decide to purge a `Page` from its cache and back to the `DiskManager`. I implemented a simple FIFO version as well as a `ClockEvictor` that is an efficient subsitute for an LRU cache.
+    - The `EvictionPolicy` rotates through the `Frames` and finds one that isn't currently 'pinned' (has an open read or write latch to it). It should prefer to find one that isn't 'dirty' (has uncommitted writes) to avoid having to flush it to disk.
+- An occupied `Frame` holds a `RwLock` guarding a cached `Page`. This is used for synchronization across multiple threads trying to access the same data.
+  - It also holds an atomic counter of how many read or write guards are out there (`pin_count`). This is all controlled using RAII guards. A `Frame` can't be evicted from the pool until the `pin_count` is `0` (otherwise you're leaving a reader with access to whatever `Page` you loaded in its place).
+  - The `referenced` `AtomicBool` is used by the `ClockEvictor` to estimate recency of access. It's set to `true` when a `Frame` is pinned, and set to `false` when the `ClockEvictor` is searching for a victim `Frame`.
+  - The `dirty` flag indicates if this `Frame` has pending writes that haven't been flushed from the cache. This is set to `true` whenever `.deref_mut()` is invoked on a `WriteGuard`, not when a `Page` is fetched for write access.
+- `frames` size is determined at initialization of the `BufferPoolManager`. A higher `pool_size` will reduce the number of times you're needed to shuffle in and out of memory. Remember that my design right now triggers a deserialization everytime you pull something from the `DiskManager` and a serialization everytime you push something to it.
+- The internal state is currently protected by a `Mutex`. This includes:
+  - `page_table`, which is just a mapping from a `PageId` to the current index in the `frames` array.
+  - `free_frames` is the list of unoccupied `Frame`s. This is initialized at start up and drains until everything has been assigned. After that eviction is required to fetch another `Page` from the `DiskManager`.
+  - `eviction_policy` was described above. This is inside the lock to make sure it's handing out a valid victim for eviction.
+  - `wal` is currently unused, but in a later phase I will wire in a Write Ahead Log.
 
 ```
-struct BpmState {
-    page_table: HashMap<PageId, FrameId>,
-    free_frames: Vec<FrameId>,
-    eviction_policy: EvictionPolicy,
-    wal: Option<Wal>,
-}
-
-pub struct BufferPoolManager<Dm: DiskManager> {
-    frames: Box<[Frame]>,
-    persistant_layer: Dm,
-    // TODO: Replace this with refined concurrency control
-    big_dumb_lock: Arc<Mutex<BpmState>>,
-}
-
-pub(crate) struct Frame {
+pub struct Frame {
     latch: RwLock<Option<Page>>, // guards the page contents
     pin_count: AtomicU32,
     dirty: AtomicBool,
+    referenced: AtomicBool,
+}
+
+struct BpmState<Ep: EvictionPolicy> {
+    page_table: HashMap<PageId, FrameId>,
+    free_frames: Vec<FrameId>,
+    eviction_policy: Ep,
+    wal: Option<Wal>,
+}
+
+pub struct BufferPoolManager<Dm: DiskManager, Ep: EvictionPolicy> {
+    frames: Box<[Frame]>,
+    persistant_layer: Dm,
+    big_dumb_lock: Arc<Mutex<BpmState<Ep>>>,
+}
+```
+
+### Phase 2.5 - Table
+- `Table` holds a reference to a `BufferPoolManager` and stores the metadata `PageId`.
+- It's the primary conduit for database interaction with methods like `create`, `allocate`, `free`, `insert`, `delete`.
+- TODO: Describe all the core methods.
+```
+pub struct Table<'a, Dm: DiskManager, Ep: EvictionPolicy> {
+    pub(crate) bpm: &'a BufferPoolManager<Dm, Ep>,
+    meta_id: PageId,
+    schema: Schema,
+    table_name: String,
 }
 ```
 
 ### Phase 3 — BTree over the BPM
 - `BTree` struct holding a reference to the BPM (similar to `Table` and `Pager` from cstack).
 ```
-pub struct BTree {
-  id: TableId,
-  bpm: Arc<BufferPoolManager>,
-  root_page: PageId,
-  schema: Schema,
-  ...
+pub struct BTree<'t, Dm: DiskManager, Ep: EvictionPolicy> {
+    table: &'t Table<'t, Dm, Ep>,
 }
 ```
-- `PageId` of `0` should be a metadata page containing all the core information.
-- Delete, including underflow handling (merge with / borrow from a sibling).
-  Conspicuously absent from cstack_db — this is the mirror image of
-  split-on-insert, and at least as fiddly as the key-promotion bookkeeping in
-  `internal_node_split_and_insert` was, just in reverse.
-- Free-list / space map for page allocation, replacing cstack_db's
-  `get_unused_page_num` (which only ever grows). Needed once delete exists so
-  freed pages are reusable.
-- A minimal catalog/system table to durably store user-defined schema
-  definitions themselves, since schemas are no longer fixed at compile time.
-- Implement a `vacuum` method that performs:
+- Right now this is just a wrapper around a `Table` struct that holds a `BufferPoolManager` and a `Schema`.
+- Root `PageId` are always read from or written to the underlying metadata `Page` through `ReadGuard`s or `WriteGuard`s, so there shouldn't ever be a race condition resulting in an invalid root `PageId` and subsequent invalid tree traversal.
+- Implement a `vacuum` method that performs (this should probably go on `Table`):
   - Complete sequential scan, gathering all records in one place.
   - Builds full leaf `Page`s out of the collection and connects sibling pointers
   - Bottom up construction of internal `Page`s until reaching the root
-  - Update `self.root_page`
 
 ### Phase 3.5 - REPL / Dumb Queries
 - Now the project is ready to interact with, implement a simple REPL and allow some basic "stored procedures" like `INSERT <Row>`, `SELECT <Key>`, `DELETE <Key>`, `UPDATE <Key> <Row>`.

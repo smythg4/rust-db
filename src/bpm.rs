@@ -27,7 +27,8 @@ pub enum BpmError {
     #[error("Tried to create a page that already exists {0}")]
     AlreadyExists(PageId),
 }
-// Dummy structs to hold me over until I actually make them
+
+// Dummy struct to hold me over until I actually make them
 struct Wal;
 
 #[derive(Default, Debug)]
@@ -44,6 +45,11 @@ impl Frame {
         self.pin_count.load(Ordering::Acquire) != 0
     }
 
+    /// Returns whether anybody holds an active reference to the `Frame`
+    pub(crate) fn is_dirty(&self) -> bool {
+        self.dirty.load(Ordering::Acquire)
+    }
+
     /// Returns whether the frame was used since the last sweep, and clears the flag.
     /// Used for clock eviction
     pub(crate) fn take_referenced(&self) -> bool {
@@ -54,8 +60,8 @@ impl Frame {
 struct BpmState<Ep: EvictionPolicy> {
     page_table: HashMap<PageId, FrameId>,
     free_frames: Vec<FrameId>,
-    // TODO: Make real versions of these...
     eviction_policy: Ep,
+    // TODO: Make an actual Wal at some point
     _wal: Option<Wal>,
 }
 
