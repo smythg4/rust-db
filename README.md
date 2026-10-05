@@ -2,52 +2,47 @@
 A project focused on learning more about databases.
 
 ### Current Status
-I added a few `Page` tests and rolled out a super basic REPL for interactive inserts and deletes. Run it with `cargo run --bin repl -- data/test.db --pool-size 100`. CLI arguments are a filepath (required) and pool-size (optional) which defaults to 64.
+I added a super naive filter capability. Since the page methods that get `Row`s are lazy iterators, a `filter` clause avoids unnecessary allocations when results are collected. `Scheme` now has a method `filter_fn` that accepts a `&str` `column_name` and `&RowValue` `value`, it will generate a closure that can be passed to `BTree` operations `get_all` and `get_range` to filter the ultimate output.
+
+Run simple REPL with `cargo run --bin repl -- data/test.db --pool-size 100`. CLI arguments are a filepath (required) and pool-size (optional) which defaults to 64.
 ```
 cargo run --bin repl -- data/test.db --pool-size 4
     Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.10s
      Running `target/debug/repl data/test.db --pool-size 4`
 File Size: 0.01MB
-rust-db > .table
-Users
-----------------------------------------------------------------------------------------------------
-| id (Integer)                   | email (String*)                | active (Bool)                  |
-----------------------------------------------------------------------------------------------------
-----------------------------------------------------------------------------------------------------
-(0 rows)
-rust-db > insert 1 name@email.com true
-Insert successful
-rust-db > insert 5 name@email.com false
-Insert successful
-rust-db > insert 1 null false
-Error on insert: Attempt to insert a duplicate key
-rust-db > insert 2 null true
+rust-db > insert 4 null false
 Insert successful
 rust-db > .table
 Users
 ----------------------------------------------------------------------------------------------------
 | id (Integer)                   | email (String*)                | active (Bool)                  |
 ----------------------------------------------------------------------------------------------------
+| 0                              | 'original@gmail.com'           | true                           |
 | 1                              | 'name@email.com'               | true                           |
-| 2                              | NULL                           | true                           |
-| 5                              | 'name@email.com'               | false                          |
+| 2                              | 'name2@email.com'              | false                          |
+| 3                              | 'name3@gmail.com'              | true                           |
+| 4                              | NULL                           | false                          |
 ----------------------------------------------------------------------------------------------------
-(3 rows)
-rust-db > delete 5
-Removed: Row { fields: [Integer(5), String("name@email.com"), Boolean(false)] }
-rust-db > insert 3 null null
-Error on insert: Null value in non-nullable column 2
+(5 rows)
+rust-db > insert 4 name4@gmail.com true
+Error on insert: Attempt to insert a duplicate key
+rust-db > delete 3
+Removed: Row { fields: [Integer(3), String("name3@gmail.com"), Boolean(true)] }
+rust-db > select * where active true
+Found: [Row { fields: [Integer(0), String("original@gmail.com"), Boolean(true)] }, Row { fields: [Integer(1), String("name@email.com"), Boolean(true)] }]
+rust-db > .vacuum
+File Size: 0.01MB
+Vacuum successful!
 rust-db > .help
    .help   : show this message
    .table  : print the table (first and last 5 rows)
    .quit   : save and exit
+   .size   : prints size of db file
+   .vacuum : de-fragments the on disk storage
    insert  : insert <id> <email|null> <true|false>
    delete  : delete <id>
-   select  : select <id>
-rust-db > .quit
-Rows: 2
-File Size: 0.01MB
-File Size: 0.01MB
+   select  : select <id> (WHERE <col> <val>)
+rust-db >
 ```
 
 Next steps include:

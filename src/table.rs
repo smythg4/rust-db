@@ -7,6 +7,8 @@ use crate::traits::{DiskManager, EvictionPolicy};
 use std::collections::HashSet;
 use thiserror::Error;
 
+const NO_FILTER: fn(&Row) -> bool = |_| true;
+
 #[derive(Debug, Error)]
 pub enum TableError {
     #[error(transparent)]
@@ -54,7 +56,7 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
     /// tree or on the free list. Does not flush: durability is the buffer pool's job, so call
     /// `BufferPoolManager::close` to persist changes.
     pub fn close(self) -> Result<(), TableError> {
-        let rows = BTree::new(&self).get_all()?;
+        let rows = BTree::new(&self).get_all(NO_FILTER)?;
         println!("Rows: {}", rows.len());
         self.debug_check_space_accounting("close");
         Ok(())
@@ -155,6 +157,10 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
         Ok(BTree::new(self).get(key)?)
     }
 
+    pub fn get_all(&self, filter_fn: impl Fn(&Row) -> bool) -> Result<Vec<Row>, TableError> {
+        Ok(BTree::new(self).get_all(filter_fn)?)
+    }
+
     pub fn size(&self) -> Result<usize, TableError> {
         Ok(self.bpm.fetch_read(self.meta_id)?.meta_get_page_count()? * PAGE_SIZE)
     }
@@ -213,7 +219,7 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
     pub fn vacuum(&self) -> Result<(), TableError> {
         log::info!("Starting vacuum on table '{}'...", self.table_name);
         // collect all the rows into memory
-        let rows: Vec<Row> = BTree::new(self).get_all()?;
+        let rows: Vec<Row> = BTree::new(self).get_all(NO_FILTER)?;
 
         let mut next_page_num: u32 = 1; // page 0 is the meta page
         let new_leaf = |n: &mut u32| {
@@ -355,7 +361,7 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
         })
     }
 
-    pub fn insert_raw(&self, args: &[&str]) -> Result<(), TableError> {
+    pub fn insert_raw(&self, args: &[String]) -> Result<(), TableError> {
         let row = Row {
             fields: self
                 .schema
@@ -369,23 +375,33 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
         self.insert(row)
     }
 
-    pub fn delete_raw(&self, args: &[&str]) -> Result<Option<Row>, TableError> {
+    pub fn delete_raw(&self, args: &[String]) -> Result<Option<Row>, TableError> {
         assert!(args.len() == 1);
-        let row_val = Self::map_raw(self.schema.columns[0].col_type, args[0])?;
+        let row_val = Self::map_raw(self.schema.columns[0].col_type, &args[0])?;
         let key = &Key::try_from(&row_val).expect("invalid key");
         self.delete(key)
     }
 
-    pub fn get_raw(&self, args: &[&str]) -> Result<Option<Row>, TableError> {
-        assert!(args.len() == 1);
-        let row_val = Self::map_raw(self.schema.columns[0].col_type, args[0])?;
+    pub fn get_raw(&self, args: &[String]) -> Result<Option<Row>, TableError> {
+        assert_eq!(args.len(), 1);
+        let row_val = Self::map_raw(self.schema.columns[0].col_type, &args[0])?;
         let key = &Key::try_from(&row_val).expect("invalid key");
         self.get(key)
     }
 
+    pub fn get_all_raw(&self, args: &[String]) -> Result<Vec<Row>, TableError> {
+        assert_eq!(args.len(), 4);
+        assert_eq!(args[0], "*");
+        assert_eq!(args[1], "where");
+        let filter_fn = self.schema.filter_fn(&args[2], &args[3])?;
+        self.get_all(filter_fn)
+    }
+
     pub fn print_table(&self) -> Result<(), TableError> {
         println!("{}", self.table_name);
-        let rows = BTree::new(self).get_all().expect("failed to fetch rows");
+        let rows = BTree::new(self)
+            .get_all(NO_FILTER)
+            .expect("failed to fetch rows");
         let header = line(self.schema.columns.iter().map(Column::to_string));
 
         let rule = "-".repeat(header.chars().count());
@@ -445,7 +461,7 @@ mod tests {
             let expected_count = (end.checked_sub(start).unwrap_or_default().abs() + 1) as usize;
             let start_key = Key::Integer(start);
             let end_key = Key::Integer(end);
-            let rows = BTree::new(self).get_range(&start_key, &end_key)?;
+            let rows = BTree::new(self).get_range(&start_key, &end_key, |_| true)?;
             let keys: Vec<Key> = rows
                 .iter()
                 .map(|r| Key::try_from(&r.fields[0]))
@@ -565,7 +581,9 @@ mod tests {
 
         table.print_table().expect("failed to print table");
 
-        let rows = BTree::new(&table).get_all().expect("failed to fetch rows");
+        let rows = BTree::new(&table)
+            .get_all(NO_FILTER)
+            .expect("failed to fetch rows");
 
         table.close().expect("failed to close table");
         bpm.close().expect("failed to close bpm");
@@ -575,7 +593,7 @@ mod tests {
         let new_table = Table::open(&new_bpm, TableId::new(1)).expect("failed to reopen table");
 
         let after_rows = BTree::new(&new_table)
-            .get_all()
+            .get_all(NO_FILTER)
             .expect("failed to fetch rows on reload");
 
         assert_eq!(rows, after_rows, "reload rows were different");
@@ -587,7 +605,7 @@ mod tests {
             "vacuum didn't shrink the file"
         );
 
-        assert_eq!(BTree::new(&new_table).get_all().unwrap(), rows);
+        assert_eq!(BTree::new(&new_table).get_all(NO_FILTER).unwrap(), rows);
         new_table.debug_check_space_accounting("post-vacuum reopen");
 
         new_table.close().expect("failed to close new table");

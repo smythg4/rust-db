@@ -278,8 +278,7 @@ impl Page {
                 writer.write_all(&page_count.to_be_bytes())?;
                 free_list_head.serialize(writer)?;
                 schema.serialize(writer)?;
-                let name_len = table_name.len().required_space();
-                writer.write_all(&name_len.encode_var_vec())?;
+                writer.write_all(&table_name.len().encode_var_vec())?;
                 writer.write_all(table_name.as_bytes())?;
                 Ok((0, 0))
             }

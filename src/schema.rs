@@ -249,6 +249,32 @@ impl ColumnType {
             Self::Integer | Self::String => true,
         }
     }
+
+    /// Converts raw &str into a `RowValue` based on underlying `Column`
+    /// TODO: Add support for strings surrounded by single quotes
+    pub fn parse_value(self, text: &str) -> Result<RowValue, SchemaError> {
+        let text = text.trim();
+        if text.eq_ignore_ascii_case("null") {
+            return Ok(RowValue::Null);
+        }
+        //let bad = || ParseValueError { text: text.to_string(), expected: self };
+        Ok(match self {
+            ColumnType::Integer => RowValue::Integer(text.parse()?),
+            ColumnType::Float => {
+                let f: f64 = text.parse()?;
+                if f.is_nan() {
+                    return Err(SchemaError::NanFloat);
+                } // NaN breaks ordering and equality
+                RowValue::Float(f)
+            }
+            ColumnType::Bool => match text.to_ascii_lowercase().as_str() {
+                "true" | "t" | "1" => RowValue::Boolean(true),
+                "false" | "f" | "0" => RowValue::Boolean(false),
+                _ => return Err(SchemaError::ParseBool),
+            },
+            ColumnType::String => RowValue::String(text.to_string()),
+        })
+    }
 }
 
 impl Serializable for ColumnType {
@@ -401,6 +427,16 @@ pub enum SchemaError {
     InvalidBool(u8),
     #[error(transparent)]
     Utf8Error(#[from] FromUtf8Error),
+    #[error("Column not found")]
+    ColumnNotFound,
+    #[error("Can't compare NaN values")]
+    NanFloat,
+    #[error("Failed to parse bool value")]
+    ParseBool,
+    #[error(transparent)]
+    ParseInt(#[from] std::num::ParseIntError),
+    #[error(transparent)]
+    ParseFloat(#[from] std::num::ParseFloatError),
 }
 
 /// ValidatedRow is the only type accepted for `insert` operations on the B+Tree
@@ -500,6 +536,28 @@ impl Schema {
         }
 
         Ok(ValidatedRow(row))
+    }
+
+    /// Returns a callback to filter a `Row` based on column value. Right now it just handles
+    /// equal to. E.g. `col_name: "name", value "bob"` returns true if a `Row`'s column for `"name"`
+    /// holds the value `"bob"`
+    /// TODO: Extend this to handle other comparison operations (e.g. <, >, etc). Will need to implement
+    /// a comparison scheme for `RowValue`
+    pub(crate) fn filter_fn(
+        &self,
+        col_name: &str,
+        value: &str,
+    ) -> Result<impl Fn(&Row) -> bool, SchemaError> {
+        let i = self
+            .columns
+            .iter()
+            .position(|c| c.name == col_name)
+            .ok_or(SchemaError::ColumnNotFound)?;
+
+        let value = self.columns[i].col_type.parse_value(value)?;
+
+        let res = move |row: &Row| row.fields.get(i).is_some_and(|rv| &value == rv);
+        Ok(res)
     }
 }
 

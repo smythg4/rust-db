@@ -177,7 +177,12 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
         Ok(curr_page.leaf_get(key)?.cloned())
     }
 
-    pub fn get_range(&self, start_key: &Key, end_key: &Key) -> Result<Vec<Row>, BTreeError> {
+    pub fn get_range(
+        &self,
+        start_key: &Key,
+        end_key: &Key,
+        filter_fn: impl Fn(&Row) -> bool,
+    ) -> Result<Vec<Row>, BTreeError> {
         let mut curr_page = self.get_root_read()?;
 
         // descend through the internal pages
@@ -194,6 +199,7 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
                 curr_page
                     .leaf_records_from(start_key)?
                     .filter(|r| r.cmp_key(end_key) != std::cmp::Ordering::Greater)
+                    .filter(|r| filter_fn(r))
                     .cloned(),
             );
             match curr_page.next()? {
@@ -205,13 +211,13 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
         Ok(result)
     }
 
-    pub fn get_all(&self) -> Result<Vec<Row>, BTreeError> {
+    pub fn get_all(&self, filter_fn: impl Fn(&Row) -> bool) -> Result<Vec<Row>, BTreeError> {
         // TODO: Add a schema helper that returns minimum key for that schema
         let min_key = Key::Integer(i64::MIN);
         // TODO: Add a schema helper that returns the max key for that schema
         let max_key = Key::String(String::from("a").repeat(100));
 
-        self.get_range(&min_key, &max_key)
+        self.get_range(&min_key, &max_key, filter_fn)
     }
 
     pub fn delete(&self, key: &Key) -> Result<Option<Row>, BTreeError> {

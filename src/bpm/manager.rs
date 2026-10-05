@@ -1,61 +1,16 @@
+use crate::bpm::{BpmError, Frame, PageReadGuard, PageWriteGuard};
 use crate::commontypes::{FrameId, PageId};
-use crate::page::{EMPTY_RAW, Page, PageError};
-
+use crate::page::{EMPTY_RAW, Page};
 use crate::traits::{DiskManager, EvictionPolicy, Serializable};
 use std::collections::HashMap;
-use std::ops::{Deref, DerefMut};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
-use thiserror::Error;
 
 pub const BUFFER_SIZE: usize = 512;
 
-#[derive(Debug, Error)]
-pub enum BpmError {
-    // TODO: Write actual error types
-    #[error("Unexpected error with a BPM operation")]
-    Unexpected,
-    #[error(transparent)]
-    Io(#[from] std::io::Error),
-    #[error(transparent)]
-    Page(#[from] PageError),
-    #[error("No free frames available")]
-    NoFreeFrames,
-    #[error("Page Id didn't match on fetch. Expected: {expected}, Got: {got}")]
-    WrongPage { expected: PageId, got: PageId },
-    #[error("Tried to create a page that already exists {0}")]
-    AlreadyExists(PageId),
-}
-
 // Dummy struct to hold me over until I actually make them
 struct Wal;
-
-#[derive(Default, Debug)]
-pub struct Frame {
-    latch: RwLock<Option<Page>>, // guards the page contents
-    pin_count: AtomicU32,
-    dirty: AtomicBool,
-    referenced: AtomicBool,
-}
-
-impl Frame {
-    /// Returns whether anybody holds an active reference to the `Frame`
-    pub(crate) fn is_pinned(&self) -> bool {
-        self.pin_count.load(Ordering::Acquire) != 0
-    }
-
-    /// Returns whether anybody holds an active reference to the `Frame`
-    pub(crate) fn is_dirty(&self) -> bool {
-        self.dirty.load(Ordering::Acquire)
-    }
-
-    /// Returns whether the frame was used since the last sweep, and clears the flag.
-    /// Used for clock eviction
-    pub(crate) fn take_referenced(&self) -> bool {
-        self.referenced.swap(false, Ordering::Acquire)
-    }
-}
 
 struct BpmState<Ep: EvictionPolicy> {
     page_table: HashMap<PageId, FrameId>,
@@ -66,7 +21,7 @@ struct BpmState<Ep: EvictionPolicy> {
 }
 
 pub struct BufferPoolManager<Dm: DiskManager, Ep: EvictionPolicy> {
-    frames: Box<[Frame]>,
+    pub(crate) frames: Box<[Frame]>,
     persistant_layer: Dm,
     // TODO: Replace this with refined concurrency control
     big_dumb_lock: Arc<Mutex<BpmState<Ep>>>,
@@ -115,11 +70,7 @@ impl<Dm: DiskManager, Ep: EvictionPolicy> BufferPoolManager<Dm, Ep> {
         let _ = self.pin_frame(frame_id);
         // this has to be down here to prevent another thread from evicting this frame after we grab it, but before we pin it
         drop(state);
-        Ok(PageWriteGuard {
-            bpm: self,
-            frame: frame_id,
-            data: Some(slot),
-        })
+        Ok(PageWriteGuard::new(self, frame_id, slot))
     }
 
     /// Returns a `ReadGuard` providing access to the `Page` associated with the given `PageId`
@@ -142,13 +93,8 @@ impl<Dm: DiskManager, Ep: EvictionPolicy> BufferPoolManager<Dm, Ep> {
                 got: pg.page_id(),
             });
         }
-        let data = Some(guard);
         // build and return a `PageReadGuard` with reference to the underlying data
-        Ok(PageReadGuard {
-            bpm: self,
-            frame,
-            data,
-        })
+        Ok(PageReadGuard::new(self, frame, guard))
     }
 
     /// Returns a `WriteGuard` providing mutable access to the `Page` associated with the given `PageId`
@@ -171,13 +117,8 @@ impl<Dm: DiskManager, Ep: EvictionPolicy> BufferPoolManager<Dm, Ep> {
                 got: pg.page_id(),
             });
         }
-        let data = Some(guard);
         // build and return a `PageWriteGuard` with reference to the underlying data
-        Ok(PageWriteGuard {
-            bpm: self,
-            frame,
-            data,
-        })
+        Ok(PageWriteGuard::new(self, frame, guard))
     }
 
     /// takes a `PageId` and `&mut BpmState` to provide a usable `FrameId` for the requested page.
@@ -284,7 +225,7 @@ impl<Dm: DiskManager, Ep: EvictionPolicy> BufferPoolManager<Dm, Ep> {
     }
     /// Decrements the `pin_count` for a given `FrameId`, called by `drop` on read and write guards.
     /// Returns the pin count before the decrement
-    fn unpin_frame(&self, id: FrameId) -> u32 {
+    pub(crate) fn unpin_frame(&self, id: FrameId) -> u32 {
         let prev = self.frames[id].pin_count.fetch_sub(1, Ordering::Release);
         debug_assert!(prev > 0, "unpinned frame {id:?} with pin_count 0");
         prev
@@ -337,90 +278,5 @@ impl<Dm: DiskManager, Ep: EvictionPolicy> Drop for BufferPoolManager<Dm, Ep> {
         if let Err(e) = self.flush_all() {
             log::error!("buffer pool flush on drop failed: {e}");
         }
-    }
-}
-
-pub struct PageReadGuard<'a, Dm: DiskManager, Ep: EvictionPolicy> {
-    bpm: &'a BufferPoolManager<Dm, Ep>,
-    frame: FrameId,
-    data: Option<RwLockReadGuard<'a, Option<Page>>>,
-}
-
-impl<'a, Dm: DiskManager, Ep: EvictionPolicy> std::fmt::Debug for PageReadGuard<'a, Dm, Ep> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Read Guard")
-            .field("Page", &self.data)
-            .finish()
-    }
-}
-
-pub struct PageWriteGuard<'a, Dm: DiskManager, Ep: EvictionPolicy> {
-    bpm: &'a BufferPoolManager<Dm, Ep>,
-    frame: FrameId,
-    data: Option<RwLockWriteGuard<'a, Option<Page>>>,
-}
-
-impl<'a, Dm: DiskManager, Ep: EvictionPolicy> std::fmt::Debug for PageWriteGuard<'a, Dm, Ep> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Write Guard")
-            .field("Page", &self.data)
-            .finish()
-    }
-}
-
-impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Drop for PageReadGuard<'a, Dm, Ep> {
-    fn drop(&mut self) {
-        // Drop ordering would normally drop the ReadGuard after unpinning, this forces the latch drop first
-        let _ = self.data.take();
-        self.bpm.unpin_frame(self.frame);
-    }
-}
-
-impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Drop for PageWriteGuard<'a, Dm, Ep> {
-    fn drop(&mut self) {
-        // Frame is marked dirty only through `DerefMut`, so we avoid marking dirty for `WriteGuard`
-        // acquisitions that didn't actually modify anything.
-
-        // Drop ordering would normally drop the WriteGuard after unpinning, this forces the latch drop first
-        let _ = self.data.take();
-        self.bpm.unpin_frame(self.frame);
-    }
-}
-
-impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Deref for PageReadGuard<'a, Dm, Ep> {
-    type Target = Page;
-    fn deref(&self) -> &Self::Target {
-        self.data
-            .as_ref()
-            .expect("guard is live until drop")
-            .as_ref()
-            .expect("pinned frame holds a page")
-    }
-}
-
-impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Deref for PageWriteGuard<'a, Dm, Ep> {
-    type Target = Page;
-    fn deref(&self) -> &Self::Target {
-        self.data
-            .as_ref()
-            .expect("guard is live until drop")
-            .as_ref()
-            .expect("pinned frame holds a page")
-    }
-}
-
-impl<'a, Dm: DiskManager, Ep: EvictionPolicy> DerefMut for PageWriteGuard<'a, Dm, Ep> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        // mark the frame as dirty -- always assuming that someone's gonna change something
-        // if they took a mutable reference.
-        self.bpm.frames[self.frame]
-            .dirty
-            .store(true, Ordering::Release);
-
-        self.data
-            .as_mut()
-            .expect("guard is live until drop")
-            .as_mut()
-            .expect("pinned frame holds a page")
     }
 }

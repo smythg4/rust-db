@@ -1,6 +1,5 @@
 use clap::Parser;
-use rust_db::bpm::BpmError;
-use rust_db::bpm::BufferPoolManager;
+use rust_db::bpm::{BpmError, BufferPoolManager};
 use rust_db::commontypes::TableId;
 use rust_db::disk::FileDisk;
 use rust_db::eviction::ClockEvictor;
@@ -28,7 +27,7 @@ const COMMANDS: &[(&str, &str)] = &[
     (".vacuum", "de-fragments the on disk storage"),
     ("insert", "insert <id> <email|null> <true|false>"),
     ("delete", "delete <id>"),
-    ("select", "select <id>"),
+    ("select", "select <id> (WHERE <col> <val>)"),
 ];
 
 fn main() {
@@ -60,8 +59,11 @@ fn main() {
         print!("rust-db > ");
         stdout.flush().unwrap();
         let line = stdin.next().unwrap().unwrap();
-        let parts: Vec<_> = line.split_whitespace().collect();
-        match parts[0] {
+        let parts: Vec<_> = line
+            .split_whitespace()
+            .map(|p| p.to_ascii_lowercase())
+            .collect();
+        match parts[0].as_str() {
             ".table" => table.print_table().unwrap(),
             ".quit" => {
                 table.close().expect("failed to close the table");
@@ -88,9 +90,13 @@ fn main() {
                 Ok(Some(r)) => println!("Removed: {r:?}"),
                 Err(e) => eprintln!("Error on delete: {e}"),
             },
-            "select" => match table.get_raw(&parts[1..]) {
+            "select" if parts.len() == 2 => match table.get_raw(&parts[1..]) {
                 Ok(None) => println!("{:?} not found in table", &parts[1..]),
                 Ok(Some(r)) => println!("Found: {r:?}"),
+                Err(e) => eprintln!("Error on get: {e}"),
+            },
+            "select" if parts.len() == 5 => match table.get_all_raw(&parts[1..]) {
+                Ok(v) => println!("Found: {v:?}"),
                 Err(e) => eprintln!("Error on get: {e}"),
             },
             command => println!("Unknown command: '{command}'"),
