@@ -5,6 +5,7 @@ use crate::page::{
     BorrowFailReason, CorruptionKind, MAX_LEAF_HEADER_SIZE, MergeFailReason, PAGE_SIZE, Page,
     PageBody, PageError,
 };
+use crate::schema::tests::{SchemaRowPair, SchemaWithRows};
 use crate::schema::{Row, RowValue, ValidatedRow};
 use crate::test_support::*;
 use crate::traits::Serializable;

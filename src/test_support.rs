@@ -5,6 +5,7 @@ use crate::page::{
 };
 use crate::schema::{Column, Row, RowValue, Schema, ValidatedRow};
 use crate::traits::Serializable;
+use quickcheck::{Arbitrary, Gen};
 use std::io::Cursor;
 
 /// Like `assert!(matches!(..))`, but prints the actual value on failure.
@@ -195,4 +196,10 @@ pub(crate) fn try_split(page: &mut Page, new_id: PageId) -> Option<(Key, Page)> 
         Err(PageError::TooSmallToSplit(_)) => None,
         Err(e) => panic!("Unexpected split error: {e:?}"),
     }
+}
+
+/// A length in `0..=max`, scaled by quickcheck's size parameter (`QUICKCHECK_GENERATOR_SIZE`,
+/// default 100) so every generator grows and shrinks together.
+pub(crate) fn gen_len(g: &mut Gen, max: usize) -> usize {
+    usize::arbitrary(g) % (max.min(g.size()) + 1)
 }
