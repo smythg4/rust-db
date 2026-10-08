@@ -1,4 +1,5 @@
 use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
@@ -58,11 +59,18 @@ impl DiskManager for FileDisk {
         let temp_path = self.path.with_extension("vac");
         let mut temp_file = std::fs::File::create(&temp_path)?;
         for page in pages {
-            page.serialize(&mut temp_file)
-                .expect("failed to serialize on swap");
+            temp_file.seek(SeekFrom::Start(
+                page.page_id().get_page_num() as u64 * PAGE_SIZE as u64,
+            ))?;
+            page.serialize(&mut temp_file).expect("write failed");
         }
+        temp_file.sync_all()?;
         std::fs::rename(&temp_path, &self.path)?;
-        let _ = std::fs::remove_file(&temp_path);
+        if let Some(dir) = self.path.parent() {
+            std::fs::File::open(dir)?.sync_all()?; // make the rename itself durable
+        }
+        let mut guard = self.file.write().unwrap();
+        *guard = OpenOptions::new().read(true).write(true).open(&self.path)?;
         Ok(())
     }
 }

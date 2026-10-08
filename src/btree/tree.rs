@@ -304,7 +304,10 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
         }
 
         // the loop only leaves `page` as an internal page with no ancestors if it walked all the way up to the root
-        if ancestors.is_empty() && page.is_internal() && page.num_items() == 0 {
+        if page.page_id() == self.table.root_id().expect("failed to fetch table root id")
+            && page.is_internal()
+            && page.num_items() == 0
+        {
             let only_child = *page
                 .children()
                 .expect("internal")

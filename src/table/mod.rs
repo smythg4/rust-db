@@ -35,7 +35,6 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
             schema,
             table_name,
         };
-        //table.debug_check_space_accounting("open");
         Ok(table)
     }
 
@@ -43,9 +42,7 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
     /// tree or on the free list. Does not flush: durability is the buffer pool's job, so call
     /// `BufferPoolManager::close` to persist changes.
     pub fn close(self) -> Result<(), TableError> {
-        let rows = BTree::new(&self).get_all(NO_FILTER)?;
-        println!("Rows: {}", rows.len());
-        self.debug_check_space_accounting("close");
+        log::debug!("Closing table...");
         Ok(())
     }
 
@@ -89,7 +86,7 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
             schema,
             table_name: name.to_string(),
         };
-        //table.debug_check_space_accounting("create");
+        table.debug_check_space_accounting("create");
         Ok(table)
     }
 
@@ -100,11 +97,9 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
             let mut free_guard = self.bpm.fetch_write(free_list_head)?;
             meta_guard.free_list_pop(&free_guard)?;
             *free_guard = Page::empty_page(free_guard.page_id(), PageBody::Free { next: None });
-            self.debug_check_space_accounting("allocate");
             Ok(free_guard)
         } else {
             let new_free_id = meta_guard.meta_bump_page_count()?;
-            //self.debug_check_space_accounting("allocate");
             Ok(self
                 .bpm
                 .new_page(Page::empty_page(new_free_id, PageBody::Free { next: None }))?)
@@ -228,7 +223,6 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
                     &mut curr_page,
                     new_leaf(&mut next_page_num),
                 ));
-                curr_page = new_leaf(&mut next_page_num);
                 let validated_row = self.schema.validate_row(row)?;
                 curr_page.leaf_insert(validated_row)?;
             }
