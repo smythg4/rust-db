@@ -6,6 +6,8 @@ use crate::page::{ChildIndex, Page, PageError};
 use crate::schema::{Row, ValidatedRow};
 use crate::table::Table;
 use crate::traits::{DiskManager, EvictionPolicy};
+use std::cmp::Ordering;
+use std::ops::{Bound, RangeBounds};
 
 pub struct BTree<'t, Dm: DiskManager, Ep: EvictionPolicy> {
     table: &'t Table<'t, Dm, Ep>,
@@ -173,45 +175,49 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
 
     pub fn get_range(
         &self,
-        start_key: &Key,
-        end_key: &Key,
+        range: impl RangeBounds<Key>,
         filter_fn: impl Fn(&Row) -> bool,
     ) -> Result<Vec<Row>, BTreeError> {
+        let (start, end) = (range.start_bound(), range.end_bound());
         let mut curr_page = self.get_root_read()?;
 
-        // descend through the internal pages
-        while curr_page.is_internal()
-            && let Some(ch) = curr_page.find_child(start_key)
-        {
-            curr_page = self.table.bpm.fetch_read(ch)?;
+        while curr_page.is_internal() {
+            let child = match start {
+                Bound::Unbounded => curr_page
+                    .children()
+                    .expect("internal page")
+                    .next()
+                    .expect("internal page has a child"),
+                Bound::Included(k) | Bound::Excluded(k) => {
+                    &curr_page.find_child(k).expect("internal page")
+                }
+            };
+            curr_page = self.table.bpm.fetch_read(*child)?;
         }
 
-        let mut result = Vec::with_capacity(curr_page.num_items());
-
-        loop {
-            result.extend(
-                curr_page
-                    .leaf_records_from(start_key)?
-                    .filter(|r| r.cmp_key(end_key) != std::cmp::Ordering::Greater)
-                    .filter(|r| filter_fn(r))
-                    .cloned(),
-            );
+        let mut result = Vec::new();
+        'leaves: loop {
+            for row in curr_page.records().expect("leaf page") {
+                if before_start(row, start) {
+                    continue;
+                }
+                if past_end(row, end) {
+                    break 'leaves;
+                }
+                if filter_fn(row) {
+                    result.push(row.clone());
+                }
+            }
             match curr_page.next()? {
                 None => break,
                 Some(n) => curr_page = self.table.bpm.fetch_read(n)?,
             }
         }
-
         Ok(result)
     }
 
     pub fn get_all(&self, filter_fn: impl Fn(&Row) -> bool) -> Result<Vec<Row>, BTreeError> {
-        // TODO: Add a schema helper that returns minimum key for that schema
-        let min_key = Key::Integer(i64::MIN);
-        // TODO: Add a schema helper that returns the max key for that schema
-        let max_key = Key::String(String::from("a").repeat(100));
-
-        self.get_range(&min_key, &max_key, filter_fn)
+        self.get_range(.., filter_fn)
     }
 
     pub fn delete(&self, key: &Key) -> Result<Option<Row>, BTreeError> {
@@ -322,5 +328,21 @@ impl<'t, 'bpm, Dm: DiskManager, Ep: EvictionPolicy> BTree<'t, Dm, Ep> {
                 .expect("failed to free lonely root page");
         }
         Ok(())
+    }
+}
+
+fn before_start(row: &Row, start: Bound<&Key>) -> bool {
+    match start {
+        Bound::Unbounded => false,
+        Bound::Included(k) => row.cmp_key(k) == Ordering::Less,
+        Bound::Excluded(k) => row.cmp_key(k) != Ordering::Greater,
+    }
+}
+
+fn past_end(row: &Row, start: Bound<&Key>) -> bool {
+    match start {
+        Bound::Unbounded => false,
+        Bound::Included(k) => row.cmp_key(k) == Ordering::Greater,
+        Bound::Excluded(k) => row.cmp_key(k) != Ordering::Less,
     }
 }

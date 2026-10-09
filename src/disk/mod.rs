@@ -77,3 +77,6 @@ impl DiskManager for FileDisk {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+pub(crate) use tests::FakeDisk;

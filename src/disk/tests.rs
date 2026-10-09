@@ -7,7 +7,7 @@ use std::sync::Mutex;
 
 #[allow(dead_code)] // used for tests only
 #[derive(Default)]
-struct FakeDisk {
+pub(crate) struct FakeDisk {
     stuff: Mutex<HashMap<PageId, RawPage>>,
 }
 

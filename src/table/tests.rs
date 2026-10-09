@@ -13,7 +13,7 @@ impl<'t, Dm: DiskManager, Ep: EvictionPolicy> Table<'t, Dm, Ep> {
         let expected_count = (end.checked_sub(start).unwrap_or_default().abs() + 1) as usize;
         let start_key = Key::Integer(start);
         let end_key = Key::Integer(end);
-        let rows = BTree::new(self).get_range(&start_key, &end_key, |_| true)?;
+        let rows = BTree::new(self).get_range(&start_key..=&end_key, |_| true)?;
         let keys: Vec<Key> = rows
             .iter()
             .map(|r| Key::try_from(&r.fields[0]))
