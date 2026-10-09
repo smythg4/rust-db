@@ -13,12 +13,19 @@ Show
 
 Type "./target/release/repl /tmp/demo.db" Enter
 Wait /rust-db >\s*$/
+Sleep 500ms
 Type "insert 1 alice@example.com true" Enter
 Wait /rust-db >\s*$/
+Sleep 500ms
+Type "insert 1 charlie@example.com false" Enter
+Wait /rust-db >\s*$/
+Sleep 2s
 Type "insert 2 null false" Enter
 Wait /rust-db >\s*$/
+Sleep 500ms
 Type "insert 3 bob@example.com true" Enter
 Wait /rust-db >\s*$/
+Sleep 500ms
 Type ".table" Enter
 Wait /rust-db >\s*$/
 Sleep 1.5s
@@ -30,9 +37,10 @@ Type "# restart: the data is still there" Enter
 Wait /^>\s*$/
 Type "./target/release/repl /tmp/demo.db" Enter
 Wait /rust-db >\s*$/
+Sleep 500ms
 Type "select * where active true" Enter
 Wait /rust-db >\s*$/
-Sleep 2s
+Sleep 3s
 Type ".quit" Enter
 Wait /^>\s*$/
 Sleep 1s
