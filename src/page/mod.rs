@@ -1,7 +1,7 @@
-use crate::commontypes::{Key, Lsn, PageId, PageLsn, SlotEntry};
-use crate::commontypes::{PAGE_ID_SIZE, SLOT_ENTRY_SIZE};
-use crate::schema::{Row, Schema, SchemaError, ValidatedRow};
+use crate::schema::{Key, Row, Schema, SchemaError, ValidatedRow};
 use crate::traits::Serializable;
+use crate::types::{Lsn, PageId, PageLsn, SlotEntry};
+use crate::types::{PAGE_ID_SIZE, SLOT_ENTRY_SIZE};
 use std::cmp::Ordering;
 use std::io::Cursor;
 use std::ops::Range;

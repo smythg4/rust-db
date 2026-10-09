@@ -2,14 +2,14 @@ pub(crate) mod generators;
 
 pub(crate) use generators::{SchemaRowPair, SchemaWithRows};
 
-use crate::commontypes::{Key, PAGE_ID_SIZE, SLOT_ENTRY_SIZE};
 use crate::schema::{
-    BOOL_FLAG, Column, ColumnType, FLOAT_FLAG, INT_FLAG, MAX_FIELD_LEN, MAX_INTERNAL_ENTRY_SIZE,
-    MAX_LEAF_ENTRY_SIZE, MAX_NUM_FIELDS, NULL_FLAG, Row, RowError, RowValue, RowValueError,
-    STRING_FLAG, Schema, SchemaError,
+    BOOL_FLAG, Column, ColumnType, FLOAT_FLAG, INT_FLAG, Key, MAX_FIELD_LEN,
+    MAX_INTERNAL_ENTRY_SIZE, MAX_LEAF_ENTRY_SIZE, MAX_NUM_FIELDS, NULL_FLAG, Row, RowError,
+    RowValue, RowValueError, STRING_FLAG, Schema, SchemaError,
 };
 use crate::test_support::*;
 use crate::traits::Serializable;
+use crate::types::{PAGE_ID_SIZE, SLOT_ENTRY_SIZE};
 
 use quickcheck::{Arbitrary, Gen, TestResult};
 use quickcheck_macros::quickcheck;

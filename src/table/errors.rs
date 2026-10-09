@@ -1,8 +1,8 @@
 use crate::bpm::BpmError;
 use crate::btree::BTreeError;
-use crate::commontypes::TableId;
 use crate::page::PageError;
 use crate::schema::SchemaError;
+use crate::types::TableId;
 use thiserror::Error;
 
 #[derive(Debug, Error)]

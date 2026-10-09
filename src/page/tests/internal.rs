@@ -1,13 +1,13 @@
-use crate::commontypes::{Key, Lsn, PAGE_ID_SIZE, PageId, PageLsn, SLOT_ENTRY_SIZE, TableId};
 use crate::page::internal::{ChildIndex, KeyIndex};
 use crate::page::tests::generators::*;
 use crate::page::{
     BorrowFailReason, CorruptionKind, MAX_INTERNAL_ENTRY_SIZE, MAX_INTERNAL_HEADER_SIZE, Page,
     PageBody, PageError,
 };
-use crate::schema::{Row, RowValue, SchemaError, ValidatedRow};
+use crate::schema::{Key, Row, RowValue, SchemaError, ValidatedRow};
 use crate::test_support::*;
 use crate::traits::Serializable;
+use crate::types::{Lsn, PAGE_ID_SIZE, PageId, PageLsn, SLOT_ENTRY_SIZE, TableId};
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
 

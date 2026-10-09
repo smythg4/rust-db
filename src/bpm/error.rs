@@ -1,5 +1,5 @@
-use crate::commontypes::PageId;
 use crate::page::PageError;
+use crate::types::PageId;
 use thiserror::Error;
 
 #[derive(Debug, Error)]

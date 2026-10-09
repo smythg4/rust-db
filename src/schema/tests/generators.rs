@@ -1,6 +1,5 @@
-use crate::commontypes::Key;
 use crate::page::Page;
-use crate::schema::{Column, ColumnType, Row, RowValue, Schema, ValidatedRow};
+use crate::schema::{Column, ColumnType, Key, Row, RowValue, Schema, ValidatedRow};
 use crate::schema::{MAX_INTERNAL_ENTRY_SIZE, MAX_LEAF_ENTRY_SIZE, MAX_NUM_FIELDS};
 use crate::test_support::gen_len;
 use quickcheck::{Arbitrary, Gen};
@@ -197,5 +196,23 @@ impl Arbitrary for SchemaRowPair {
             r.fields.remove(i);
             SchemaRowPair(s, r)
         }))
+    }
+}
+
+impl Arbitrary for Key {
+    fn arbitrary(g: &mut Gen) -> Self {
+        let coin_flip = bool::arbitrary(g);
+        if coin_flip {
+            Key::Integer(i64::arbitrary(g))
+        } else {
+            Key::String(String::arbitrary(g))
+        }
+    }
+
+    fn shrink(&self) -> Box<dyn Iterator<Item = Self>> {
+        match self {
+            Key::Integer(n) => Box::new(n.shrink().map(Key::Integer)),
+            Key::String(s) => Box::new(s.shrink().map(Key::String)),
+        }
     }
 }

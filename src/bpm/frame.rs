@@ -2,6 +2,8 @@ use std::sync::RwLock;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 use crate::page::Page;
+use crate::types::FrameId;
+use std::ops::Index;
 
 #[derive(Default, Debug)]
 pub struct Frame {
@@ -26,5 +28,13 @@ impl Frame {
     /// Used for clock eviction
     pub(crate) fn take_referenced(&self) -> bool {
         self.referenced.swap(false, Ordering::Acquire)
+    }
+}
+
+/// Allows us to index our bpm slices (Box<[Frame]>) using `FrameId`
+impl Index<FrameId> for [Frame] {
+    type Output = Frame;
+    fn index(&self, id: FrameId) -> &Self::Output {
+        &self[id.get()]
     }
 }

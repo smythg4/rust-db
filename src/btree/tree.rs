@@ -1,9 +1,8 @@
 use crate::bpm::{PageReadGuard, PageWriteGuard};
 use crate::btree::BTreeError;
 use crate::btree::sibling::{Side, pick_sibling};
-use crate::commontypes::Key;
 use crate::page::{ChildIndex, Page, PageError};
-use crate::schema::{Row, ValidatedRow};
+use crate::schema::{Key, Row, ValidatedRow};
 use crate::table::Table;
 use crate::traits::{DiskManager, EvictionPolicy};
 use std::cmp::Ordering;

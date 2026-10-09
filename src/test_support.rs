@@ -1,10 +1,10 @@
-use crate::commontypes::{Key, PAGE_ID_SIZE, PageId, SLOT_ENTRY_SIZE, TableId};
 use crate::page::{
     CHECKSUM_OFFSET, MAX_INTERNAL_ENTRY_SIZE, MAX_LEAF_ENTRY_SIZE, MAX_LEAF_HEADER_SIZE, Page,
     PageBody, PageError, RawPage,
 };
-use crate::schema::{Column, Row, RowValue, Schema, ValidatedRow};
+use crate::schema::{Column, Key, Row, RowValue, Schema, ValidatedRow};
 use crate::traits::Serializable;
+use crate::types::{PAGE_ID_SIZE, PageId, SLOT_ENTRY_SIZE, TableId};
 use quickcheck::{Arbitrary, Gen};
 use std::io::Cursor;
 

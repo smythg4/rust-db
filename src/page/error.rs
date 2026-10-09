@@ -1,5 +1,5 @@
-use crate::commontypes::{Key, KeyError, Lsn, LsnError, PageId};
-use crate::schema::{RowValue, RowValueError, SchemaError};
+use crate::schema::{Key, KeyError, RowValue, RowValueError, SchemaError};
+use crate::types::{Lsn, LsnError, PageId};
 use std::ops::Range;
 use std::string::FromUtf8Error;
 use thiserror::Error;

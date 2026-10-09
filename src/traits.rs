@@ -1,6 +1,6 @@
 use crate::bpm::Frame;
-use crate::commontypes::{FrameId, PageId};
 use crate::page::{Page, RawPage};
+use crate::types::{FrameId, PageId};
 use std::io::ErrorKind;
 use std::io::{Read, Write};
 

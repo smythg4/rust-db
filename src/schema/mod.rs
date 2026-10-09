@@ -1,7 +1,9 @@
+mod key;
+
+pub use key::{Key, KeyError};
 #[cfg(test)]
 pub(crate) mod tests;
 
-use crate::commontypes::Key;
 use crate::page::{MAX_INTERNAL_ENTRY_SIZE, MAX_LEAF_ENTRY_SIZE, Page};
 use crate::traits::Serializable;
 use integer_encoding::*;

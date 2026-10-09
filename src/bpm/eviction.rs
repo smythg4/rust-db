@@ -1,6 +1,6 @@
 use crate::bpm::Frame;
-use crate::commontypes::FrameId;
 use crate::traits::EvictionPolicy;
+use crate::types::FrameId;
 
 /// Note: This ClockEvictor needs to live behind a `Mutex` in the `BufferPoolManager`
 /// This may change once I remove the big dumb lock from my BPM.

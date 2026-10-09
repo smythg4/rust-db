@@ -1,9 +1,9 @@
 use crate::bpm::{BpmError, BufferPoolManager, PageWriteGuard};
 use crate::btree::BTree;
-use crate::commontypes::{Key, PageId, TableId};
 use crate::page::{PAGE_SIZE, Page, PageBody};
-use crate::schema::{Column, ColumnType, Row, RowValue, Schema};
+use crate::schema::{Column, ColumnType, Key, Row, RowValue, Schema};
 use crate::traits::{DiskManager, EvictionPolicy};
+use crate::types::{PageId, TableId};
 use std::collections::HashSet;
 
 const NO_FILTER: fn(&Row) -> bool = |_| true;

@@ -1,13 +1,12 @@
-use crate::commontypes::{Key, Lsn, PAGE_ID_SIZE};
 use crate::page::tests::generators::{InternalPage, LeafPage};
 use crate::page::{
     CHECKSUM_OFFSET, CorruptionKind, MAX_INTERNAL_HEADER_SIZE, MAX_LEAF_HEADER_SIZE,
     MAX_LEAF_ITEMS, MergeFailReason, PAGE_SIZE, Page, PageBody, PageError,
 };
-use crate::schema::Row;
-use crate::schema::RowValue;
+use crate::schema::{Key, Row, RowValue};
 use crate::test_support::*;
 use crate::traits::Serializable;
+use crate::types::{Lsn, PAGE_ID_SIZE};
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
 use std::cmp::Ordering;

@@ -3,9 +3,9 @@ use std::sync::atomic::Ordering;
 use std::sync::{RwLockReadGuard, RwLockWriteGuard};
 
 use crate::bpm::BufferPoolManager;
-use crate::commontypes::FrameId;
 use crate::page::Page;
 use crate::traits::{DiskManager, EvictionPolicy};
+use crate::types::FrameId;
 
 pub struct PageReadGuard<'a, Dm: DiskManager, Ep: EvictionPolicy> {
     bpm: &'a BufferPoolManager<Dm, Ep>,

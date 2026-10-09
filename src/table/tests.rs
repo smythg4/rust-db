@@ -1,12 +1,12 @@
 use crate::bpm::{BufferPoolManager, ClockEvictor};
 use crate::btree::{BTree, BTreeError};
-use crate::commontypes::{Key, TableId};
 use crate::disk::FileDisk;
 use crate::page::{PAGE_SIZE, PageError};
-use crate::schema::Column;
+use crate::schema::{Column, Key};
 use crate::schema::{Row, RowValue, Schema};
 use crate::table::{NO_FILTER, Table, TableError};
 use crate::traits::{DiskManager, EvictionPolicy};
+use crate::types::TableId;
 
 impl<'t, Dm: DiskManager, Ep: EvictionPolicy> Table<'t, Dm, Ep> {
     fn check_row_keys_order(&self, start: i64, end: i64) -> Result<(), TableError> {

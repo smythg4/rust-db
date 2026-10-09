@@ -1,9 +1,9 @@
 use clap::Parser;
 use rust_db::bpm::{BpmError, BufferPoolManager, ClockEvictor};
-use rust_db::commontypes::TableId;
 use rust_db::disk::FileDisk;
 use rust_db::schema::{Column, Schema};
 use rust_db::table::{Table, TableError};
+use rust_db::types::TableId;
 use std::io::Write;
 use std::path::PathBuf;
 

@@ -1,11 +1,11 @@
-use crate::commontypes::{Key, PageId, PageLsn, SlotEntry};
 use crate::page::{
     CHECKSUM_OFFSET, FREE_TAG, INTERNAL_TAG, LEAF_TAG, MAX_INTERNAL_ITEMS, MAX_LEAF_ITEMS,
     META_TAG, PAGE_ID_SIZE, PAGE_SIZE, SLOT_ENTRY_SIZE,
 };
 use crate::page::{CorruptionKind, Page, PageBody, PageError, RawPage};
-use crate::schema::{Row, Schema};
+use crate::schema::{Key, Row, Schema};
 use crate::traits::Serializable;
+use crate::types::{PageId, PageLsn, SlotEntry};
 use crc32_light::Crc32Stream;
 use integer_encoding::{VarInt, VarIntReader};
 use std::io::{Cursor, Read, Seek, SeekFrom, Write};

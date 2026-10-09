@@ -1,5 +1,5 @@
-use crate::commontypes::*;
 use crate::page::*;
+use crate::types::*;
 
 /// Position of a child pointer in an internal page (0..=keys.len()).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

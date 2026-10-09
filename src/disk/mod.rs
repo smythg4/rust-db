@@ -4,9 +4,9 @@ use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use crate::commontypes::PageId;
 use crate::page::{PAGE_SIZE, Page, RawPage};
 use crate::traits::{DiskManager, Serializable};
+use crate::types::PageId;
 
 pub struct FileDisk {
     file: Arc<RwLock<File>>,

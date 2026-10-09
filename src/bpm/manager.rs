@@ -1,7 +1,7 @@
 use crate::bpm::{BpmError, Frame, PageReadGuard, PageWriteGuard};
-use crate::commontypes::{FrameId, PageId};
 use crate::page::{EMPTY_RAW, Page};
 use crate::traits::{DiskManager, EvictionPolicy, Serializable};
+use crate::types::{FrameId, PageId};
 use std::collections::HashMap;
 
 use std::sync::atomic::Ordering;

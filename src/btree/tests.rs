@@ -4,11 +4,11 @@ use std::collections::BTreeMap;
 use std::collections::btree_map::Entry;
 
 use crate::bpm::{BufferPoolManager, Replacer};
-use crate::commontypes::{Key, TableId};
 use crate::disk::FakeDisk;
+use crate::types::TableId;
 
-use crate::schema::Row;
 use crate::schema::tests::SchemaWithRows;
+use crate::schema::{Key, Row};
 use crate::table::Table;
 
 #[quickcheck]

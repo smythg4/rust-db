@@ -1,4 +1,3 @@
-use crate::commontypes::{Key, Lsn, PAGE_ID_SIZE, PageId, PageLsn, TableId};
 use crate::page::internal::{ChildIndex, KeyIndex};
 use crate::page::tests::generators::*;
 use crate::page::{
@@ -6,9 +5,10 @@ use crate::page::{
     PageBody, PageError,
 };
 use crate::schema::tests::{SchemaRowPair, SchemaWithRows};
-use crate::schema::{Row, RowValue, ValidatedRow};
+use crate::schema::{Key, Row, RowValue, ValidatedRow};
 use crate::test_support::*;
 use crate::traits::Serializable;
+use crate::types::{Lsn, PAGE_ID_SIZE, PageId, PageLsn, TableId};
 use quickcheck::TestResult;
 use quickcheck_macros::quickcheck;
 use std::cmp::Ordering;

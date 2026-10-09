@@ -1,6 +1,6 @@
-use crate::commontypes::PageId;
 use crate::page::{Page, RawPage};
 use crate::traits::DiskManager;
+use crate::types::PageId;
 
 use std::collections::HashMap;
 use std::sync::Mutex;

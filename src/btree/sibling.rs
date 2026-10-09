@@ -1,5 +1,6 @@
-use crate::commontypes::{Key, PageId};
 use crate::page::{ChildIndex, Page};
+use crate::schema::Key;
+use crate::types::PageId;
 
 pub(crate) enum Side {
     Left,
