@@ -359,11 +359,8 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
         self.get_all(filter_fn)
     }
 
-    pub fn print_table(&self) -> Result<(), TableError> {
+    pub fn print_rows(&self, rows: &[Row]) -> Result<(), TableError> {
         println!("{}", self.table_name);
-        let rows = BTree::new(self)
-            .get_all(NO_FILTER)
-            .expect("failed to fetch rows");
         let header = line(self.schema.columns.iter().map(Column::to_string));
 
         let rule = "-".repeat(header.chars().count());
@@ -376,7 +373,7 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
 
         println!("{rule}\n{header}\n{rule}");
         if rows.len() <= 10 {
-            print_rows(&rows);
+            print_rows(rows);
         } else {
             print_rows(&rows[..5]);
             println!(
@@ -388,6 +385,13 @@ impl<'a, Dm: DiskManager, Ep: EvictionPolicy> Table<'a, Dm, Ep> {
         println!("{rule}\n({} rows)", rows.len());
 
         Ok(())
+    }
+
+    pub fn print_table(&self) -> Result<(), TableError> {
+        let rows = BTree::new(self)
+            .get_all(NO_FILTER)
+            .expect("failed to fetch rows");
+        self.print_rows(&rows)
     }
 }
 

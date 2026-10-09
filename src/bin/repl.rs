@@ -95,7 +95,10 @@ fn main() {
                 Err(e) => eprintln!("Error on get: {e}"),
             },
             "select" if parts.len() == 5 => match table.get_all_raw(&parts[1..]) {
-                Ok(v) => println!("Found: {v:?}"),
+                Ok(v) => {
+                    println!("Found:");
+                    table.print_rows(&v).unwrap();
+                }
                 Err(e) => eprintln!("Error on get: {e}"),
             },
             command => println!("Unknown command: '{command}'"),

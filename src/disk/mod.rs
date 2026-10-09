@@ -50,8 +50,6 @@ impl DiskManager for FileDisk {
 
     fn sync(&self) -> std::io::Result<()> {
         let guard = self.file.write().unwrap();
-        let size = std::fs::metadata(&self.path).unwrap().len() as f64 / (1024 * 1024) as f64;
-        println!("File Size: {size:.2}MB");
         guard.sync_all()
     }
 
