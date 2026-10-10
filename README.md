@@ -1,8 +1,8 @@
 ## rust-db
-A project focused on learning more about databases.
+A learning project about databases: B+Tree Storage Engine, Buffer Pool Manager, Concurrent Operations, Write Ahead Logs, Transactions, Query Engine, and eventually Consensus.
 
 ### Current Status
-I added a super naive filter capability. Since the page methods that get `Row`s are lazy iterators, a `filter` clause avoids unnecessary allocations when results are collected. `Scheme` now has a method `filter_fn` that accepts a `&str` `column_name` and `&RowValue` `value`, it will generate a closure that can be passed to `BTree` operations `get_all` and `get_range` to filter the ultimate output.
+I spent some time restructuring the project and tidying up the REPL output. I added a couple basic `BTree` tests, but I still have a lot of tests to write before moving on to the `Wal`.
 
 Run simple REPL with `cargo run --bin repl -- data/test.db --pool-size 100`. CLI arguments are a filepath (required) and pool-size (optional) which defaults to 64.
 
@@ -20,36 +20,9 @@ QUICKCHECK_TESTS=10000 cargo test
 ```
 
 ### Immediate To-Do
+[To Do List](TODO.md)
 
-#### Merges
-- [ ] underfull guarantee: two leaves just under `LEAF_UNDERFULL_BYTES` merge successfully
-- [ ] underfull guarantee: two internal pages just under `INTERNAL_UNDERFULL_BYTES` + a max-size separator merge successfully
-
-#### Accessors and small functions
-- [ ] `can_insert_separator`: exact fit → true, one byte over → false, leaf → false
-- [ ] `is_underfull`: exactly at each threshold, all 4 page types
-- [x] `split_page`: 0 or 1 rows, or fewer than 3 keys → `TooSmallToSplit`
-
-#### Routing and indexes
-- [x] `child_at` / `key_at`: out of range → `None`; on a leaf → `None`
-- [ ] `ChildIndex` navigation: index 0 has no left sibling/separator; for every child, keys routed to it lie between `key_at(left_separator)` and `key_at(right_separator)`
-
-#### Invariants and size limits
-- [ ] `check_invariants` returns: `RowTooLarge`, `KeyTooLarge`.
-- [ ] crafted string length prefix over `MAX_FIELD_LEN` → `FieldTooLong` on read
-- [ ] `validate_row`: largest payload from `leaf_schema()` helper at the limit accepted, one byte over → `FieldTooLong`
-
-#### Corruption kinds without a targeted test
-- [ ] `InvalidTag`, `InvalidPointerTag`, `CorruptRow`, `ExceedsCapacity`, `RowTooLarge` / `KeyTooLarge`, `ExceedsCapacity` from `deserialize`
-
-#### Generators and helpers
-- [ ] `MAX_*_ITEMS` never too low (smallest distinct entries never exceed it)
-
-#### `Meta`/`Free` Tests
-- [ ] `free_list_push` and `free_list_pop` tests
-
-
-### Phase 0 — Types
+### Phase 0 — Types (Done)
 - When following the [cstack database tutorial](https://github.com/smythg4/cstack_db), raw `u32` and `usize` abounded. This time, I opted to create custom types for things like `PageId`, `SlotIndex`, `SlotEntry`, `Key`, `Row`, `RowValue`, and `ValidatedRow` for example.
 - Compile time checks will prevent users from using the wrong type of arguments (e.g. `PageId` when `SlotIndex` is required).
 - One very nice touch is the concept of `ValidatedRow`. A `Table` can hold a `Schema`. When performing an `insert` operation, the `Page` object requires that argument is a `ValidatedRow`. `Schema` includes a method called `validate_row(row: Row) -> Result<ValidatedRow, SchemaError>`, which ensures that any `Row` inserted into a `Page` conforms to the `Schema`'s rules to prevent the input of junk data.
@@ -58,14 +31,14 @@ QUICKCHECK_TESTS=10000 cargo test
   - There's lots of cloning and allocations going on (e.g. `ValidatedRow` -> `Key` clones the underlying `String` if that's its type).
   - I may swap out `Key::String(String)` for `Key::String(&str)`, but I'm somewhat dreading the injection of a million lifetimes. Perhaps `Key::String(Cow<str>)` or `Key::String(Arc<str>)` will be the right call.
 
-### Phase 1 — Storage Layout
+### Phase 1 — Storage Layout (Done for Now)
 - In-table data is represented as a `RowValue`, which currently supports `Integer(i64)`, `String(String)`, `Boolean(bool)`, `Float(f64)`, and `Null`.
 - `Schemas` hold `Columns` that are made up of `ColumnType` and a `nullable` flag. Primary Keys are always stored in the first element of the underlying `Vec`. Primary Keys can only be non-nullable `String` or `Integer` right now and a new `Schema` will be rejected if the first entry doesn't meet these requirements.
 - The fundamental unit of storage `Page` holds core metadata like `page_id: PageId` and `Lsn` (not currently used, but will be important for WAL implementation), as well as a `PageBody` that is either a `Leaf`, `Internal`, `Meta`, or `Free`.
   - `Internal` page bodies hold a list of keys and child `PageId`s. There should always be 1 more child than keys. This is enforced through `debug_assert!`s for operations on `Page`s and `PageError::Corrupt { kind }` for deserialization.
   - `Leaf` page bodies hold a list of `Rows` and sibling pointers (`next: Option<PageId>`, `prev: Option<PageId>`) to allow quicker sequential scans.
   - `Meta` page bodies contain all the `Table` metadata including `root_page_id`, `num_pages`, the table `Schema`, and a `free_list_head` pointer.
-  - `Free` page bodies only contain a single value `next: Option<PageId>` and act as entries in a linked list of a `Page`s that have been freed through merge operations.
+  - `Free` page bodies only contain a single value `next: Option<PageId>` and act as entries in a linked list of `Page`s that have been freed through merge operations.
 ```
 #[derive(Debug, PartialEq, Clone)]
 pub struct Page {
@@ -136,10 +109,10 @@ pub enum PageBody {
   | `offset` | 2 | byte offset from the start of the page |
   | `length` | 2 | length of the encoded row or key |
   
-### Phase 2 — BufferPoolManager
+### Phase 2 — BufferPoolManager (Done for Now, Tests Pending)
 - Is in charge of handing out `Frames` that hold in-memory representations of the `Page`s on disk. It requires both a `DiskManager` and an `EvictionPolicy` on creation.
-  - `DiskManager` represents the underlying persistent layer. By making it a trait I am able to keep a quick-and-dirty in-memory version that's just a `HashMap<FrameId, RawPage>` for testing, as well as a `FaultyDiskManager` (planned) to simulate torn writes and other failures. Right now I have an actual `FileDisk` that pushes to/from the filesystem.
-  - `EvictionPolicy` is how the `BufferPoolManager` will decide to purge a `Page` from its cache and back to the `DiskManager`. I implemented a simple round-robin version as well as a `ClockEvictor` that is an efficient subsitute for an LRU cache.
+  - `DiskManager` represents the underlying persistent layer. By making it a trait I am able to keep a quick-and-dirty in-memory version that's just a `HashMap<PageId, RawPage>` for testing, as well as a `FaultyDiskManager` (planned) to simulate torn writes and other failures. Right now I have an actual `FileDisk` that pushes to/from the filesystem.
+  - `EvictionPolicy` is how the `BufferPoolManager` will decide to purge a `Page` from its cache and back to the `DiskManager`. I implemented a simple round-robin version as well as a `ClockEvictor` that is an efficient substitute for an LRU cache.
     - The `EvictionPolicy` rotates through the `Frames` and finds one that isn't currently 'pinned' (has an open read or write latch to it). It should prefer to find one that isn't 'dirty' (writes not yet pushed to disk) to avoid having to flush it to disk.
 - An occupied `Frame` holds a `RwLock` guarding a cached `Page`. This is used for synchronization across multiple threads trying to access the same data.
   - It also holds an atomic counter of how many read or write guards are out there (`pin_count`). This is all controlled using RAII guards. A `Frame` can't be evicted from the pool until the `pin_count` is `0` (otherwise you're leaving a reader with access to whatever `Page` you loaded in its place).
@@ -174,7 +147,7 @@ pub struct BufferPoolManager<Dm: DiskManager, Ep: EvictionPolicy> {
 }
 ```
 
-### Phase 2.5 - Table
+### Phase 2.5 - Table (Done for Now, Tests Pending)
 - `Table` holds a reference to a `BufferPoolManager` and stores the metadata `PageId`.
 - It's the primary conduit for database interaction with methods like `create`, `allocate`, `free`, `insert`, `delete`.
 - TODO: Describe all the core methods.
@@ -187,7 +160,7 @@ pub struct Table<'a, Dm: DiskManager, Ep: EvictionPolicy> {
 }
 ```
 
-### Phase 3 — BTree over the BPM
+### Phase 3 — BTree over the BPM (Done for Now, Tests Pending)
 - `BTree` struct holding a reference to the BPM (similar to `Table` and `Pager` from cstack).
 ```
 pub struct BTree<'t, Dm: DiskManager, Ep: EvictionPolicy> {
@@ -196,16 +169,20 @@ pub struct BTree<'t, Dm: DiskManager, Ep: EvictionPolicy> {
 ```
 - Right now this is just a wrapper around a `Table` struct that holds a `BufferPoolManager` and a `Schema`.
 - Root `PageId` are always read from or written to the underlying metadata `Page` through `ReadGuard`s or `WriteGuard`s, so there shouldn't ever be a race condition resulting in an invalid root `PageId` and subsequent invalid tree traversal.
-- Implement a `vacuum` method that performs (this should probably go on `Table`):
-  - Complete sequential scan, gathering all records in one place.
-  - Builds full leaf `Page`s out of the collection and connects sibling pointers
-  - Bottom up construction of internal `Page`s until reaching the root
+- I implemented a `vacuum` method on `Table` that will sequentially scan all the leaf `Page`s and collect the underlying `Row`s.
+  - It then constructs a series of tightly packed leaf `Page`s and recursively generates internal `Page`s on top until the `Page` layer's length is 1, meaning we're at the root `Page`.
+  - Then I generate a new meta `Page` directed to the appropriate root.
+  - This collection of `Page`s is written to a temp file, then renamed to the `Table`s source file's name. The source directory is `sync`ed and the file is reopened and assigned to `Table`'s internal file handle.
+  - The `big_dumb_lock` is held during the file rename, so there shouldn't be any races to worry about.
+  - **Tradeoff:** I'm packing leaves as tight as possible, which means a single `insert` after a `vacuum` will immediately result in a split that will cascade all the way up the tree.
+    - I could consider packing the leaves only 90% full to avoid this.
 
-### Phase 3.5 - REPL / Dumb Queries
-- Now the project is ready to interact with, implement a simple REPL and allow some basic "stored procedures" like `INSERT <Row>`, `SELECT <Key>`, `DELETE <Key>`, `UPDATE <Key> <Row>`.
-- Maybe I'll start with a default dummy `Schema` to avoid all the `Table` declarations with the REPL.
+### Phase 3.5 - REPL / Dumb Queries (Constant Work in Progress)
+- I have a super simple REPL that supports `INSERT <Row>`, `SELECT <Key>`, and `DELETE <Key>`.
+- I added a rudimentary `WHERE` clause option that currently only supports column name and value (e.g. ... `WHERE active true`).
+- Next Steps here are to build out an actual `SQL` parser that translates user input into executable actions for the storage engine and REPL.
 
-### Phase 4 — Concurrency
+### Phase 4 — Concurrency (Done for Now)
 - Tree descents all follow a similar pattern: 
 ```
         let mut curr_page = self.get_root_write()?;
@@ -223,46 +200,37 @@ pub struct BTree<'t, Dm: DiskManager, Ep: EvictionPolicy> {
 ```
 - Grabbing a write latch at the root, then following it down until hitting a leaf, pushing guards onto an `ancestors` stack along the way.
   - Read only operations like `get` don't require an `ancestor` stack.
-- Once an operation is safe (e.g. a `Page` can fit a max-sized entry, or if a `Page` below it split or merged with its neighbor this one can definitely handle the `Key` deletion or insertion), we clear the the ancestors `Vec`, releasing all the latches above and allowing another thread to grab the root.
+- Once an operation is safe (e.g. a `Page` can fit a max-sized entry, or if a `Page` below it split or merged with its neighbor this one can definitely handle the `Key` deletion or insertion), we clear the ancestors `Vec`, releasing all the latches above and allowing another thread to grab the root.
   - This is a pessimistic approach to latching with an 'early' release on `ancestor` latches.
-  - Alternatively I could try an optimistic approach where I only take read guards all the way down and if the leaf is safe to `insert` or `delete`, only take that write guard. Otherwise, trace back to the highest write guard I'd need to perform the operation.
+  - Alternatively I could try an optimistic approach where I only take read guards all the way down and if the leaf is safe to `insert` or `delete`, only take that write guard. Otherwise, release everything and try again using `WriteGuard`s.
 
-### Phase 4.5 - Bloom Filters
-- A quick way to test if an element is in the `Table` or not. Avoiding unecessary latch crabbing and speeding things up in cases where we know an entry isn't in the tree.
-
-### Phase 5 — WAL / ARIES
-Hardest item on the list — sequence deliberately rather than attempting full
-ARIES in one pass:
-1. Redo-only logging + crash recovery first (log before touching the page,
-   replay on restart).
-2. Undo + CLRs (compensation log records) for transaction abort, once
-   redo-only recovery is solid.
-3. Invariant to never violate: the log record for a change is durable
-   *before* the corresponding page write hits disk. Every page carries the
-   LSN of its last modifying record.
-- WAL records are generated at the BTree call site (logical redo/undo info —
-  "Inserted key K into page P" — lives there, not in the buffer
-  pool). `WriteGuard::drop` does **not** push to the WAL; it only marks the
-  frame dirty. WAL-before-data is enforced at the *other* end: in the BPM's
-  flush/eviction path, before writing a dirty page, force the log manager to
-  durably flush up through that page's stamped LSN.
+### Phase 5 — WAL / ARIES (Planned Next)
+- Next new feature to roll out. `Wal` actions will need to occur before the push to the `DiskManager` managed through the `BufferPoolManager`.
+- I imagine them being physiological actions such as "insert row r into leaf page n", "insert key k into internal page m", "update root_page to n on meta page" for example.
+- When `write` actions occur, we can get an `Lsn` from the `Wal` that will update the `Page` before the `write` completes. The action can be put on a `Wal` backlog.
+  - When the `Frame` is evicted and `Page` is written to disk, first we will ensure that we `sync` the `Wal` and track the `Lsn`s that have been flushed.
+- Periodically we need a `checkpointer` that flushes the `Wal` entries to disk and records the `Lsn` for that event.
+  - On replay, we need to review all the `Page`s with an `Lsn` before the latest 'flushed' `Lsn` and complete the actions on those `Page`s before allowing the user to access them.
+- Rough order of implementation:
+1. Redo-only logging + crash recovery
+2. Undo + CLRs (compensation log records) for transaction abort
 - Build a crash-test harness as a real deliverable (kill the process
   mid-transaction, restart, assert recovery produces a consistent state) —
   the only way to know ARIES is actually correct rather than "looks right".
 - Will need to devise a protocol for logging splits and merges and the multiple page modifications that result.
 
-### Phase 6 — TransactionManager
+### Phase 6 — TransactionManager (Planned)
 - Basic `TransactionManager`: begin/commit/abort, transaction IDs, hooked
   into WAL. A single global lock serializing all transactions is a
   reasonable v1 concurrency model — get commit/abort/WAL integration correct
   before attempting real isolation levels (2PL/MVCC).
 - Add `BEGIN`, `ABORT`, and `COMMIT` to the dumb REPL.
 
-### Phase 7 - QueryEngine
+### Phase 7 - QueryEngine (Planned)
 - Basic `QueryEngine`: thin dispatch layer once everything below it works,
   similar in spirit to `vm.rs` from cstack's tutorial.
 - Add support for range selections
 - Maybe support `JOIN`? That's gonna be fun.
 
-### Phase 8 - Consensus
+### Phase 8 - Consensus (Eventually)
 - RAFT or VSR, whichever I find easier to implement

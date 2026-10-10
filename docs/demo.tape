@@ -40,6 +40,9 @@ Wait /rust-db >\s*$/
 Sleep 500ms
 Type "select * where active true" Enter
 Wait /rust-db >\s*$/
+Type "select * where active false" Enter
+Wait /rust-db >\s*$/
+Sleep 500ms
 Sleep 3s
 Type ".quit" Enter
 Wait /^>\s*$/
