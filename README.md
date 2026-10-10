@@ -1,5 +1,7 @@
 ## rust-db
-A learning project about databases: B+Tree Storage Engine, Buffer Pool Manager, Concurrent Operations, Write Ahead Logs, Transactions, Query Engine, and eventually Consensus.
+A learning project about databases: B+Tree Storage Engine, Buffer Pool Manager, Concurrent Operations.
+
+Still to come: Write Ahead Logs, Transactions, Query Engine, and eventually Consensus.
 
 ### Current Status
 I spent some time restructuring the project and tidying up the REPL output. I added a couple basic `BTree` tests, but I still have a lot of tests to write before moving on to the `Wal`.
